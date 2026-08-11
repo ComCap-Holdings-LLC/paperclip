@@ -36,6 +36,7 @@ import {
   isPortQuarantined,
   loadRegistry,
   nextGeneration,
+  pruneExpiredReservations,
   quarantinePort,
   removeLeaseByHandle,
   saveRegistry,
@@ -44,9 +45,10 @@ import type {
   BrokerRegistry,
   BrokerRequest,
   BrokerResponse,
-  OwnedListener,
   PeerCredentials,
 } from "./types.js";
+
+const RESERVATION_TTL_MS = 5 * 60 * 1_000;
 
 /** Result of running a tailscale CLI command (argv, shell:false). */
 export interface CliResult {
@@ -116,6 +118,8 @@ export class BrokerCore {
       switch (request.op) {
         case "list":
           return this.doList(request, peer);
+        case "reserve":
+          return this.doReserve(request, peer);
         case "expose":
           return this.doExpose(request, peer);
         case "remove":
@@ -145,23 +149,23 @@ export class BrokerCore {
     }
   }
 
-  private loadRegistry(): BrokerRegistry {
+  private loadRegistry(pruneReservations = true): BrokerRegistry {
     const registry = loadRegistry(this.config.registryPath, this.config.nodeIdentity);
     // Boot/node identity change forces quarantine + operator reconciliation.
     if (registry.nodeIdentity !== this.config.nodeIdentity) {
       denied("quarantined", "node identity changed; operator reconciliation required");
     }
+    if (pruneReservations && pruneExpiredReservations(registry, this.config.deps.nowIso()).length > 0) {
+      saveRegistry(this.config.registryPath, registry);
+    }
     return registry;
   }
 
-  private doExpose(
-    request: Extract<BrokerRequest, { op: "expose" }>,
+  private doReserve(
+    request: Extract<BrokerRequest, { op: "reserve" }>,
     peer: PeerCredentials,
   ): BrokerResponse {
     const registry = this.loadRegistry();
-
-    // Pre-flight every requested port: allowlist, quarantine, and the
-    // immediately-before /proc ownership check (req #2).
     for (const listener of request.listeners) {
       if (!this.config.isAllowedPort(listener.port)) {
         denied("port_not_allowlisted", `port ${listener.port} is outside the dedicated range`);
@@ -169,15 +173,109 @@ export class BrokerCore {
       if (isPortQuarantined(registry, listener.port)) {
         denied("quarantined", `port ${listener.port} is quarantined`);
       }
-      const ownership = this.config.deps.verifyListenerOwnership(listener.port);
+    }
+
+    const requestedPorts = request.listeners.map((listener) => listener.port);
+    const requestedPurposes = request.listeners.map((listener) => listener.purpose);
+    const existingForRuntime = registry.leases.find((lease) =>
+      lease.runtimeId === request.runtimeId
+      && lease.peerUid === peer.uid
+      && lease.peerGid === peer.gid
+      && sameNumbers(lease.ports, requestedPorts)
+      && sameStrings(lease.purposes, requestedPurposes));
+    if (existingForRuntime) {
+      return {
+        ok: true,
+        op: "reserve",
+        requestId: request.requestId,
+        handle: existingForRuntime.handle,
+        reservedPorts: [...existingForRuntime.ports],
+      };
+    }
+
+    for (const lease of registry.leases) {
+      if (lease.ports.some((port) => requestedPorts.includes(port))) {
+        denied("reservation_conflict", "a requested port is reserved by another runtime");
+      }
+    }
+
+    const serve = this.readServe();
+    assertPrimaryIntact(serve);
+    for (const port of requestedPorts) {
+      if (serve.entries.has(port)) {
+        denied("manual_mapping_present", `port ${port} already has a Serve mapping`);
+      }
+    }
+
+    const createdAtIso = this.config.deps.nowIso();
+    const handle = generateLeaseHandle();
+    addLease(registry, {
+      handle,
+      runtimeId: request.runtimeId,
+      peerUid: peer.uid,
+      peerGid: peer.gid,
+      ports: requestedPorts,
+      purposes: requestedPurposes,
+      state: "reserved",
+      generation: nextGeneration(registry),
+      createdAtIso,
+      expiresAtIso: new Date(Date.parse(createdAtIso) + RESERVATION_TTL_MS).toISOString(),
+    });
+    saveRegistry(this.config.registryPath, registry);
+    this.config.auditSink.write({
+      timestampIso: this.config.deps.nowIso(),
+      peer,
+      op: "reserve",
+      runtimeId: request.runtimeId,
+      ports: requestedPorts,
+      requestId: request.requestId,
+      decision: "allow",
+      reasonCode: "ok",
+      reason: "reserved",
+      beforeDigest: primaryDigest(serve),
+      afterDigest: primaryDigest(serve),
+      cliExitCategory: "ok",
+      recovery: "none",
+    });
+    return { ok: true, op: "reserve", requestId: request.requestId, handle, reservedPorts: requestedPorts };
+  }
+
+  private doExpose(
+    request: Extract<BrokerRequest, { op: "expose" }>,
+    peer: PeerCredentials,
+  ): BrokerResponse {
+    const registry = this.loadRegistry(false);
+    let lease;
+    try {
+      lease = authorizeRemoval(registry.leases, request, peer);
+    } catch (error) {
+      if (error instanceof AuthorizationError) denied(error.code, error.message);
+      throw error;
+    }
+    if (lease.state === "reserved" && lease.expiresAtIso && Date.parse(lease.expiresAtIso) <= Date.parse(this.config.deps.nowIso())) {
+      removeLeaseByHandle(registry, lease.handle);
+      saveRegistry(this.config.registryPath, registry);
+      denied("reservation_expired", "reservation expired before exposure");
+    }
+
+    // Pre-flight every requested port: allowlist, quarantine, and the
+    // immediately-before /proc ownership check (req #2).
+    for (const port of lease.ports) {
+      if (!this.config.isAllowedPort(port)) {
+        denied("port_not_allowlisted", `port ${port} is outside the dedicated range`);
+      }
+      if (isPortQuarantined(registry, port)) {
+        denied("quarantined", `port ${port} is quarantined`);
+      }
+      const ownership = this.config.deps.verifyListenerOwnership(port);
       if (!ownership.present) {
-        denied("listener_ownership_mismatch", `no loopback listener on port ${listener.port}`);
+        denied("listener_ownership_mismatch", `no loopback listener on port ${port}`);
       }
       if (!ownership.loopbackOnly) {
-        denied("listener_ownership_mismatch", `listener on ${listener.port} is not loopback-only`);
+        denied("listener_ownership_mismatch", `listener on ${port} is not loopback-only`);
       }
       if (!ownership.ownerUidMatches) {
-        denied("listener_ownership_mismatch", `listener on ${listener.port} not owned by managed runtime`);
+        denied("listener_ownership_mismatch", `listener on ${port} not owned by managed runtime`);
       }
     }
 
@@ -187,26 +285,26 @@ export class BrokerCore {
 
     // Each target port must be absent or already exactly our same-number entry
     // (idempotent re-expose). A manual/unknown entry is never touched.
-    for (const listener of request.listeners) {
-      const entry = before.entries.get(listener.port);
-      if (entry && !isSameNumberLoopbackEntry(entry, listener.port)) {
-        denied("manual_mapping_present", `port ${listener.port} already has a non-Paperclip mapping`);
+    for (const port of lease.ports) {
+      const entry = before.entries.get(port);
+      if (entry && !isSameNumberLoopbackEntry(entry, port)) {
+        denied("manual_mapping_present", `port ${port} already has a non-Paperclip mapping`);
       }
     }
 
     const appliedPorts: number[] = [];
     try {
-      for (const listener of request.listeners) {
-        const already = before.entries.get(listener.port);
-        if (already && isSameNumberLoopbackEntry(already, listener.port)) {
+      for (const port of lease.ports) {
+        const already = before.entries.get(port);
+        if (already && isSameNumberLoopbackEntry(already, port)) {
           continue; // idempotent
         }
         const result = this.config.deps.runTailscale(
-          buildExposeArgv(this.config.tailscaleBinPath, listener.port),
+          buildExposeArgv(this.config.tailscaleBinPath, port),
         );
-        if (result.timedOut) denied("cli_timeout", `expose ${listener.port} timed out`);
-        if (result.code !== 0) denied("cli_error", `expose ${listener.port} exited non-zero`);
-        appliedPorts.push(listener.port);
+        if (result.timedOut) denied("cli_timeout", `expose ${port} timed out`);
+        if (result.code !== 0) denied("cli_error", `expose ${port} exited non-zero`);
+        appliedPorts.push(port);
       }
 
       const after = this.readServe();
@@ -220,28 +318,18 @@ export class BrokerCore {
       // Only the intended ports may have changed, and each must now be an exact
       // same-number loopback listener.
       const diff = new Set(changedPorts(before, after));
-      const intended = new Set(request.listeners.map((l) => l.port));
+      const intended = new Set(lease.ports);
       for (const port of diff) {
         if (!intended.has(port)) denied("unexpected_serve_diff", `unexpected change on port ${port}`);
       }
-      for (const listener of request.listeners) {
-        if (!isSameNumberLoopbackEntry(after.entries.get(listener.port), listener.port)) {
-          denied("unexpected_serve_diff", `port ${listener.port} not exactly exposed`);
+      for (const port of lease.ports) {
+        if (!isSameNumberLoopbackEntry(after.entries.get(port), port)) {
+          denied("unexpected_serve_diff", `port ${port} not exactly exposed`);
         }
       }
 
-      const handle = generateLeaseHandle();
-      const generation = nextGeneration(registry);
-      addLease(registry, {
-        handle,
-        runtimeId: request.runtimeId,
-        peerUid: peer.uid,
-        peerGid: peer.gid,
-        ports: request.listeners.map((l) => l.port),
-        purposes: request.listeners.map((l) => l.purpose) as OwnedListener["purpose"][],
-        generation,
-        createdAtIso: this.config.deps.nowIso(),
-      });
+      lease.state = "exposed";
+      lease.expiresAtIso = null;
       saveRegistry(this.config.registryPath, registry);
 
       this.config.auditSink.write({
@@ -249,7 +337,7 @@ export class BrokerCore {
         peer,
         op: "expose",
         runtimeId: request.runtimeId,
-        ports: request.listeners.map((l) => l.port),
+        ports: lease.ports,
         requestId: request.requestId,
         decision: "allow",
         reasonCode: "ok",
@@ -264,8 +352,8 @@ export class BrokerCore {
         ok: true,
         op: "expose",
         requestId: request.requestId,
-        handle,
-        publicPorts: request.listeners.map((l) => l.port),
+        handle: lease.handle,
+        publicPorts: [...lease.ports],
       };
     } catch (error) {
       // Partial success is not healthy: compensate by removing only the exact
@@ -306,6 +394,25 @@ export class BrokerCore {
     } catch (error) {
       if (error instanceof AuthorizationError) denied(error.code, error.message);
       throw error;
+    }
+
+    if (lease.state === "reserved") {
+      removeLeaseByHandle(registry, lease.handle);
+      saveRegistry(this.config.registryPath, registry);
+      this.config.auditSink.write({
+        timestampIso: this.config.deps.nowIso(),
+        peer,
+        op: "remove",
+        runtimeId: request.runtimeId,
+        ports: lease.ports,
+        requestId: request.requestId,
+        decision: "allow",
+        reasonCode: "ok",
+        reason: "reservation_released",
+        cliExitCategory: "ok",
+        recovery: "cleanup",
+      });
+      return { ok: true, op: "remove", requestId: request.requestId, removedPorts: [] };
     }
 
     const before = this.readServe();
@@ -371,7 +478,7 @@ export class BrokerCore {
   ): BrokerResponse {
     const registry = this.loadRegistry();
     const listeners = registry.leases
-      .filter((lease) => lease.peerUid === peer.uid && lease.peerGid === peer.gid)
+      .filter((lease) => lease.state === "exposed" && lease.peerUid === peer.uid && lease.peerGid === peer.gid)
       .flatMap((lease) =>
         lease.ports.map((port, index) => ({
           runtimeId: lease.runtimeId,
@@ -418,6 +525,14 @@ export class BrokerCore {
     }
     return { ok: false, requestId, code: code as never, message: safeMessage(code) };
   }
+}
+
+function sameNumbers(left: readonly number[], right: readonly number[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function codeForError(error: unknown): string {

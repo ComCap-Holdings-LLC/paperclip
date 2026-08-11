@@ -45,6 +45,11 @@ export interface BrokerExposeResult {
   publicPorts: number[];
 }
 
+export interface BrokerReserveResult {
+  handle: string;
+  reservedPorts: number[];
+}
+
 export interface BrokerRemoveResult {
   removedPorts: number[];
 }
@@ -75,7 +80,8 @@ export class BrokerClientError extends Error {
  * it as an interface lets tests inject a fake broker with zero sockets.
  */
 export interface BrokerClient {
-  expose(runtimeId: string, listeners: BrokerListenerRequest[]): Promise<BrokerExposeResult>;
+  reserve(runtimeId: string, listeners: BrokerListenerRequest[]): Promise<BrokerReserveResult>;
+  expose(runtimeId: string, handle: string): Promise<BrokerExposeResult>;
   remove(runtimeId: string, handle: string): Promise<BrokerRemoveResult>;
   list(): Promise<BrokerOwnedListener[]>;
 }
@@ -116,16 +122,34 @@ export class UnixBrokerClient implements BrokerClient {
     this.connect = options.connect ?? ((p) => net.createConnection(p));
   }
 
-  async expose(
+  async reserve(
     runtimeId: string,
     listeners: BrokerListenerRequest[],
-  ): Promise<BrokerExposeResult> {
+  ): Promise<BrokerReserveResult> {
+    const response = await this.roundTrip({
+      v: BROKER_PROTOCOL_VERSION,
+      op: "reserve",
+      requestId: nextRequestId(),
+      runtimeId,
+      listeners: listeners.map((l) => ({ purpose: l.purpose, port: l.port })),
+    });
+    if (
+      typeof response.handle !== "string" ||
+      !Array.isArray(response.reservedPorts) ||
+      !response.reservedPorts.every((p) => Number.isInteger(p))
+    ) {
+      throw new BrokerClientError("malformed_response", "reserve response missing handle/reservedPorts");
+    }
+    return { handle: response.handle, reservedPorts: response.reservedPorts as number[] };
+  }
+
+  async expose(runtimeId: string, handle: string): Promise<BrokerExposeResult> {
     const response = await this.roundTrip({
       v: BROKER_PROTOCOL_VERSION,
       op: "expose",
       requestId: nextRequestId(),
       runtimeId,
-      listeners: listeners.map((l) => ({ purpose: l.purpose, port: l.port })),
+      handle,
     });
     if (
       typeof response.handle !== "string" ||

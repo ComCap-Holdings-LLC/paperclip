@@ -2420,6 +2420,7 @@ export {
   isRuntimeExposureHmrPort,
   isAllowedRuntimeExposurePort,
   deriveViteHmrPort,
+  derivePaperclipViteHmrPort,
   buildRuntimeExposureUrl,
   buildRuntimeExposureHealthUrl,
 } from "./runtime-exposure/ports.js";

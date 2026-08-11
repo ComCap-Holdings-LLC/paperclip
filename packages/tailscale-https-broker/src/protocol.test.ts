@@ -8,11 +8,11 @@ function frame(obj: unknown): string {
 }
 
 describe("decodeRequest", () => {
-  it("decodes a valid expose request", () => {
+  it("decodes a valid reserve request", () => {
     const req = decodeRequest(
       frame({
         v: 1,
-        op: "expose",
+        op: "reserve",
         requestId: "req-1",
         runtimeId: RUNTIME,
         listeners: [
@@ -22,7 +22,7 @@ describe("decodeRequest", () => {
       }),
     );
     expect(req).toEqual({
-      op: "expose",
+      op: "reserve",
       requestId: "req-1",
       runtimeId: RUNTIME,
       listeners: [
@@ -32,7 +32,7 @@ describe("decodeRequest", () => {
     });
   });
 
-  it("decodes remove and list", () => {
+  it("decodes expose, remove, and list", () => {
     expect(
       decodeRequest(frame({ v: 1, op: "list", requestId: "r" })).op,
     ).toBe("list");
@@ -40,6 +40,10 @@ describe("decodeRequest", () => {
       frame({ v: 1, op: "remove", requestId: "r", runtimeId: RUNTIME, handle: "a".repeat(20) }),
     );
     expect(rm.op).toBe("remove");
+    const expose = decodeRequest(
+      frame({ v: 1, op: "expose", requestId: "r", runtimeId: RUNTIME, handle: "a".repeat(20) }),
+    );
+    expect(expose.op).toBe("expose");
   });
 
   it("rejects unsupported protocol version", () => {
@@ -64,20 +68,40 @@ describe("decodeRequest", () => {
 
   it("rejects a non-UUID runtimeId and out-of-canonical ports", () => {
     expect(() =>
-      decodeRequest(frame({ v: 1, op: "expose", requestId: "r", runtimeId: "not-a-uuid", listeners: [{ purpose: "app", port: 42010 }] })),
+      decodeRequest(frame({ v: 1, op: "reserve", requestId: "r", runtimeId: "not-a-uuid", listeners: [{ purpose: "app", port: 42010 }] })),
     ).toThrow(/runtime/);
     expect(() =>
-      decodeRequest(frame({ v: 1, op: "expose", requestId: "r", runtimeId: RUNTIME, listeners: [{ purpose: "app", port: "42010" }] })),
+      decodeRequest(frame({ v: 1, op: "reserve", requestId: "r", runtimeId: RUNTIME, listeners: [{ purpose: "app", port: "42010" }] })),
     ).toThrow();
   });
 
   it("rejects duplicate ports/purposes and too many listeners", () => {
     expect(() =>
-      decodeRequest(frame({ v: 1, op: "expose", requestId: "r", runtimeId: RUNTIME, listeners: [{ purpose: "app", port: 42010 }, { purpose: "app", port: 42010 }] })),
+      decodeRequest(frame({ v: 1, op: "reserve", requestId: "r", runtimeId: RUNTIME, listeners: [{ purpose: "app", port: 42010 }, { purpose: "app", port: 42010 }] })),
     ).toThrow(/duplicate/);
     expect(() =>
-      decodeRequest(frame({ v: 1, op: "expose", requestId: "r", runtimeId: RUNTIME, listeners: [{ purpose: "app", port: 42010 }, { purpose: "vite_hmr", port: 52010 }, { purpose: "app", port: 42011 }] })),
+      decodeRequest(frame({ v: 1, op: "reserve", requestId: "r", runtimeId: RUNTIME, listeners: [{ purpose: "app", port: 42010 }, { purpose: "vite_hmr", port: 52010 }, { purpose: "app", port: 42011 }] })),
     ).toThrow(/too many/);
+  });
+
+  it("rejects HMR-only and mismatched app/HMR reservations", () => {
+    expect(() => decodeRequest(frame({
+      v: 1,
+      op: "reserve",
+      requestId: "r",
+      runtimeId: RUNTIME,
+      listeners: [{ purpose: "vite_hmr", port: 52000 }],
+    }))).toThrow(/app listener/);
+    expect(() => decodeRequest(frame({
+      v: 1,
+      op: "reserve",
+      requestId: "r",
+      runtimeId: RUNTIME,
+      listeners: [
+        { purpose: "app", port: 42000 },
+        { purpose: "vite_hmr", port: 52001 },
+      ],
+    }))).toThrow(/companion/);
   });
 
   it("rejects oversized frames", () => {

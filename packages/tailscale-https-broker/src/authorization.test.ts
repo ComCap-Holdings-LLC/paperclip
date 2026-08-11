@@ -44,8 +44,10 @@ describe("authorizeRemoval (ownership binding)", () => {
     peerGid: 987,
     ports: [42010, 52010],
     purposes: ["app", "vite_hmr"],
+    state: "exposed",
     generation: 1,
     createdAtIso: "2026-08-11T00:00:00.000Z",
+    expiresAtIso: null,
   };
   const peer = { uid: 999, gid: 987, pid: 42 };
 

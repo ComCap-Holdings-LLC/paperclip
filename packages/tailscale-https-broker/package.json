@@ -10,9 +10,10 @@
     "./*": "./src/*.ts"
   },
   "bin": {
-    "paperclip-tailscale-https-broker": "./src/main.ts"
+    "paperclip-tailscale-https-broker": "./dist/main.js"
   },
   "scripts": {
+    "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },

@@ -68,7 +68,25 @@ export function deriveViteHmrPort(appPort: number): number {
         `[${RUNTIME_EXPOSURE_APP_PORT_MIN}, ${RUNTIME_EXPOSURE_APP_PORT_MAX}]`,
     );
   }
-  return appPort + RUNTIME_EXPOSURE_HMR_PORT_OFFSET;
+  return derivePaperclipViteHmrPort(appPort);
+}
+
+/**
+ * Derive Paperclip's Vite HMR companion port for any valid application port.
+ *
+ * Normal Paperclip instances can use ports outside the dedicated exposure
+ * range, while exposed branch runtimes are deliberately constrained to it.
+ * Keeping the generic derivation here prevents the app server and exposure
+ * allocator from drifting while preserving the historical overflow fallback.
+ */
+export function derivePaperclipViteHmrPort(serverPort: number): number {
+  if (!Number.isInteger(serverPort) || serverPort < 1 || serverPort > 65_535) {
+    throw new RangeError(`server port ${serverPort} is not a valid TCP port`);
+  }
+  if (serverPort <= 55_535) {
+    return serverPort + RUNTIME_EXPOSURE_HMR_PORT_OFFSET;
+  }
+  return Math.max(1_024, serverPort - RUNTIME_EXPOSURE_HMR_PORT_OFFSET);
 }
 
 /**

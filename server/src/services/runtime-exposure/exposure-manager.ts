@@ -45,6 +45,8 @@ export interface ExposureManagerDeps {
 export interface ProvisionInput {
   runtimeId: string;
   config: RuntimeExposureConfigInput;
+  /** Broker-issued reservation handle persisted before the backend starts. */
+  handle: string;
   /** Resolved Tailscale node DNS hostname (the manager does not resolve it). */
   hostname: string;
   /** Loopback app port already allocated in the dedicated range. */
@@ -59,6 +61,48 @@ export interface ProvisionResult {
    * it in a server-private store. Null when nothing was exposed.
    */
   handle: string | null;
+}
+
+export interface ReserveInput {
+  runtimeId: string;
+  config: RuntimeExposureConfigInput;
+  appPort: number;
+}
+
+/** Reserve the app/HMR pair before the backend binds either listener. */
+export async function reserveExposure(
+  deps: ExposureManagerDeps,
+  input: ReserveInput,
+): Promise<ProvisionResult> {
+  const status = baseStatus(deps.now());
+  if (!isRuntimeExposureAppPort(input.appPort)) {
+    status.state = "failed";
+    status.lastError = "app port outside dedicated runtime exposure range";
+    return { status, handle: null };
+  }
+  const requested = buildListenerRequests(input.config, input.appPort);
+  status.listeners = requested.map((listener) => ({
+    purpose: listener.purpose,
+    publicPort: listener.port,
+    targetPort: listener.port,
+  }));
+  status.brokerRef = input.runtimeId;
+  try {
+    const result = await deps.broker.reserve(input.runtimeId, requested);
+    const requestedPorts = new Set(requested.map((listener) => listener.port));
+    const returnedPorts = new Set(result.reservedPorts);
+    if (requestedPorts.size !== returnedPorts.size || ![...requestedPorts].every((port) => returnedPorts.has(port))) {
+      await safeRemove(deps.broker, input.runtimeId, result.handle);
+      status.state = "failed";
+      status.lastError = "broker returned unexpected reserved ports";
+      return { status, handle: null };
+    }
+    return { status, handle: result.handle };
+  } catch (error) {
+    status.state = "failed";
+    status.lastError = brokerErrorCode(error);
+    return { status, handle: null };
+  }
 }
 
 export interface DeprovisionInput {
@@ -124,21 +168,27 @@ export async function provisionExposure(
   if (!isRuntimeExposureAppPort(input.appPort)) {
     status.state = "failed";
     status.lastError = "app port outside dedicated runtime exposure range";
-    return { status, handle: null };
+    return { status, handle: input.handle };
   }
 
   const requested = buildListenerRequests(input.config, input.appPort);
+  status.listeners = requested.map((listener) => ({
+    purpose: listener.purpose,
+    publicPort: listener.port,
+    targetPort: listener.port,
+  }));
+  status.brokerRef = input.runtimeId;
 
   let handle: string;
   let publicPorts: number[];
   try {
-    const result = await deps.broker.expose(input.runtimeId, requested);
+    const result = await deps.broker.expose(input.runtimeId, input.handle);
     handle = result.handle;
     publicPorts = result.publicPorts;
   } catch (error) {
     status.state = "failed";
     status.lastError = brokerErrorCode(error);
-    return { status, handle: null };
+    return { status, handle: input.handle };
   }
 
   // The broker must return exactly the ports we asked for (same-number). A
@@ -149,18 +199,11 @@ export async function provisionExposure(
     await safeRemove(deps.broker, input.runtimeId, handle);
     status.state = "failed";
     status.lastError = "broker returned unexpected public ports";
-    return { status, handle: null };
+    return { status, handle };
   }
 
   // Reflect the attempted mapping regardless of health so the UI can show what
   // was provisioned even while probing.
-  status.listeners = requested.map((l) => ({
-    purpose: l.purpose,
-    publicPort: l.port,
-    targetPort: l.port,
-  }));
-  status.brokerRef = input.runtimeId;
-
   // fail-closed: never report ready until an external, cert-validating probe
   // succeeds. Keep the handle so the caller can retry or clean up.
   const healthUrl = buildRuntimeExposureHealthUrl(input.hostname, input.appPort);

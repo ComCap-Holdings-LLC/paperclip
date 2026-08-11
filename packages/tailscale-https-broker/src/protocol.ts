@@ -5,6 +5,11 @@
  * duplicate-key, and unknown-field requests are rejected without side effects.
  */
 import { assertCanonicalPort } from "./integers.js";
+import {
+  DEFAULT_APP_PORT_MAX,
+  DEFAULT_APP_PORT_MIN,
+  DEFAULT_HMR_PORT_OFFSET,
+} from "./port-policy.js";
 import { parseJsonNoDuplicateKeys } from "./strict-json.js";
 import {
   BROKER_PROTOCOL_VERSION,
@@ -102,7 +107,7 @@ export function decodeRequest(frame: Buffer | string): BrokerRequest {
   const requestId = requireStringField(obj, "requestId", REQUEST_ID_RE, "malformed_request", null);
 
   const op = obj.op;
-  if (op !== "expose" && op !== "remove" && op !== "list") {
+  if (op !== "reserve" && op !== "expose" && op !== "remove" && op !== "list") {
     throw new ProtocolError("unknown_operation", `unknown operation: ${String(op)}`, requestId);
   }
 
@@ -111,14 +116,14 @@ export function decodeRequest(frame: Buffer | string): BrokerRequest {
     return { op: "list", requestId };
   }
 
-  if (op === "remove") {
+  if (op === "remove" || op === "expose") {
     assertExactKeys(obj, ["v", "op", "requestId", "runtimeId", "handle"], requestId);
     const runtimeId = requireStringField(obj, "runtimeId", UUID_RE, "invalid_runtime_id", requestId);
     const handle = requireStringField(obj, "handle", HANDLE_RE, "malformed_request", requestId);
-    return { op: "remove", requestId, runtimeId, handle };
+    return { op, requestId, runtimeId, handle };
   }
 
-  // expose
+  // reserve
   assertExactKeys(obj, ["v", "op", "requestId", "runtimeId", "listeners"], requestId);
   const runtimeId = requireStringField(obj, "runtimeId", UUID_RE, "invalid_runtime_id", requestId);
   const rawListeners = obj.listeners;
@@ -151,7 +156,16 @@ export function decodeRequest(frame: Buffer | string): BrokerRequest {
     throw new ProtocolError("malformed_request", "duplicate listener port or purpose", requestId);
   }
 
-  return { op: "expose", requestId, runtimeId, listeners };
+  const app = listeners.find((listener) => listener.purpose === "app");
+  const hmr = listeners.find((listener) => listener.purpose === "vite_hmr");
+  if (!app || app.port < DEFAULT_APP_PORT_MIN || app.port > DEFAULT_APP_PORT_MAX) {
+    throw new ProtocolError("invalid_port", "an app listener in the dedicated app range is required", requestId);
+  }
+  if (hmr && hmr.port !== app.port + DEFAULT_HMR_PORT_OFFSET) {
+    throw new ProtocolError("invalid_port", "vite_hmr must be the app port companion", requestId);
+  }
+
+  return { op: "reserve", requestId, runtimeId, listeners };
 }
 
 function assertExactKeys(

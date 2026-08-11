@@ -72,26 +72,28 @@ afterEach(async () => {
 const RUNTIME_ID = "11111111-2222-4333-8444-555566667777";
 
 describe("UnixBrokerClient", () => {
-  it("round-trips an expose request and parses handle + ports", async () => {
+  it("round-trips reservation and expose requests", async () => {
     let seen: Record<string, unknown> | undefined;
     const socketPath = fake((request) => {
       seen = request;
+      if (request.op === "reserve") {
+        return { ok: true, op: "reserve", requestId: request.requestId, handle: "h".repeat(20), reservedPorts: [42000, 52000] };
+      }
       return { ok: true, op: "expose", requestId: request.requestId, handle: "h".repeat(20), publicPorts: [42000, 52000] };
     });
     const client = new UnixBrokerClient({ socketPath });
-    const result = await client.expose(RUNTIME_ID, [
+    const reserved = await client.reserve(RUNTIME_ID, [
       { purpose: "app", port: 42000 },
       { purpose: "vite_hmr", port: 52000 },
     ]);
+    expect(reserved).toEqual({ handle: "h".repeat(20), reservedPorts: [42000, 52000] });
+    const result = await client.expose(RUNTIME_ID, reserved.handle);
     expect(result).toEqual({ handle: "h".repeat(20), publicPorts: [42000, 52000] });
     expect(seen).toMatchObject({
       v: 1,
       op: "expose",
       runtimeId: RUNTIME_ID,
-      listeners: [
-        { purpose: "app", port: 42000 },
-        { purpose: "vite_hmr", port: 52000 },
-      ],
+      handle: "h".repeat(20),
     });
     expect(typeof seen?.requestId).toBe("string");
   });
@@ -128,7 +130,7 @@ describe("UnixBrokerClient", () => {
       message: "denied",
     }));
     const client = new UnixBrokerClient({ socketPath });
-    await expect(client.expose(RUNTIME_ID, [{ purpose: "app", port: 42000 }])).rejects.toMatchObject({
+    await expect(client.reserve(RUNTIME_ID, [{ purpose: "app", port: 42000 }])).rejects.toMatchObject({
       name: "BrokerClientError",
       code: "port_not_allowlisted",
     });
@@ -143,7 +145,7 @@ describe("UnixBrokerClient", () => {
   it("rejects an expose response missing publicPorts", async () => {
     const socketPath = fake((request) => ({ ok: true, op: "expose", requestId: request.requestId, handle: "h".repeat(20) }));
     const client = new UnixBrokerClient({ socketPath });
-    await expect(client.expose(RUNTIME_ID, [{ purpose: "app", port: 42000 }])).rejects.toMatchObject({
+    await expect(client.expose(RUNTIME_ID, "h".repeat(20))).rejects.toMatchObject({
       code: "malformed_response",
     });
   });

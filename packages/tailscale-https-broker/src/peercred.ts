@@ -3,7 +3,7 @@
  *
  * Node does not expose SO_PEERCRED through a public API. The broker's PRIMARY
  * access boundary is therefore the OS filesystem: the socket lives in a
- * root-owned directory and is mode 0660 owned by `root:<dedicated-group>`, so
+ * broker-owned directory and is mode 0660 owned by the dedicated socket group, so
  * only the allowlisted Paperclip service identity can `connect()` at all (this
  * is exactly the dedicated-socket-group control in PAP-17050 verdict req #1).
  *
@@ -21,7 +21,7 @@ export interface PeerResolverConfig {
   /** The single OS identity the socket permissions restrict connections to. */
   serviceUid: number;
   serviceGid: number;
-  /** Operator assertion that the socket is 0660 root:<dedicated-group>. */
+  /** Operator assertion that the socket is 0660 and dedicated-group-owned. */
   trustSocketPermissions: boolean;
   /** Optional native SO_PEERCRED reader; returns null if unavailable. */
   soPeercred?: (socket: Socket) => PeerCredentials | null;

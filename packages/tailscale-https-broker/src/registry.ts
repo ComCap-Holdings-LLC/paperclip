@@ -43,6 +43,13 @@ export function loadRegistry(path: string, nodeIdentity: string): BrokerRegistry
   if (parsed.version !== 1 || !Array.isArray(parsed.leases)) {
     throw new Error("registry is corrupt or of an unsupported version");
   }
+  // Compatibility with the pre-reservation development build: an existing
+  // lease necessarily represented an exposed mapping.
+  parsed.leases = parsed.leases.map((lease) => ({
+    ...lease,
+    state: lease.state === "reserved" ? "reserved" : "exposed",
+    expiresAtIso: typeof lease.expiresAtIso === "string" ? lease.expiresAtIso : null,
+  }));
   parsed.quarantinedPorts = Array.isArray(parsed.quarantinedPorts) ? parsed.quarantinedPorts : [];
   return parsed;
 }
@@ -114,6 +121,21 @@ export function removeLeaseByHandle(registry: BrokerRegistry, handle: string): L
   if (index < 0) return null;
   const [removed] = registry.leases.splice(index, 1);
   return removed;
+}
+
+/** Remove expired, never-exposed reservations and return their released ports. */
+export function pruneExpiredReservations(registry: BrokerRegistry, nowIso: string): number[] {
+  const nowMs = Date.parse(nowIso);
+  if (!Number.isFinite(nowMs)) return [];
+  const released: number[] = [];
+  registry.leases = registry.leases.filter((lease) => {
+    if (lease.state !== "reserved" || !lease.expiresAtIso) return true;
+    const expiresMs = Date.parse(lease.expiresAtIso);
+    if (!Number.isFinite(expiresMs) || expiresMs > nowMs) return true;
+    released.push(...lease.ports);
+    return false;
+  });
+  return released;
 }
 
 export function isPortQuarantined(registry: BrokerRegistry, port: number): boolean {

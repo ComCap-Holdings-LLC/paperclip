@@ -17,7 +17,7 @@ export const BROKER_PROTOCOL_VERSION = 1;
 export const PROTECTED_PRIMARY_PORT = 443;
 export const PROTECTED_PRIMARY_TARGET = "http://127.0.0.1:3100";
 
-export type BrokerOp = "expose" | "remove" | "list";
+export type BrokerOp = "reserve" | "expose" | "remove" | "list";
 
 /** Peer credentials obtained from the OS for an accepted socket connection. */
 export interface PeerCredentials {
@@ -33,14 +33,20 @@ export interface OwnedListener {
   port: number;
 }
 
-/** An expose request body (already schema-validated). */
+/** Reserve an app/HMR pair before the managed backend starts listening. */
+export interface ReserveRequest {
+  op: "reserve";
+  requestId: string;
+  runtimeId: string;
+  listeners: OwnedListener[];
+}
+
+/** Expose the listeners bound to a broker-issued reservation handle. */
 export interface ExposeRequest {
   op: "expose";
   requestId: string;
-  /** Runtime-service UUID the caller claims to own. */
   runtimeId: string;
-  /** Loopback target ports to expose; each becomes a same-number HTTPS listener. */
-  listeners: OwnedListener[];
+  handle: string;
 }
 
 /** A remove request body. Requires a prior expose lease handle. */
@@ -58,7 +64,16 @@ export interface ListRequest {
   requestId: string;
 }
 
-export type BrokerRequest = ExposeRequest | RemoveRequest | ListRequest;
+export type BrokerRequest = ReserveRequest | ExposeRequest | RemoveRequest | ListRequest;
+
+export interface ReserveResponseOk {
+  ok: true;
+  op: "reserve";
+  requestId: string;
+  /** Unguessable handle bound to peer, runtime, ports, and generation. */
+  handle: string;
+  reservedPorts: number[];
+}
 
 export interface ExposeResponseOk {
   ok: true;
@@ -93,6 +108,7 @@ export interface BrokerErrorResponse {
 }
 
 export type BrokerResponse =
+  | ReserveResponseOk
   | ExposeResponseOk
   | RemoveResponseOk
   | ListResponseOk
@@ -109,6 +125,8 @@ export type BrokerErrorCode =
   | "listener_not_owned"
   | "listener_ownership_mismatch"
   | "manual_mapping_present"
+  | "reservation_conflict"
+  | "reservation_expired"
   | "primary_route_violation"
   | "invalid_handle"
   | "serve_parse_error"
@@ -129,9 +147,13 @@ export interface LeaseRecord {
   peerGid: number;
   ports: number[];
   purposes: OwnedListener["purpose"][];
+  /** Reserved before bind; exposed only after listener ownership is verified. */
+  state: "reserved" | "exposed";
   /** Monotonic generation to defeat ABA remove/re-expose confusion. */
   generation: number;
   createdAtIso: string;
+  /** Bounds leaked reservations when a caller crashes before backend start. */
+  expiresAtIso: string | null;
 }
 
 /** Registry persisted to a root-owned 0600 file via temp+fsync+rename. */

@@ -65,6 +65,7 @@ function makeCore(
     loopbackOnly: true,
     ownerUidMatches: true,
   }),
+  nowIso: () => string = () => "2026-08-11T00:00:00.000Z",
 ) {
   const audit = new MemoryAuditSink();
   const core = new BrokerCore({
@@ -77,18 +78,29 @@ function makeCore(
     deps: {
       runTailscale: fake.run,
       verifyListenerOwnership: ownership,
-      nowIso: () => "2026-08-11T00:00:00.000Z",
+      nowIso,
     },
   });
   return { core, audit };
 }
 
-const exposeReq = (runtimeId = RUNTIME_A, port = 42010): BrokerRequest => ({
-  op: "expose",
+const reserveReq = (runtimeId = RUNTIME_A, port = 42010): BrokerRequest => ({
+  op: "reserve",
   requestId: "req-e",
   runtimeId,
   listeners: [{ purpose: "app", port }],
 });
+
+async function reserveAndExpose(core: BrokerCore, runtimeId = RUNTIME_A, port = 42010, peer = PEER) {
+  const reserved = await core.handle(reserveReq(runtimeId, port), peer);
+  if (!reserved.ok || reserved.op !== "reserve") throw new Error("reserve failed");
+  return await core.handle({
+    op: "expose",
+    requestId: "req-x",
+    runtimeId,
+    handle: reserved.handle,
+  }, peer);
+}
 
 let dir: string;
 let registryPath: string;
@@ -101,10 +113,16 @@ afterEach(() => {
 });
 
 describe("expose", () => {
-  it("exposes a same-number loopback listener and persists a lease", async () => {
+  it("reserves before bind, then exposes a same-number loopback listener and persists a lease", async () => {
     const fake = new FakeTailscale();
     const { core } = makeCore(fake, registryPath);
-    const res = await core.handle(exposeReq(), PEER);
+    const reserved = await core.handle(reserveReq(), PEER);
+    expect(reserved.ok).toBe(true);
+    expect(fake.ports.has(42010)).toBe(false);
+    const beforeList = await core.handle({ op: "list", requestId: "before-list" }, PEER);
+    expect(beforeList).toMatchObject({ ok: true, listeners: [] });
+    if (!reserved.ok || reserved.op !== "reserve") throw new Error("expected reserve ok");
+    const res = await core.handle({ op: "expose", requestId: "req-x", runtimeId: RUNTIME_A, handle: reserved.handle }, PEER);
     expect(res.ok).toBe(true);
     if (!res.ok || res.op !== "expose") throw new Error("expected expose ok");
     expect(res.publicPorts).toEqual([42010]);
@@ -112,23 +130,46 @@ describe("expose", () => {
     expect(fake.ports.get(42010)).toBe("http://127.0.0.1:42010");
     const registry = JSON.parse(readFileSync(registryPath, "utf8"));
     expect(registry.leases[0].ports).toEqual([42010]);
+    expect(registry.leases[0].state).toBe("exposed");
     // Handle is persisted server-side but never appears in list output.
   });
 
   it("is idempotent: re-exposing the same port does not double-apply", async () => {
     const fake = new FakeTailscale();
     const { core } = makeCore(fake, registryPath);
-    await core.handle(exposeReq(), PEER);
+    const firstReservation = await core.handle(reserveReq(), PEER);
+    if (!firstReservation.ok || firstReservation.op !== "reserve") throw new Error("reserve failed");
+    await core.handle({ op: "expose", requestId: "first", runtimeId: RUNTIME_A, handle: firstReservation.handle }, PEER);
     const before = fake.exposeCalls;
-    const res = await core.handle(exposeReq(), PEER);
+    const repeatedReservation = await core.handle(reserveReq(), PEER);
+    expect(repeatedReservation).toMatchObject({ ok: true, handle: firstReservation.handle });
+    const res = await core.handle({ op: "expose", requestId: "second", runtimeId: RUNTIME_A, handle: firstReservation.handle }, PEER);
     expect(res.ok).toBe(true);
     expect(fake.exposeCalls).toBe(before); // no additional CLI mutation
+  });
+
+  it("rejects and releases an expired reservation before any Serve mutation", async () => {
+    const fake = new FakeTailscale();
+    let now = "2026-08-11T00:00:00.000Z";
+    const { core } = makeCore(fake, registryPath, undefined, () => now);
+    const reserved = await core.handle(reserveReq(), PEER);
+    if (!reserved.ok || reserved.op !== "reserve") throw new Error("reserve failed");
+    now = "2026-08-11T00:06:00.000Z";
+    const result = await core.handle({
+      op: "expose",
+      requestId: "expired",
+      runtimeId: RUNTIME_A,
+      handle: reserved.handle,
+    }, PEER);
+    expect(result).toMatchObject({ ok: false, code: "reservation_expired" });
+    expect(fake.exposeCalls).toBe(0);
+    expect(JSON.parse(readFileSync(registryPath, "utf8")).leases).toEqual([]);
   });
 
   it("rejects an unauthorized peer without mutating serve", async () => {
     const fake = new FakeTailscale();
     const { core } = makeCore(fake, registryPath);
-    const res = await core.handle(exposeReq(), { uid: 1000, gid: 987, pid: 1 });
+    const res = await core.handle(reserveReq(), { uid: 1000, gid: 987, pid: 1 });
     expect(res.ok).toBe(false);
     if (res.ok) throw new Error("unreachable");
     expect(res.code).toBe("unauthorized_peer");
@@ -138,7 +179,7 @@ describe("expose", () => {
   it("rejects a port outside the dedicated allowlist", async () => {
     const fake = new FakeTailscale();
     const { core } = makeCore(fake, registryPath);
-    const res = await core.handle(exposeReq(RUNTIME_A, 8080), PEER);
+    const res = await core.handle(reserveReq(RUNTIME_A, 8080), PEER);
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.code).toBe("port_not_allowlisted");
   });
@@ -151,7 +192,7 @@ describe("expose", () => {
     ]) {
       const fake = new FakeTailscale();
       const { core } = makeCore(fake, registryPath, () => bad);
-      const res = await core.handle(exposeReq(), PEER);
+      const res = await reserveAndExpose(core);
       expect(res.ok).toBe(false);
       if (!res.ok) expect(res.code).toBe("listener_ownership_mismatch");
       expect(fake.ports.has(42010)).toBe(false);
@@ -162,7 +203,7 @@ describe("expose", () => {
     const fake = new FakeTailscale();
     fake.ports.set(42010, "http://127.0.0.1:5432"); // manual/unrelated service
     const { core } = makeCore(fake, registryPath);
-    const res = await core.handle(exposeReq(), PEER);
+    const res = await core.handle(reserveReq(), PEER);
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.code).toBe("manual_mapping_present");
     expect(fake.ports.get(42010)).toBe("http://127.0.0.1:5432"); // unchanged
@@ -172,7 +213,7 @@ describe("expose", () => {
     const fake = new FakeTailscale();
     fake.retargetPrimaryOnExpose = true;
     const { core } = makeCore(fake, registryPath);
-    const res = await core.handle(exposeReq(), PEER);
+    const res = await reserveAndExpose(core);
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.code).toBe("primary_route_violation");
   });
@@ -182,7 +223,7 @@ describe("expose", () => {
     fake.sideEffectOnExpose = 42011; // an unexpected extra entry appears
     fake.failRemove = true; // compensation cannot be proven -> quarantine
     const { core } = makeCore(fake, registryPath);
-    const res = await core.handle(exposeReq(), PEER);
+    const res = await reserveAndExpose(core);
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.code).toBe("unexpected_serve_diff");
     const registry = JSON.parse(readFileSync(registryPath, "utf8"));
@@ -190,7 +231,7 @@ describe("expose", () => {
     // A later expose of the quarantined port is refused.
     const fake2 = new FakeTailscale();
     const { core: core2 } = makeCore(fake2, registryPath);
-    const res2 = await core2.handle(exposeReq(), PEER);
+    const res2 = await core2.handle(reserveReq(), PEER);
     expect(res2.ok).toBe(false);
     if (!res2.ok) expect(res2.code).toBe("quarantined");
   });
@@ -198,7 +239,7 @@ describe("expose", () => {
 
 describe("remove", () => {
   async function exposeAndGetHandle(core: BrokerCore, port = 42010, runtime = RUNTIME_A) {
-    const res = await core.handle(exposeReq(runtime, port), PEER);
+    const res = await reserveAndExpose(core, runtime, port);
     if (!res.ok || res.op !== "expose") throw new Error("expose failed");
     return res.handle;
   }
@@ -235,13 +276,27 @@ describe("remove", () => {
     if (!cross.ok) expect(cross.code).toBe("listener_ownership_mismatch");
     expect(fake.ports.has(42010)).toBe(true); // still there
   });
+
+  it("releases an unexposed reservation without mutating Serve", async () => {
+    const fake = new FakeTailscale();
+    const { core } = makeCore(fake, registryPath);
+    const reserved = await core.handle(reserveReq(), PEER);
+    if (!reserved.ok || reserved.op !== "reserve") throw new Error("reserve failed");
+    const res = await core.handle(
+      { op: "remove", requestId: "req-r", runtimeId: RUNTIME_A, handle: reserved.handle },
+      PEER,
+    );
+    expect(res).toMatchObject({ ok: true, removedPorts: [] });
+    expect(fake.exposeCalls).toBe(0);
+    expect(fake.removeCalls).toBe(0);
+  });
 });
 
 describe("list", () => {
   it("returns caller-owned ports and never lease handles", async () => {
     const fake = new FakeTailscale();
     const { core } = makeCore(fake, registryPath);
-    await core.handle(exposeReq(), PEER);
+    await reserveAndExpose(core);
     const res = await core.handle({ op: "list", requestId: "req-l" }, PEER);
     expect(res.ok).toBe(true);
     if (res.ok && res.op === "list") {
@@ -255,7 +310,7 @@ describe("node identity", () => {
   it("quarantines when the persisted node identity no longer matches", async () => {
     const fake = new FakeTailscale();
     const { core } = makeCore(fake, registryPath);
-    await core.handle(exposeReq(), PEER);
+    await reserveAndExpose(core);
     // Rebuild a core with a different node identity against the same registry.
     const audit = new MemoryAuditSink();
     const core2 = new BrokerCore({
@@ -271,7 +326,7 @@ describe("node identity", () => {
         nowIso: () => "2026-08-11T00:00:00.000Z",
       },
     });
-    const res = await core2.handle(exposeReq(RUNTIME_B, 42011), PEER);
+    const res = await core2.handle(reserveReq(RUNTIME_B, 42011), PEER);
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.code).toBe("quarantined");
   });

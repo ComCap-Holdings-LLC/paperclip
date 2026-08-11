@@ -8,13 +8,32 @@ authority (see [PAP-16989](../../)) while still getting automatic trusted HTTPS
 previews per branch runtime. Design: [PAP-17049](../../) plan; security contract:
 [PAP-17050](../../) threat-model verdict.
 
+Runtime services opt in explicitly; existing services and the primary `:443`
+route are unchanged:
+
+```json
+{
+  "port": { "type": "auto", "envKey": "PORT" },
+  "expose": {
+    "type": "tailscale_https",
+    "hostname": "auto",
+    "publicPort": "same",
+    "includePaperclipViteHmr": true,
+    "failurePolicy": "fail_closed"
+  }
+}
+```
+
 ## What it can and cannot do
 
 Supported operations (over a Unix socket, one runtime-service at a time):
 
 - `list` — the caller's own exposures (never returns lease handles).
-- `expose` — add same-number HTTPS→loopback listeners for an allowlisted port,
-  returning an unguessable lease handle.
+- `reserve` — atomically reserve an app/HMR pair before either backend binds,
+  returning an unguessable, short-lived lease handle bound to the caller,
+  runtime ID, ports, purposes, and generation.
+- `expose` — redeem that reservation only after `/proc` proves both listeners
+  are loopback-only and owned by the configured managed-runtime UID.
 - `remove` — remove the caller's own listeners, proven by exact lease handle.
 
 Hard-denied, deny-by-default: Funnel, certificates, Tailscale Services,
@@ -56,18 +75,30 @@ Tailscale-operator service account distinct from the Paperclip app account.
    Do **not** grant `--operator` to the Paperclip app/agent account (that grant
    was explicitly rejected in PAP-16989).
 
-4. **Create state directories (root-owned, not writable by others).**
+4. **Create state directories (not writable by the Paperclip app).** The
+   packaged unit creates these automatically; for a manual install use:
 
    ```sh
-   sudo install -d -o root -g root -m 0755 /run/paperclip-tailscale-broker
-   sudo install -d -o paperclip-tsbroker -g root -m 0700 /var/lib/paperclip-tailscale-broker
-   sudo install -d -o paperclip-tsbroker -g root -m 0700 /var/log/paperclip-tailscale-broker
+   sudo install -d -o paperclip-tsbroker -g paperclip-tsbroker-sock -m 0750 /run/paperclip-tailscale-broker
+   sudo install -d -o paperclip-tsbroker -g paperclip-tsbroker-sock -m 0700 /var/lib/paperclip-tailscale-broker
+   sudo install -d -o paperclip-tsbroker -g paperclip-tsbroker-sock -m 0700 /var/log/paperclip-tailscale-broker
    ```
 
    The broker refuses to start if the registry path's parent is group/other
    writable.
 
-5. **Install a systemd unit** (`/etc/systemd/system/paperclip-tailscale-broker.service`):
+5. **Build and install the packaged systemd unit.**
+
+   ```sh
+   pnpm --filter @paperclipai/tailscale-https-broker build
+   sudo install -D -m 0644 \
+     packages/tailscale-https-broker/deploy/paperclip-tailscale-https-broker.service \
+     /etc/systemd/system/paperclip-tailscale-https-broker.service
+   sudo install -d -m 0750 /etc/paperclip
+   sudoedit /etc/paperclip/tailscale-https-broker.env
+   ```
+
+   The packaged unit is equivalent to:
 
    ```ini
    [Unit]
@@ -78,17 +109,10 @@ Tailscale-operator service account distinct from the Paperclip app account.
    [Service]
    Type=simple
    User=paperclip-tsbroker
-   # Socket must end up 0660 root:paperclip-tsbroker-sock. Set the group here and
+   # Socket must end up 0660 paperclip-tsbroker:paperclip-tsbroker-sock. Set the group here and
    # the broker chmods the socket to 0660 on bind.
-   SupplementaryGroups=paperclip-tsbroker-sock
-   Environment=BROKER_NODE_IDENTITY=%H
-   Environment=BROKER_SERVICE_UID=<uid of paperclip app account>
-   Environment=BROKER_SERVICE_GID=<gid of paperclip-tsbroker-sock>
-   Environment=BROKER_RUNTIME_UID=<uid of the dedicated managed-runtime account>
-   Environment=BROKER_TAILSCALE_BIN=/usr/bin/tailscale
-   # Only when SO_PEERCRED is not wired and the socket is confirmed 0660
-   # root:<group>. Prefer a native SO_PEERCRED reader when available.
-   Environment=BROKER_TRUST_SOCKET_PERMISSIONS=true
+   Group=paperclip-tsbroker-sock
+   EnvironmentFile=/etc/paperclip/tailscale-https-broker.env
    ExecStart=/usr/bin/node /opt/paperclip/packages/tailscale-https-broker/dist/main.js
    Restart=on-failure
    NoNewPrivileges=true
@@ -99,6 +123,10 @@ Tailscale-operator service account distinct from the Paperclip app account.
    WantedBy=multi-user.target
    ```
 
+   Put the `BROKER_*` values from the table below in the environment file. Set
+   `PAPERCLIP_TAILSCALE_BROKER_SOCKET=/run/paperclip-tailscale-broker/broker.sock`
+   on the Paperclip service only if overriding its default.
+
    Environment variables (defaults in `src/config.ts`):
 
    | Var | Required | Default | Meaning |
@@ -106,7 +134,7 @@ Tailscale-operator service account distinct from the Paperclip app account.
    | `BROKER_NODE_IDENTITY` | yes | — | hostname + boot id; a change forces quarantine + operator reconciliation |
    | `BROKER_SERVICE_UID` | yes | — | UID of the Paperclip **app** account allowed to connect |
    | `BROKER_SERVICE_GID` | yes | — | GID of the dedicated socket group (caller's primary GID) |
-   | `BROKER_RUNTIME_UID` | yes | — | UID of the dedicated managed-runtime account whose loopback listeners are eligible |
+   | `BROKER_RUNTIME_UID` | yes | — | UID that owns Paperclip-managed runtime processes (normally the Paperclip app service account); only its loopback listeners are eligible |
    | `BROKER_TAILSCALE_BIN` | no | `/usr/bin/tailscale` | absolute path to the Tailscale CLI |
    | `BROKER_SOCKET_PATH` | no | `/run/paperclip-tailscale-broker/broker.sock` | Unix socket path |
    | `BROKER_REGISTRY_PATH` | no | `/var/lib/paperclip-tailscale-broker/registry.json` | root-owned `0600` ownership registry |
@@ -126,7 +154,8 @@ Tailscale-operator service account distinct from the Paperclip app account.
    node identity. Exit 0 = ready. It never mutates Serve state.
 
 7. **Enable.** `sudo systemctl daemon-reload && sudo systemctl enable --now
-   paperclip-tailscale-broker`. Confirm the socket is `0660 root:<group>`.
+   paperclip-tailscale-broker`. Confirm the socket is `0660
+   paperclip-tsbroker:paperclip-tsbroker-sock`.
 
 ## Upgrade
 
@@ -163,6 +192,7 @@ redacted.
 ## Tests
 
 ```sh
-pnpm --filter @paperclipai/tailscale-https-broker test        # 57 tests
+pnpm --filter @paperclipai/tailscale-https-broker test        # 60 tests
 pnpm --filter @paperclipai/tailscale-https-broker typecheck
+pnpm --filter @paperclipai/tailscale-https-broker build
 ```

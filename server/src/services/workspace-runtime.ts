@@ -5330,8 +5330,6 @@ export async function reconcilePersistedRuntimeServicesOnStartup(db: Db) {
       ),
     );
 
-  if (rows.length === 0) return { reconciled: 0, adopted: 0, stopped: 0 };
-
   let reconciled = 0;
   let adopted = 0;
   let stopped = 0;
@@ -5457,7 +5455,20 @@ export async function reconcilePersistedRuntimeServicesOnStartup(db: Db) {
     stopped += 1;
   }
 
-  return { reconciled, adopted, stopped };
+  // Row reconciliation alone cannot repair the process-start crash window: the
+  // local service registry may contain a healthy managed process whose DB row
+  // was never committed. Re-applying persisted desired state adopts that
+  // registry entry (or restarts a missing service) and makes it visible to
+  // workspace cleanup through workspace_runtime_services again.
+  const desiredState = await restartDesiredRuntimeServicesOnStartup(db);
+
+  return {
+    reconciled,
+    adopted,
+    stopped,
+    restarted: desiredState.restarted,
+    restartFailed: desiredState.failed,
+  };
 }
 
 export async function restartDesiredRuntimeServicesOnStartup(db: Db) {

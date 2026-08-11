@@ -5645,6 +5645,161 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
     await db.delete(companies);
   });
 
+  it("restores desired services when one row is stopped and a live registered service has no row", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-desired-reconcile-"));
+    const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-home-"));
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = `runtime-desired-reconcile-${randomUUID()}`;
+
+    const reservePort = async () => {
+      const probe = net.createServer();
+      await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+      const address = probe.address();
+      const port = typeof address === "object" && address ? address.port : null;
+      await new Promise<void>((resolve, reject) => {
+        probe.close((error) => error ? reject(error) : resolve());
+      });
+      if (!port) throw new Error("Failed to reserve runtime reconciliation test port");
+      return port;
+    };
+    const stoppedPort = await reservePort();
+    const livePort = await reservePort();
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const command =
+      "node -e \"require('node:http').createServer((req,res)=>res.end(process.env.PORT)).listen(Number(process.env.PORT), '127.0.0.1')\"";
+    const workspaceRuntime = {
+      services: [
+        {
+          name: "persisted-service",
+          command,
+          port: stoppedPort,
+          expose: { urlTemplate: "http://127.0.0.1:{{port}}" },
+          readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 10, intervalMs: 50 },
+          lifecycle: "shared",
+          reuseScope: "execution_workspace",
+          stopPolicy: { type: "manual" },
+        },
+        {
+          name: "registry-only-service",
+          command,
+          port: livePort,
+          expose: { urlTemplate: "http://127.0.0.1:{{port}}" },
+          readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 10, intervalMs: 50 },
+          lifecycle: "shared",
+          reuseScope: "execution_workspace",
+          stopPolicy: { type: "manual" },
+        },
+      ],
+    };
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Runtime desired reconciliation",
+      status: "in_progress",
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary",
+      sourceType: "local_path",
+      cwd: workspaceRoot,
+      isPrimary: true,
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Runtime desired reconciliation workspace",
+      status: "active",
+      cwd: workspaceRoot,
+      providerType: "local_fs",
+      providerRef: workspaceRoot,
+      metadata: {
+        config: {
+          workspaceRuntime,
+          desiredState: "running",
+          serviceStates: { "0": "running", "1": "running" },
+        },
+      },
+    });
+
+    const actor = { id: null, name: "Paperclip", companyId };
+    const workspace = {
+      ...buildWorkspace(workspaceRoot),
+      projectId,
+      workspaceId: projectWorkspaceId,
+    };
+    let stoppedServiceId: string | null = null;
+    let registryOnlyServiceId: string | null = null;
+
+    try {
+      const persisted = await startRuntimeServicesForWorkspaceControl({
+        db,
+        actor,
+        issue: null,
+        workspace,
+        executionWorkspaceId,
+        config: { workspaceRuntime },
+        adapterEnv: {},
+        serviceIndex: 0,
+      });
+      stoppedServiceId = persisted[0]?.id ?? null;
+      await stopRuntimeServicesForExecutionWorkspace({
+        db,
+        executionWorkspaceId,
+        workspaceCwd: workspaceRoot,
+        runtimeServiceId: stoppedServiceId,
+      });
+
+      const registryOnly = await startRuntimeServicesForWorkspaceControl({
+        actor,
+        issue: null,
+        workspace,
+        executionWorkspaceId,
+        config: { workspaceRuntime },
+        adapterEnv: {},
+        serviceIndex: 1,
+      });
+      registryOnlyServiceId = registryOnly[0]?.id ?? null;
+      expect(registryOnlyServiceId).toBeTruthy();
+      expect(await db.select().from(workspaceRuntimeServices)).toHaveLength(1);
+
+      await resetRuntimeServicesForTests();
+      const result = await reconcilePersistedRuntimeServicesOnStartup(db);
+
+      expect(result).toMatchObject({ reconciled: 0, adopted: 0, stopped: 0, restarted: 1, restartFailed: 0 });
+      const rows = await db.select().from(workspaceRuntimeServices);
+      expect(rows).toHaveLength(2);
+      expect(rows).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: stoppedServiceId, port: stoppedPort, status: "running" }),
+        expect.objectContaining({ id: registryOnlyServiceId, port: livePort, status: "running" }),
+      ]));
+      await expect(fetch(`http://127.0.0.1:${stoppedPort}`)).resolves.toMatchObject({ ok: true });
+      await expect(fetch(`http://127.0.0.1:${livePort}`)).resolves.toMatchObject({ ok: true });
+    } finally {
+      await stopRuntimeServicesForExecutionWorkspace({
+        db,
+        executionWorkspaceId,
+        workspaceCwd: workspaceRoot,
+      });
+      await fs.rm(paperclipHome, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it("adopts a live auto-port shared service after runtime state is reset", async () => {
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-reconcile-"));
     const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-home-"));

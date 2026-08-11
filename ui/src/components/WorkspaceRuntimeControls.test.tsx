@@ -47,6 +47,7 @@ function createRuntimeService(overrides: Partial<WorkspaceRuntimeService> = {}):
     stoppedAt: overrides.stoppedAt ?? null,
     stopPolicy: overrides.stopPolicy ?? null,
     healthStatus: overrides.healthStatus ?? "unknown",
+    exposure: overrides.exposure ?? null,
     configIndex: overrides.configIndex ?? null,
     createdAt: overrides.createdAt ?? new Date("2026-04-12T00:00:00.000Z"),
     updatedAt: overrides.updatedAt ?? new Date("2026-04-12T00:00:00.000Z"),
@@ -626,6 +627,36 @@ describe("buildWorkspaceServiceControlEntries", () => {
 
     expect(entries[0].state).toBe("failed");
     expect(entries[0].failureDetail).toMatch(/^Service failed · /);
+  });
+
+  it("surfaces HTTPS failure independently while the backend remains running", () => {
+    const running = createRuntimeService({
+      status: "running",
+      healthStatus: "healthy",
+      port: 42000,
+      url: null,
+      exposure: {
+        provider: "tailscale_https",
+        state: "failed",
+        publicUrl: null,
+        hostname: "runner.tail123.ts.net",
+        listeners: [{ purpose: "app", publicPort: 42000, targetPort: 42000 }],
+        brokerRef: "service-1",
+        lastError: "cli_error",
+        updatedAt: "2026-08-11T00:00:00.000Z",
+      },
+    });
+    const built = buildWorkspaceRuntimeControlSections({
+      runtimeConfig: { commands: [{ id: "web", name: "web", kind: "service", command: "pnpm dev" }] },
+      runtimeServices: [running],
+      canStartServices: true,
+    });
+    const [entry] = buildWorkspaceServiceControlEntries({ sections: built, runtimeServices: [running] });
+
+    expect(entry.state).toBe("running");
+    expect(entry.exposureState).toBe("failed");
+    expect(entry.exposureDetail).toMatch(/^HTTPS unavailable/);
+    expect(entry.exposureDetail).not.toContain("cli_error");
   });
 });
 

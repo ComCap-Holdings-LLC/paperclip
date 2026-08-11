@@ -1,12 +1,23 @@
 // @vitest-environment jsdom
 
-import { act } from "react";
+import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WorkspaceServiceControlBar } from "./WorkspaceServiceControlBar";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+
+async function act(callback: () => void | Promise<void>) {
+  let pending: void | Promise<void>;
+  flushSync(() => {
+    pending = callback();
+  });
+  await pending!;
+  await Promise.resolve();
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  flushSync(() => {});
+}
 
 describe("WorkspaceServiceControlBar", () => {
   let container: HTMLDivElement;
@@ -104,5 +115,27 @@ describe("WorkspaceServiceControlBar", () => {
     const runningSegment = await renderService("running", "http://127.0.0.1:3100");
     expect(runningSegment).not.toBeNull();
     expect(runningSegment?.className).toBe(stoppedSegment?.className);
+  });
+
+  it("renders HTTPS cleanup separately from process running state", async () => {
+    await act(() => {
+      root.render(
+        <WorkspaceServiceControlBar
+          services={[{
+            key: "web",
+            name: "Web",
+            state: "running",
+            healthStatus: "healthy",
+            exposureState: "cleanup_pending",
+            exposureDetail: "HTTPS cleanup pending · Restart the host broker before reusing this port.",
+          }]}
+          onAction={() => {}}
+        />,
+      );
+    });
+
+    expect(container.textContent).toContain("Running");
+    expect(container.textContent).toContain("HTTPS cleanup pending");
+    expect(container.querySelector(".text-destructive")).not.toBeNull();
   });
 });

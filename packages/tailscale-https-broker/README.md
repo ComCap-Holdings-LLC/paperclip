@@ -87,10 +87,18 @@ Tailscale-operator service account distinct from the Paperclip app account.
    The broker refuses to start if the registry path's parent is group/other
    writable.
 
-5. **Build and install the packaged systemd unit.**
+5. **Build, install the package under `/opt/paperclip`, and install the
+   packaged systemd unit.** The unit's `ExecStart` (and the doctor command
+   below) run the build output from
+   `/opt/paperclip/packages/tailscale-https-broker/dist`, so copy it there
+   explicitly. The output is self-contained (Node builtins only; no
+   `node_modules` needed).
 
    ```sh
    pnpm --filter @paperclipai/tailscale-https-broker build
+   sudo install -d -m 0755 /opt/paperclip/packages/tailscale-https-broker
+   sudo cp -r packages/tailscale-https-broker/dist \
+     /opt/paperclip/packages/tailscale-https-broker/
    sudo install -D -m 0644 \
      packages/tailscale-https-broker/deploy/paperclip-tailscale-https-broker.service \
      /etc/systemd/system/paperclip-tailscale-https-broker.service
@@ -154,12 +162,14 @@ Tailscale-operator service account distinct from the Paperclip app account.
    node identity. Exit 0 = ready. It never mutates Serve state.
 
 7. **Enable.** `sudo systemctl daemon-reload && sudo systemctl enable --now
-   paperclip-tailscale-broker`. Confirm the socket is `0660
+   paperclip-tailscale-https-broker`. Confirm the socket is `0660
    paperclip-tsbroker:paperclip-tsbroker-sock`.
 
 ## Upgrade
 
-Deploy new package output, `systemctl restart paperclip-tailscale-broker`. On
+Deploy new package output to
+`/opt/paperclip/packages/tailscale-https-broker/dist`, then
+`sudo systemctl restart paperclip-tailscale-https-broker`. On
 restart the broker re-reads its root-owned registry and adopts only exact-lease
 matches; a changed `BROKER_NODE_IDENTITY` (host reimage / boot-id change) forces
 quarantine and operator reconciliation rather than silently re-adopting.
@@ -173,7 +183,7 @@ resets Serve or changes the primary route.
    `expose`). Existing previews drain on runtime stop.
 2. Drain owned listeners: stop each managed runtime so Paperclip issues `remove`
    for its own leases (proven by handle).
-3. `sudo systemctl disable --now paperclip-tailscale-broker`.
+3. `sudo systemctl disable --now paperclip-tailscale-https-broker`.
 4. Optional cleanup: remove the state dirs and `sudo tailscale set --operator=`
    to drop the operator grant. Do **not** run `tailscale serve reset` — remove
    only the specific per-port Serve entries if any remain.
@@ -192,7 +202,7 @@ redacted.
 ## Tests
 
 ```sh
-pnpm --filter @paperclipai/tailscale-https-broker test        # 60 tests
+pnpm --filter @paperclipai/tailscale-https-broker test        # 65 tests
 pnpm --filter @paperclipai/tailscale-https-broker typecheck
 pnpm --filter @paperclipai/tailscale-https-broker build
 ```

@@ -10,8 +10,12 @@ import type { CliResult } from "./broker-core.js";
 const MAX_OUTPUT_BYTES = 256 * 1024;
 const DEFAULT_TIMEOUT_MS = 10_000;
 
-/** Tailscale CLI versions this broker has been validated against (pinned). */
-export const SUPPORTED_TAILSCALE_VERSIONS = new Set<string>(["1.80", "1.82", "1.84"]);
+/**
+ * Minimum Tailscale CLI version the broker accepts. Serve subcommand syntax and
+ * JSON status output are stable from this release onward, so newer releases are
+ * accepted by numeric comparison rather than a pinned allowlist.
+ */
+export const MIN_TAILSCALE_VERSION = { major: 1, minor: 80 } as const;
 
 export function createTailscaleRunner(options: { timeoutMs?: number } = {}) {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -39,13 +43,15 @@ export function createTailscaleRunner(options: { timeoutMs?: number } = {}) {
   };
 }
 
-/** Parse the `major.minor` prefix of `tailscale version` output. */
-export function parseTailscaleMinor(versionOutput: string): string | null {
+/** Parse the numeric `major.minor` prefix of `tailscale version` output. */
+export function parseTailscaleVersion(versionOutput: string): { major: number; minor: number } | null {
   const match = /^\s*(\d+)\.(\d+)/.exec(versionOutput);
-  return match ? `${match[1]}.${match[2]}` : null;
+  return match ? { major: Number(match[1]), minor: Number(match[2]) } : null;
 }
 
 export function isSupportedTailscaleVersion(versionOutput: string): boolean {
-  const minor = parseTailscaleMinor(versionOutput);
-  return minor !== null && SUPPORTED_TAILSCALE_VERSIONS.has(minor);
+  const version = parseTailscaleVersion(versionOutput);
+  if (version === null) return false;
+  if (version.major !== MIN_TAILSCALE_VERSION.major) return version.major > MIN_TAILSCALE_VERSION.major;
+  return version.minor >= MIN_TAILSCALE_VERSION.minor;
 }

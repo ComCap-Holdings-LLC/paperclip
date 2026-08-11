@@ -35,6 +35,7 @@ function runtimeServiceRow(
     stoppedAt: now,
     stopPolicy: null,
     healthStatus: "unknown",
+    exposure: null,
     createdAt: now,
     updatedAt: now,
     ...overrides,

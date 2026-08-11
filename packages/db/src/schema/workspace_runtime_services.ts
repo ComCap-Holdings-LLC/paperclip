@@ -48,6 +48,10 @@ export const workspaceRuntimeServices = pgTable(
     // independently of process `status`/`healthStatus` so HTTPS provisioning /
     // failure / cleanup surface separately from backend process health.
     exposure: jsonb("exposure").$type<RuntimeExposureStatus | null>(),
+    // Server-private reservation/lease handle and backend readiness URL. These
+    // are deliberately never serialized to API clients.
+    exposureHandle: text("exposure_handle"),
+    backendUrl: text("backend_url"),
     healthStatus: text("health_status").notNull().default("unknown"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

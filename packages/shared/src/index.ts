@@ -2406,8 +2406,11 @@ export {
   runtimeExposureListenerSchema,
   runtimeExposureStatusSchema,
   parseRuntimeExposureConfig,
+  readRuntimeExposureIntent,
+  resolveDeclaredRuntimeExposureConfig,
   DEFAULT_TAILSCALE_HTTPS_EXPOSURE,
   type RuntimeExposureConfigInput,
+  type RuntimeExposureIntent,
   type RuntimeExposureStatusInput,
 } from "./validators/runtime-exposure.js";
 export {

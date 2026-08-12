@@ -86,3 +86,78 @@ export function parseRuntimeExposureConfig(
   if (value === undefined || value === null) return null;
   return runtimeExposureConfigSchema.parse(value);
 }
+
+/**
+ * What an `expose` block says about HTTPS exposure, independent of whether the
+ * runtime is eligible for it.
+ *
+ * `unset` is the common case: legacy templates only declare
+ * `{ type: "url", urlTemplate }` for the backend readiness URL and say nothing
+ * about exposure. Those runtimes are defaulted to `tailscale_https` by the
+ * server start path when they are eligible (PAP-17158), so no project template
+ * or UI caller has to supply an exposure block.
+ */
+export type RuntimeExposureIntent = "enabled" | "disabled" | "unset";
+
+/**
+ * Keys of the exposure contract itself. Anything a declared `tailscale_https`
+ * block sets outside this list (and {@link RUNTIME_EXPOSURE_TRANSPORT_KEYS}) is
+ * rejected, so a malformed or injected config still cannot smuggle an arbitrary
+ * target, path, or hostname suffix through to the broker (PAP-17050 verdict).
+ */
+const RUNTIME_EXPOSURE_CONFIG_KEYS = [
+  "type",
+  "hostname",
+  "publicPort",
+  "includePaperclipViteHmr",
+  "failurePolicy",
+] as const;
+
+/**
+ * Pre-existing `expose` keys that describe the *backend* URL rather than the
+ * exposure, and may legitimately sit next to a `tailscale_https` declaration.
+ */
+const RUNTIME_EXPOSURE_TRANSPORT_KEYS = ["urlTemplate", "tailscaleHttps"] as const;
+
+/**
+ * Read the declared intent off an `expose` block.
+ *
+ * An explicit negative always wins over an explicit positive so a deliberate
+ * opt-out can never be re-enabled by a stale `type` left in the same block.
+ */
+export function readRuntimeExposureIntent(value: unknown): RuntimeExposureIntent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "unset";
+  const expose = value as Record<string, unknown>;
+  // Deliberate opt-outs, checked first.
+  if (expose.tailscaleHttps === false) return "disabled";
+  if (expose.type === "none") return "disabled";
+  if (expose.type === "tailscale_https" || expose.tailscaleHttps === true) return "enabled";
+  return "unset";
+}
+
+/**
+ * Resolve the exposure config a service *declared* (as opposed to the one it
+ * inherits by default). Returns null unless the block explicitly opts in.
+ *
+ * Recognized sub-fields fall back to {@link DEFAULT_TAILSCALE_HTTPS_EXPOSURE},
+ * so `{ type: "tailscale_https" }` is a complete declaration; unknown keys still
+ * throw rather than being silently dropped.
+ */
+export function resolveDeclaredRuntimeExposureConfig(
+  value: unknown,
+): RuntimeExposureConfigInput | null {
+  if (readRuntimeExposureIntent(value) !== "enabled") return null;
+  const expose = value as Record<string, unknown>;
+  const known = new Set<string>([...RUNTIME_EXPOSURE_CONFIG_KEYS, ...RUNTIME_EXPOSURE_TRANSPORT_KEYS]);
+  const unknownKeys = Object.keys(expose).filter((key) => !known.has(key));
+  if (unknownKeys.length > 0) {
+    throw new Error(`Unsupported expose field(s): ${unknownKeys.sort().join(", ")}`);
+  }
+  const merged: Record<string, unknown> = { ...DEFAULT_TAILSCALE_HTTPS_EXPOSURE };
+  for (const key of RUNTIME_EXPOSURE_CONFIG_KEYS) {
+    if (expose[key] !== undefined) merged[key] = expose[key];
+  }
+  // `tailscaleHttps: true` is shorthand for the provider; normalize it away.
+  merged.type = "tailscale_https";
+  return runtimeExposureConfigSchema.parse(merged);
+}

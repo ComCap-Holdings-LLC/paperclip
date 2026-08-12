@@ -49,6 +49,7 @@ import {
 import {
   findAdoptableLocalService,
   isLocalServiceRegistryCwdCompatible,
+  isLocalServiceProcessOwnedBy,
   isLocalServiceProcessInWorkspace,
   readLocalServicePortOwner,
   writeLocalServiceRegistryRecord,
@@ -4621,6 +4622,35 @@ describe("readLocalServicePortOwner", () => {
           else resolve();
         });
       });
+    }
+  });
+
+  it("attributes a Windows listener to a descendant of the launched process", async () => {
+    const fakeBin = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-windows-tools-"));
+    const previousPath = process.env.PATH;
+    const port = 43_123;
+    const listenerPid = 43_210;
+    const launchedPid = 32_000;
+    await fs.writeFile(
+      path.join(fakeBin, "netstat"),
+      `#!/bin/sh\nprintf '  TCP    127.0.0.1:${port}    0.0.0.0:0    LISTENING    ${listenerPid}\\n'\n`,
+      { mode: 0o755 },
+    );
+    await fs.writeFile(
+      path.join(fakeBin, "powershell.exe"),
+      `#!/bin/sh\nprintf '${launchedPid}\\n'\n`,
+      { mode: 0o755 },
+    );
+    process.env.PATH = `${fakeBin}${path.delimiter}${previousPath ?? ""}`;
+    Object.defineProperty(process, "platform", { value: "win32" });
+
+    try {
+      await expect(readLocalServicePortOwner(port)).resolves.toBe(listenerPid);
+      await expect(isLocalServiceProcessOwnedBy(listenerPid, launchedPid)).resolves.toBe(true);
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      await fs.rm(fakeBin, { recursive: true, force: true });
     }
   });
 

@@ -28,9 +28,9 @@ import {
   createLocalServiceKey,
   findLocalServiceRegistryRecordByRuntimeServiceId,
   findAdoptableLocalService,
+  isLocalServiceProcessOwnedBy,
   isLocalServiceProcessInWorkspace,
   readLocalServiceProcessCwd,
-  readLocalServiceProcessGroupId,
   readLocalServicePortOwner,
   removeLocalServiceRegistryRecord,
   terminateLocalService,
@@ -3991,10 +3991,7 @@ async function waitForAllocatedPortBind(input: {
     const ownerPid = await readLocalServicePortOwner(input.port);
     if (ownerPid) {
       const childPid = input.child.pid ?? null;
-      const ownerProcessGroupId = ownerPid === childPid
-        ? childPid
-        : await readLocalServiceProcessGroupId(ownerPid);
-      if (!childPid || ownerProcessGroupId !== childPid) {
+      if (!childPid || !(await isLocalServiceProcessOwnedBy(ownerPid, childPid))) {
         throw new RuntimeServicePortBindCollision(input.port);
       }
       // Require the same launched process group to retain ownership across a stability delay.
@@ -4004,12 +4001,7 @@ async function waitForAllocatedPortBind(input: {
         throw new Error("service process exited after losing its allocated port");
       }
       const stableOwnerPid = await readLocalServicePortOwner(input.port);
-      const stableOwnerProcessGroupId = stableOwnerPid === childPid
-        ? childPid
-        : stableOwnerPid
-          ? await readLocalServiceProcessGroupId(stableOwnerPid)
-          : null;
-      if (stableOwnerProcessGroupId !== childPid) {
+      if (!stableOwnerPid || !(await isLocalServiceProcessOwnedBy(stableOwnerPid, childPid))) {
         throw new RuntimeServicePortBindCollision(input.port);
       }
       return;
@@ -4024,12 +4016,7 @@ async function waitForAllocatedPortBind(input: {
       }
       const stableOwnerPid = await readLocalServicePortOwner(input.port);
       const childPid = input.child.pid ?? null;
-      const stableOwnerProcessGroupId = stableOwnerPid === childPid
-        ? childPid
-        : stableOwnerPid
-          ? await readLocalServiceProcessGroupId(stableOwnerPid)
-          : null;
-      if (childPid && stableOwnerProcessGroupId === childPid) return;
+      if (stableOwnerPid && childPid && await isLocalServiceProcessOwnedBy(stableOwnerPid, childPid)) return;
       throw new RuntimeServicePortBindCollision(input.port);
     }
     await delay(50);

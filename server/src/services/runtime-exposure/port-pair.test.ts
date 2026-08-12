@@ -44,6 +44,50 @@ describe("allocateExposurePortPair", () => {
     expect(pair.appPort).toBe(RUNTIME_EXPOSURE_APP_PORT_MIN + 2);
   });
 
+  describe("preferredAppPort (keep existing runtime ports when safe)", () => {
+    it("keeps a preferred in-range port instead of restarting the scan", async () => {
+      const pair = await allocateExposurePortPair({
+        isPortAvailable: async () => true,
+        preferredAppPort: 42_500,
+      });
+      expect(pair.appPort).toBe(42_500);
+      expect(pair.hmrPort).toBe(42_500 + RUNTIME_EXPOSURE_HMR_PORT_OFFSET);
+    });
+
+    it("ignores a legacy pinned port outside the dedicated range", async () => {
+      // 45439 is the pre-feature Paperclip App port; the broker can never
+      // publish it, so the allocator must relocate rather than fail.
+      const pair = await allocateExposurePortPair({
+        isPortAvailable: async () => true,
+        preferredAppPort: 45_439,
+      });
+      expect(pair.appPort).toBe(RUNTIME_EXPOSURE_APP_PORT_MIN);
+    });
+
+    it("falls back to the scan when the preferred port is busy or reserved", async () => {
+      const busy = await allocateExposurePortPair({
+        isPortAvailable: async (port) => port !== 42_500,
+        preferredAppPort: 42_500,
+      });
+      expect(busy.appPort).toBe(RUNTIME_EXPOSURE_APP_PORT_MIN);
+
+      const reservedCompanion = await allocateExposurePortPair({
+        isPortAvailable: async () => true,
+        reserved: new Set([42_500 + RUNTIME_EXPOSURE_HMR_PORT_OFFSET]),
+        preferredAppPort: 42_500,
+      });
+      expect(reservedCompanion.appPort).toBe(RUNTIME_EXPOSURE_APP_PORT_MIN);
+    });
+
+    it("ignores a preferred HMR-range port (never an app port)", async () => {
+      const pair = await allocateExposurePortPair({
+        isPortAvailable: async () => true,
+        preferredAppPort: RUNTIME_EXPOSURE_APP_PORT_MIN + RUNTIME_EXPOSURE_HMR_PORT_OFFSET,
+      });
+      expect(pair.appPort).toBe(RUNTIME_EXPOSURE_APP_PORT_MIN);
+    });
+  });
+
   it("throws when the dedicated range is exhausted", async () => {
     await expect(
       allocateExposurePortPair({ isPortAvailable: async () => false }),

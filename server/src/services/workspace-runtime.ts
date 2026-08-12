@@ -10,8 +10,10 @@ import type { AdapterRuntimeServiceReport } from "@paperclipai/adapter-utils";
 import type { Db } from "@paperclipai/db";
 import { executionWorkspaces, issueComments, issues, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import {
+  DEFAULT_TAILSCALE_HTTPS_EXPOSURE,
   listWorkspaceServiceCommandDefinitions,
-  parseRuntimeExposureConfig,
+  readRuntimeExposureIntent,
+  resolveDeclaredRuntimeExposureConfig,
   type RuntimeExposureConfigInput,
   type RuntimeExposureStatus,
   type GitWorktreeBranchAncestryVerdict,
@@ -207,6 +209,13 @@ const DEFAULT_TAILSCALE_BROKER_SOCKET = "/run/paperclip-tailscale-broker/broker.
 export type WorkspaceRuntimeExposureDeps = ExposureManagerDeps & {
   resolveHostname: () => Promise<string>;
   isPortAvailable: (port: number) => Promise<boolean>;
+  /**
+   * Whether this host can actually broker HTTPS exposures right now. Gating the
+   * automatic default on broker availability is what keeps a Paperclip install
+   * without the host broker from failing every managed runtime start closed.
+   * An explicit opt-in still bypasses this and fails loudly.
+   */
+  isBrokerAvailable: () => Promise<boolean>;
 };
 
 async function isLoopbackPortAvailable(port: number): Promise<boolean> {
@@ -220,14 +229,28 @@ async function isLoopbackPortAvailable(port: number): Promise<boolean> {
   });
 }
 
+function resolveTailscaleBrokerSocketPath(): string {
+  return process.env.PAPERCLIP_TAILSCALE_BROKER_SOCKET?.trim() || DEFAULT_TAILSCALE_BROKER_SOCKET;
+}
+
 function defaultWorkspaceRuntimeExposureDeps(): WorkspaceRuntimeExposureDeps {
-  const broker: BrokerClient = new UnixBrokerClient({
-    socketPath: process.env.PAPERCLIP_TAILSCALE_BROKER_SOCKET?.trim() || DEFAULT_TAILSCALE_BROKER_SOCKET,
-  });
+  const socketPath = resolveTailscaleBrokerSocketPath();
+  const broker: BrokerClient = new UnixBrokerClient({ socketPath });
   return {
     broker,
     resolveHostname: () => resolveTailscaleDnsName(),
     isPortAvailable: isLoopbackPortAvailable,
+    isBrokerAvailable: async () => {
+      try {
+        // Presence of the socket, not a probe request: availability is checked
+        // on every managed start, and an unauthenticated connect storm against
+        // the broker would be its own problem.
+        const stats = await fs.stat(socketPath);
+        return stats.isSocket();
+      } catch {
+        return false;
+      }
+    },
     probeHealth: async (url) => {
       try {
         const response = await fetch(url, {
@@ -250,10 +273,113 @@ export function setWorkspaceRuntimeExposureDepsForTests(deps: WorkspaceRuntimeEx
   workspaceRuntimeExposureDeps = deps;
 }
 
-function configuredRuntimeExposure(service: Record<string, unknown>): RuntimeExposureConfigInput | null {
-  const expose = parseObject(service.expose);
-  if (asString(expose.type, "") !== "tailscale_https") return null;
-  return parseRuntimeExposureConfig(expose);
+/**
+ * Deployment-level switch for the automatic default (PAP-17158).
+ *
+ *  - `auto` (default): eligible Paperclip-managed worktree runtimes get
+ *    `tailscale_https` without any project template or UI caller supplying an
+ *    exposure block, provided the host broker is available.
+ *  - `off`: no automatic default. Explicit opt-ins still work.
+ *  - `force`: default even when the broker socket is missing, so a
+ *    misconfigured host fails closed and loudly instead of silently serving
+ *    plain HTTP. Intended for deployments that require HTTPS previews.
+ */
+export type ManagedRuntimeHttpsMode = "auto" | "off" | "force";
+
+export function resolveManagedRuntimeHttpsMode(): ManagedRuntimeHttpsMode {
+  const raw = process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS?.trim().toLowerCase();
+  if (raw === "off" || raw === "false" || raw === "0") return "off";
+  if (raw === "force") return "force";
+  return "auto";
+}
+
+/**
+ * Whether a service would be defaulted to HTTPS if it declared nothing.
+ *
+ * Intentionally narrow: only the Paperclip-managed dev runtime. Unmanaged and
+ * custom external services are left exactly as they are, because the broker
+ * only publishes allowlisted loopback ports it can prove Paperclip owns and we
+ * do not want to relocate a service somebody else addresses by port.
+ *
+ * A *pinned* port is still a candidate. The pre-feature Paperclip App template
+ * hard-codes `port: 45439`, which the broker's dedicated allowlist can never
+ * publish, so defaulting it to HTTPS necessarily relocates it into the
+ * dedicated range. "Keep existing runtime ports when safe" is honored one layer
+ * down, by preferring the current port when it already *is* an allowlisted app
+ * port with a free HMR companion.
+ */
+function isManagedHttpsDefaultCandidate(input: {
+  serviceName: string;
+  command: string | null;
+}): boolean {
+  return isPaperclipDevRuntimeService(input);
+}
+
+export type ResolvedRuntimeServiceExposure = {
+  config: RuntimeExposureConfigInput;
+  /**
+   * `declared` — the project template or UI caller asked for HTTPS.
+   * `default` — the server applied the automatic default (PAP-17158).
+   *
+   * The distinction matters for port handling: a declared opt-in on a pinned
+   * port is an operator misconfiguration and fails loudly, while the automatic
+   * default is allowed to relocate a legacy pinned port into the dedicated
+   * exposure range.
+   */
+  origin: "declared" | "default";
+};
+
+/**
+ * Resolve the exposure config for one runtime service start.
+ *
+ * Precedence: deliberate opt-out → explicit opt-in → automatic default for
+ * eligible managed runtimes → none.
+ */
+async function resolveRuntimeServiceExposure(input: {
+  service: Record<string, unknown>;
+  serviceName: string;
+  command: string | null;
+}): Promise<ResolvedRuntimeServiceExposure | null> {
+  const expose = parseObject(input.service.expose);
+  const intent = readRuntimeExposureIntent(expose);
+  if (intent === "disabled") return null;
+  // An explicit opt-in is honored verbatim and is never gated on broker
+  // availability: the operator asked for HTTPS, so a missing broker must fail
+  // the start rather than silently downgrade it to HTTP.
+  if (intent === "enabled") {
+    const declared = resolveDeclaredRuntimeExposureConfig(expose);
+    return declared ? { config: declared, origin: "declared" } : null;
+  }
+
+  const mode = resolveManagedRuntimeHttpsMode();
+  if (mode === "off") return null;
+  if (!isManagedHttpsDefaultCandidate({ serviceName: input.serviceName, command: input.command })) {
+    return null;
+  }
+  if (mode !== "force" && !(await workspaceRuntimeExposureDeps.isBrokerAvailable())) return null;
+  return { config: DEFAULT_TAILSCALE_HTTPS_EXPOSURE, origin: "default" };
+}
+
+/**
+ * Whether any entry in a start batch will take the HTTPS exposure path.
+ *
+ * Reads the service name and command straight off the raw config entry rather
+ * than resolving the full reuse identity: templates never rewrite a service
+ * name, and the substrings `isPaperclipDevRuntimeService` matches survive
+ * rendering, so this agrees with the per-service decision made during spawn.
+ */
+async function anyRuntimeServiceUsesHttpsExposure(
+  services: Record<string, unknown>[],
+): Promise<boolean> {
+  for (const service of services) {
+    const resolved = await resolveRuntimeServiceExposure({
+      service,
+      serviceName: asString(service.name, "service"),
+      command: asString(service.command, ""),
+    });
+    if (resolved) return true;
+  }
+  return false;
 }
 
 type ProcessOutputCapture = {
@@ -3658,13 +3784,17 @@ async function allocateAndReserveExposure(input: {
   companyId: string;
   runtimeId: string;
   config: RuntimeExposureConfigInput;
+  /** Port this runtime already used, preserved when it is still safe to use. */
+  preferredAppPort?: number | null;
 }): Promise<{ appPort: number; status: RuntimeExposureStatus; handle: string }> {
   const reserved = await collectReservedExposurePorts(input.db, input.companyId);
   const retryable = new Set(["reservation_conflict", "manual_mapping_present", "quarantined"]);
+  let preferredAppPort = input.preferredAppPort ?? null;
   while (true) {
     const pair = await allocateExposurePortPair({
       isPortAvailable: workspaceRuntimeExposureDeps.isPortAvailable,
       reserved,
+      preferredAppPort,
     });
     const result = await reserveExposure(workspaceRuntimeExposureDeps, {
       runtimeId: input.runtimeId,
@@ -3679,6 +3809,9 @@ async function allocateAndReserveExposure(input: {
     }
     reserved.add(pair.appPort);
     reserved.add(pair.hmrPort);
+    // The preference lost its race with a conflicting/manual/quarantined
+    // mapping; drop it so the retry scans instead of re-offering the same port.
+    preferredAppPort = null;
   }
 }
 
@@ -4400,10 +4533,12 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
   const serviceIdentityFingerprint = input.reuseKey ?? envFingerprint;
   const explicitPort = identity.explicitPort;
   const identityPort = identity.identityPort;
-  const exposureConfig = configuredRuntimeExposure(input.service);
-  if (exposureConfig && asString(portConfig.type, "") !== "auto") {
-    throw new Error(`Runtime service "${serviceName}" must use port.type=auto with tailscale_https exposure`);
-  }
+  const resolvedExposure = await resolveRuntimeServiceExposure({
+    service: input.service,
+    serviceName,
+    command,
+  });
+  const exposureConfig = resolvedExposure?.config ?? null;
   const stoppedReuseCandidate = await findStoppedRuntimeServiceReuseCandidate({
     db: input.db,
     companyId: input.agent.companyId,
@@ -4420,12 +4555,22 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
     reusableStoppedPort = ownerPid ? null : stoppedReuseCandidate.port;
   }
   const runtimeId = input.runtimeServiceId ?? stoppedReuseCandidate?.id ?? randomUUID();
+  // An exposed runtime always takes its port from the dedicated broker range, so
+  // a configured or previously used port is a *preference*, not a constraint. It
+  // is honored when it is already an allowlisted app port whose HMR companion is
+  // free — that keeps a restart on the same port and keeps a backfilled service
+  // stable across deploys — and quietly relocated when it is not, which is the
+  // only way a legacy pinned port (the Paperclip App template's 45439) can be
+  // published at all. If the backend then fails to listen where we allocated,
+  // the broker's /proc ownership proof refuses the mapping and the start fails
+  // closed; it never falls back to HTTP.
   const reservedExposure = exposureConfig
     ? await allocateAndReserveExposure({
         db: input.db,
         companyId: input.agent.companyId,
         runtimeId,
         config: exposureConfig,
+        preferredAppPort: stoppedReuseCandidate?.port ?? (explicitPort > 0 ? explicitPort : null),
       })
     : null;
   const port = reservedExposure
@@ -4569,8 +4714,15 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
       };
     }
   }
-  if (identityPort) {
-      const ownerPid = await readLocalServicePortOwner(identityPort);
+  // A pinned port is only worth a conflict check when the service will actually
+  // bind it. Under HTTPS exposure the port comes from the broker's dedicated
+  // range instead, and both ports in that pair were already probed free before
+  // the lease was taken — so checking the pinned port here would reject a
+  // legacy `port: 45439` service purely because the pre-backfill instance still
+  // holds 45439, which is exactly the workspace this feature has to upgrade.
+  const conflictPort = reservedExposure ? null : identityPort;
+  if (conflictPort) {
+      const ownerPid = await readLocalServicePortOwner(conflictPort);
     if (ownerPid) {
       const ownerCwd = await readLocalServiceProcessCwd(ownerPid);
       const ownerIsInWorkspace = ownerCwd
@@ -4579,11 +4731,11 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
       const ownerDescription = ownerCwd ? `pid ${ownerPid} (cwd: ${ownerCwd})` : `pid ${ownerPid} (cwd unavailable)`;
       if (ownerIsInWorkspace === false) {
         throw new Error(
-          `Runtime service "${serviceName}" could not start because port ${identityPort} has a cross-workspace port conflict with ${ownerDescription}; requested workspace: ${serviceCwd}. Stop the other service or configure a different port.`,
+          `Runtime service "${serviceName}" could not start because port ${conflictPort} has a cross-workspace port conflict with ${ownerDescription}; requested workspace: ${serviceCwd}. Stop the other service or configure a different port.`,
         );
       }
       throw new Error(
-        `Runtime service "${serviceName}" could not start because port ${identityPort} is already in use by ${ownerDescription}`,
+        `Runtime service "${serviceName}" could not start because port ${conflictPort} is already in use by ${ownerDescription}`,
       );
     }
   }
@@ -5361,7 +5513,7 @@ export async function startRuntimeServicesForWorkspaceControl(
   const invocationId = input.invocationId ?? randomUUID();
   const runtimeProvisionCommand = resolveRuntimeProvisionCommand(input);
   const provisionCoordinator = createRuntimeProvisionCoordinator();
-  const hasHttpsExposure = rawServices.some((service) => configuredRuntimeExposure(service) !== null);
+  const hasHttpsExposure = await anyRuntimeServiceUsesHttpsExposure(rawServices);
 
   if (
     rawServices.length === 0

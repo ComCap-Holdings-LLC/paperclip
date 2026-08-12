@@ -35,27 +35,50 @@ export interface AllocateExposurePortPairInput {
    * cleanup, or already reserved by other live runtimes this cycle.
    */
   reserved?: ReadonlySet<number>;
+  /**
+   * The port this runtime is already using, if any. Tried first so a restart or
+   * a backfilled service keeps its port instead of drifting across the range on
+   * every deploy ("keep existing runtime ports when safe", PAP-17158).
+   *
+   * Only honored when it is genuinely safe: the port must be an allowlisted app
+   * port, unreserved, and free together with its HMR companion. A legacy pinned
+   * port outside the dedicated range (the Paperclip App template's 45439) can
+   * never be published by the broker, so it is ignored here rather than making
+   * the caller special-case it.
+   */
+  preferredAppPort?: number | null;
 }
 
 /**
- * Scan the dedicated app-port range in ascending order and return the first
- * app port whose HMR companion is also free and unreserved. Throws when the
- * range is exhausted so the caller fails closed rather than binding an
- * out-of-range port.
+ * Return an app port whose HMR companion is also free and unreserved: the
+ * preferred port when it is eligible, otherwise the first such port scanning the
+ * dedicated range in ascending order. Throws when the range is exhausted so the
+ * caller fails closed rather than binding an out-of-range port.
  */
 export async function allocateExposurePortPair(
   input: AllocateExposurePortPairInput,
 ): Promise<ExposurePortPair> {
   const reserved = input.reserved ?? new Set<number>();
-  for (let appPort = RUNTIME_EXPOSURE_APP_PORT_MIN; appPort <= RUNTIME_EXPOSURE_APP_PORT_MAX; appPort += 1) {
-    if (reserved.has(appPort)) continue;
+
+  const claimIfFree = async (appPort: number): Promise<ExposurePortPair | null> => {
+    if (reserved.has(appPort)) return null;
+    if (!isRuntimeExposureAppPort(appPort)) return null;
     const hmrPort = deriveViteHmrPort(appPort);
-    if (reserved.has(hmrPort)) continue;
-    if (!isRuntimeExposureAppPort(appPort)) continue; // defensive; range guarantees it
+    if (reserved.has(hmrPort)) return null;
     // Probe the app port first; short-circuit before probing the companion.
-    if (!(await input.isPortAvailable(appPort))) continue;
-    if (!(await input.isPortAvailable(hmrPort))) continue;
+    if (!(await input.isPortAvailable(appPort))) return null;
+    if (!(await input.isPortAvailable(hmrPort))) return null;
     return { appPort, hmrPort };
+  };
+
+  if (input.preferredAppPort != null) {
+    const preferred = await claimIfFree(input.preferredAppPort);
+    if (preferred) return preferred;
+  }
+
+  for (let appPort = RUNTIME_EXPOSURE_APP_PORT_MIN; appPort <= RUNTIME_EXPOSURE_APP_PORT_MAX; appPort += 1) {
+    const pair = await claimIfFree(appPort);
+    if (pair) return pair;
   }
   throw new Error(
     `no free app/HMR port pair available in the dedicated runtime exposure range ` +

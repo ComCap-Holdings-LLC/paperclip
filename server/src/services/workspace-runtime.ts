@@ -30,6 +30,7 @@ import {
   findAdoptableLocalService,
   isLocalServiceProcessInWorkspace,
   readLocalServiceProcessCwd,
+  readLocalServiceProcessGroupId,
   readLocalServicePortOwner,
   removeLocalServiceRegistryRecord,
   terminateLocalService,
@@ -3980,7 +3981,6 @@ async function waitForAllocatedPortBind(input: {
   service: Record<string, unknown>;
   port: number;
   child: ChildProcess;
-  serviceCwd: string;
 }) {
   const deadline = Date.now() + resolveWorkspaceRuntimeReadinessTimeoutSec(input.service) * 1000;
   while (Date.now() < deadline) {
@@ -3990,28 +3990,47 @@ async function waitForAllocatedPortBind(input: {
 
     const ownerPid = await readLocalServicePortOwner(input.port);
     if (ownerPid) {
-      const ownerCwd = await readLocalServiceProcessCwd(ownerPid);
-      if (ownerCwd && !(await isLocalServiceProcessInWorkspace(ownerCwd, input.serviceCwd))) {
+      const childPid = input.child.pid ?? null;
+      const ownerProcessGroupId = ownerPid === childPid
+        ? childPid
+        : await readLocalServiceProcessGroupId(ownerPid);
+      if (!childPid || ownerProcessGroupId !== childPid) {
         throw new RuntimeServicePortBindCollision(input.port);
       }
-      // Give the launched process enough time to surface a losing EADDRINUSE race before
-      // accepting the listener. The readiness promise still verifies HTTP services separately.
+      // Require the same launched process group to retain ownership across a stability delay.
+      // Cwd matching alone is insufficient because sibling services can share a workspace.
       await delay(250);
       if (input.child.exitCode !== null || input.child.signalCode !== null) {
         throw new Error("service process exited after losing its allocated port");
       }
+      const stableOwnerPid = await readLocalServicePortOwner(input.port);
+      const stableOwnerProcessGroupId = stableOwnerPid === childPid
+        ? childPid
+        : stableOwnerPid
+          ? await readLocalServiceProcessGroupId(stableOwnerPid)
+          : null;
+      if (stableOwnerProcessGroupId !== childPid) {
+        throw new RuntimeServicePortBindCollision(input.port);
+      }
       return;
     }
 
-    // `lsof` is not guaranteed to exist on every supported host. A failed bind probe still
-    // confirms that a listener appeared; the stability delay above/below lets an unsuccessful
-    // child report EADDRINUSE before the allocation is accepted.
+    // A failed bind probe proves only that some listener appeared. If listener ownership cannot
+    // be attributed to this child after a stability delay, retry instead of accepting a sibling.
     if (!(await canBindRuntimePort(input.port))) {
       await delay(250);
       if (input.child.exitCode !== null || input.child.signalCode !== null) {
         throw new Error("service process exited after losing its allocated port");
       }
-      return;
+      const stableOwnerPid = await readLocalServicePortOwner(input.port);
+      const childPid = input.child.pid ?? null;
+      const stableOwnerProcessGroupId = stableOwnerPid === childPid
+        ? childPid
+        : stableOwnerPid
+          ? await readLocalServiceProcessGroupId(stableOwnerPid)
+          : null;
+      if (childPid && stableOwnerProcessGroupId === childPid) return;
+      throw new RuntimeServicePortBindCollision(input.port);
     }
     await delay(50);
   }
@@ -4743,7 +4762,7 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
     Promise.all([
       waitForReadiness({ service: input.service, serviceName, command, url, readinessUrl }),
       canAllocateFixedPort && port
-        ? waitForAllocatedPortBind({ service: input.service, port, child, serviceCwd })
+        ? waitForAllocatedPortBind({ service: input.service, port, child })
         : Promise.resolve(),
     ]).then(() => undefined),
     spawnErrorPromise,

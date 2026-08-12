@@ -10,7 +10,13 @@ import type { AdapterRuntimeServiceReport } from "@paperclipai/adapter-utils";
 import type { Db } from "@paperclipai/db";
 import { executionWorkspaces, issueComments, issues, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import {
+  DEFAULT_TAILSCALE_HTTPS_EXPOSURE,
   listWorkspaceServiceCommandDefinitions,
+  readRuntimeExposureIntent,
+  resolveDeclaredRuntimeExposureConfig,
+  type RuntimeExposureConfigInput,
+  type RuntimeExposureIntent,
+  type RuntimeExposureStatus,
   type GitWorktreeBranchAncestryVerdict,
   type GitWorktreeBranchIncoherenceEvidence as SharedGitWorktreeBranchIncoherenceEvidence,
   type GitWorktreeInProgressOperation,
@@ -48,6 +54,15 @@ import {
   WORKTREE_INSTANCE_ROOT_METADATA_KEY,
   type WorktreeInstancePointer,
 } from "./workspace-instance-cleanup.js";
+import { UnixBrokerClient, type BrokerClient } from "./runtime-exposure/broker-client.js";
+import {
+  deprovisionExposure,
+  provisionExposure,
+  reserveExposure,
+  type ExposureManagerDeps,
+} from "./runtime-exposure/exposure-manager.js";
+import { allocateExposurePortPair } from "./runtime-exposure/port-pair.js";
+import { resolveTailscaleDnsName } from "./runtime-exposure/tailscale-hostname.js";
 
 export function resolveShell(): string {
   const fallback = process.platform === "win32" ? "sh" : "/bin/sh";
@@ -156,6 +171,7 @@ export interface RuntimeServiceRef {
   stoppedAt: string | null;
   stopPolicy: Record<string, unknown> | null;
   healthStatus: "unknown" | "healthy" | "unhealthy";
+  exposure: RuntimeExposureStatus | null;
   reused: boolean;
 }
 
@@ -168,6 +184,11 @@ interface RuntimeServiceRecord extends RuntimeServiceRef {
   serviceKey: string;
   profileKind: string;
   processGroupId: number | null;
+  /** Server-private broker lease handle; never returned by toRuntimeServiceRef. */
+  exposureHandle: string | null;
+  /** Loopback URL used for backend readiness/adoption; never serialized. */
+  backendUrl: string | null;
+  exposureConfig: RuntimeExposureConfigInput | null;
 }
 
 type LocalRuntimeServiceStart = {
@@ -188,9 +209,11 @@ const runtimeServicesById = new Map<string, RuntimeServiceRecord>();
 const runtimeServicesByReuseKey = new Map<string, string>();
 const runtimeServiceLeasesByRun = new Map<string, string[]>();
 const runtimeProvisionByWorkspace = new Map<string, Promise<void>>();
+const quarantinedRuntimeExposurePorts = new Set<number>();
 const DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES = 256 * 1024;
 export const WORKSPACE_RUNTIME_PORT_ALLOCATION_ATTEMPTS = 32;
 const ACTIVE_RUNTIME_PORT_RESERVATION_STATUSES = ["provisioning", "starting", "running"] as const;
+const DEFAULT_TAILSCALE_BROKER_SOCKET = "/run/paperclip-tailscale-broker/broker.sock";
 
 class RuntimeServicePortBindCollision extends Error {
   readonly port: number;
@@ -200,6 +223,182 @@ class RuntimeServicePortBindCollision extends Error {
     this.name = "RuntimeServicePortBindCollision";
     this.port = port;
   }
+}
+
+export type WorkspaceRuntimeExposureDeps = ExposureManagerDeps & {
+  resolveHostname: () => Promise<string>;
+  isPortAvailable: (port: number) => Promise<boolean>;
+  /**
+   * Whether this host can actually broker HTTPS exposures right now. Gating the
+   * automatic default on broker availability is what keeps a Paperclip install
+   * without the host broker from failing every managed runtime start closed.
+   * An explicit opt-in still bypasses this and fails loudly.
+   */
+  isBrokerAvailable: () => Promise<boolean>;
+};
+
+async function isLoopbackPortAvailable(port: number): Promise<boolean> {
+  return await new Promise<boolean>((resolve) => {
+    const server = net.createServer();
+    server.unref();
+    server.once("error", () => resolve(false));
+    server.listen(port, "127.0.0.1", () => {
+      server.close(() => resolve(true));
+    });
+  });
+}
+
+function resolveTailscaleBrokerSocketPath(): string {
+  return process.env.PAPERCLIP_TAILSCALE_BROKER_SOCKET?.trim() || DEFAULT_TAILSCALE_BROKER_SOCKET;
+}
+
+function defaultWorkspaceRuntimeExposureDeps(): WorkspaceRuntimeExposureDeps {
+  const socketPath = resolveTailscaleBrokerSocketPath();
+  const broker: BrokerClient = new UnixBrokerClient({ socketPath });
+  return {
+    broker,
+    resolveHostname: () => resolveTailscaleDnsName(),
+    isPortAvailable: isLoopbackPortAvailable,
+    isBrokerAvailable: async () => {
+      try {
+        // Presence of the socket, not a probe request: availability is checked
+        // on every managed start, and an unauthenticated connect storm against
+        // the broker would be its own problem.
+        const stats = await fs.stat(socketPath);
+        return stats.isSocket();
+      } catch {
+        return false;
+      }
+    },
+    probeHealth: async (url) => {
+      try {
+        const response = await fetch(url, {
+          redirect: "error",
+          signal: AbortSignal.timeout(5_000),
+        });
+        return response.ok;
+      } catch {
+        return false;
+      }
+    },
+    now: () => new Date().toISOString(),
+  };
+}
+
+let workspaceRuntimeExposureDeps = defaultWorkspaceRuntimeExposureDeps();
+
+/** Test-only seam; resetRuntimeServicesForTests restores production defaults. */
+export function setWorkspaceRuntimeExposureDepsForTests(deps: WorkspaceRuntimeExposureDeps) {
+  workspaceRuntimeExposureDeps = deps;
+}
+
+/**
+ * Deployment-level switch for the automatic default (PAP-17158).
+ *
+ *  - `auto` (default): eligible Paperclip-managed worktree runtimes get
+ *    `tailscale_https` without any project template or UI caller supplying an
+ *    exposure block, provided the host broker is available.
+ *  - `off`: no automatic default. Explicit opt-ins still work.
+ *  - `force`: default even when the broker socket is missing, so a
+ *    misconfigured host fails closed and loudly instead of silently serving
+ *    plain HTTP. Intended for deployments that require HTTPS previews.
+ */
+export type ManagedRuntimeHttpsMode = "auto" | "off" | "force";
+
+export function resolveManagedRuntimeHttpsMode(): ManagedRuntimeHttpsMode {
+  const raw = process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS?.trim().toLowerCase();
+  if (raw === "off" || raw === "false" || raw === "0") return "off";
+  if (raw === "force") return "force";
+  return "auto";
+}
+
+/**
+ * Whether a service would be defaulted to HTTPS if it declared nothing.
+ *
+ * Intentionally narrow: only the Paperclip-managed dev runtime. Unmanaged and
+ * custom external services are left exactly as they are, because the broker
+ * only publishes allowlisted loopback ports it can prove Paperclip owns and we
+ * do not want to relocate a service somebody else addresses by port.
+ *
+ * A *pinned* port is still a candidate. The pre-feature Paperclip App template
+ * hard-codes `port: 45439`, which the broker's dedicated allowlist can never
+ * publish, so defaulting it to HTTPS necessarily relocates it into the
+ * dedicated range. "Keep existing runtime ports when safe" is honored one layer
+ * down, by preferring the current port when it already *is* an allowlisted app
+ * port with a free HMR companion.
+ */
+function isManagedHttpsDefaultCandidate(input: {
+  serviceName: string;
+  command: string | null;
+}): boolean {
+  return isPaperclipDevRuntimeService(input);
+}
+
+export type ResolvedRuntimeServiceExposure = {
+  config: RuntimeExposureConfigInput;
+  /**
+   * `declared` — the project template or UI caller asked for HTTPS.
+   * `default` — the server applied the automatic default (PAP-17158).
+   *
+   * The distinction matters for port handling: a declared opt-in on a pinned
+   * port is an operator misconfiguration and fails loudly, while the automatic
+   * default is allowed to relocate a legacy pinned port into the dedicated
+   * exposure range.
+   */
+  origin: "declared" | "default";
+};
+
+/**
+ * Resolve the exposure config for one runtime service start.
+ *
+ * Precedence: deliberate opt-out → explicit opt-in → automatic default for
+ * eligible managed runtimes → none.
+ */
+async function resolveRuntimeServiceExposure(input: {
+  service: Record<string, unknown>;
+  serviceName: string;
+  command: string | null;
+}): Promise<ResolvedRuntimeServiceExposure | null> {
+  const expose = parseObject(input.service.expose);
+  const intent = readRuntimeExposureIntent(expose);
+  if (intent === "disabled") return null;
+  // An explicit opt-in is honored verbatim and is never gated on broker
+  // availability: the operator asked for HTTPS, so a missing broker must fail
+  // the start rather than silently downgrade it to HTTP.
+  if (intent === "enabled") {
+    const declared = resolveDeclaredRuntimeExposureConfig(expose);
+    return declared ? { config: declared, origin: "declared" } : null;
+  }
+
+  const mode = resolveManagedRuntimeHttpsMode();
+  if (mode === "off") return null;
+  if (!isManagedHttpsDefaultCandidate({ serviceName: input.serviceName, command: input.command })) {
+    return null;
+  }
+  if (mode !== "force" && !(await workspaceRuntimeExposureDeps.isBrokerAvailable())) return null;
+  return { config: DEFAULT_TAILSCALE_HTTPS_EXPOSURE, origin: "default" };
+}
+
+/**
+ * Whether any entry in a start batch will take the HTTPS exposure path.
+ *
+ * Reads the service name and command straight off the raw config entry rather
+ * than resolving the full reuse identity: templates never rewrite a service
+ * name, and the substrings `isPaperclipDevRuntimeService` matches survive
+ * rendering, so this agrees with the per-service decision made during spawn.
+ */
+async function anyRuntimeServiceUsesHttpsExposure(
+  services: Record<string, unknown>[],
+): Promise<boolean> {
+  for (const service of services) {
+    const resolved = await resolveRuntimeServiceExposure({
+      service,
+      serviceName: asString(service.name, "service"),
+      command: asString(service.command, ""),
+    });
+    if (resolved) return true;
+  }
+  return false;
 }
 
 type ProcessOutputCapture = {
@@ -213,7 +412,27 @@ type ProcessOutputAccumulator = {
   finish(): ProcessOutputCapture;
 };
 
-export async function resetRuntimeServicesForTests() {
+/**
+ * Drops in-memory runtime state between tests.
+ *
+ * By default the spawned backend processes are deliberately left running: the
+ * startup-reconciliation suites use this to simulate a Paperclip restart, where
+ * the point is that a live backend survives and has to be adopted.
+ *
+ * Suites that spawn real backends and do *not* need that must pass
+ * `terminateProcesses` — otherwise every test leaks a listener that keeps
+ * squatting a port in the dedicated exposure range for the life of the host.
+ * Termination runs before the exposure deps are restored so the suite's own
+ * broker fake handles the removal rather than the real host broker.
+ */
+export async function resetRuntimeServicesForTests(
+  opts: { terminateProcesses?: boolean } = {},
+) {
+  if (opts.terminateProcesses) {
+    for (const serviceId of [...runtimeServicesById.keys()]) {
+      await stopRuntimeService(serviceId).catch(() => undefined);
+    }
+  }
   for (const record of runtimeServicesById.values()) {
     clearIdleTimer(record);
   }
@@ -221,6 +440,8 @@ export async function resetRuntimeServicesForTests() {
   runtimeServicesByReuseKey.clear();
   runtimeServiceLeasesByRun.clear();
   runtimeProvisionByWorkspace.clear();
+  quarantinedRuntimeExposurePorts.clear();
+  workspaceRuntimeExposureDeps = defaultWorkspaceRuntimeExposureDeps();
 }
 
 function stableStringify(value: unknown): string {
@@ -434,6 +655,7 @@ function toRuntimeServiceRef(record: RuntimeServiceRecord, overrides?: Partial<R
     startedAt: record.startedAt,
     stoppedAt: record.stoppedAt,
     stopPolicy: record.stopPolicy,
+    exposure: record.exposure,
     healthStatus: record.healthStatus,
     reused: record.reused,
     ...overrides,
@@ -3563,6 +3785,60 @@ async function allocatePort(): Promise<number> {
   });
 }
 
+async function collectReservedExposurePorts(db: Db | undefined, companyId: string): Promise<Set<number>> {
+  const reserved = new Set(quarantinedRuntimeExposurePorts);
+  for (const record of runtimeServicesById.values()) {
+    if (record.companyId !== companyId || !record.exposure) continue;
+    for (const listener of record.exposure.listeners) reserved.add(listener.targetPort);
+  }
+  if (!db) return reserved;
+  const rows = await db
+    .select({ exposure: workspaceRuntimeServices.exposure })
+    .from(workspaceRuntimeServices)
+    .where(eq(workspaceRuntimeServices.companyId, companyId));
+  for (const row of rows) {
+    if (!row.exposure || row.exposure.state === "removed") continue;
+    for (const listener of row.exposure.listeners) reserved.add(listener.targetPort);
+  }
+  return reserved;
+}
+
+async function allocateAndReserveExposure(input: {
+  db?: Db;
+  companyId: string;
+  runtimeId: string;
+  config: RuntimeExposureConfigInput;
+  /** Port this runtime already used, preserved when it is still safe to use. */
+  preferredAppPort?: number | null;
+}): Promise<{ appPort: number; status: RuntimeExposureStatus; handle: string }> {
+  const reserved = await collectReservedExposurePorts(input.db, input.companyId);
+  const retryable = new Set(["reservation_conflict", "manual_mapping_present", "quarantined"]);
+  let preferredAppPort = input.preferredAppPort ?? null;
+  while (true) {
+    const pair = await allocateExposurePortPair({
+      isPortAvailable: workspaceRuntimeExposureDeps.isPortAvailable,
+      reserved,
+      preferredAppPort,
+    });
+    const result = await reserveExposure(workspaceRuntimeExposureDeps, {
+      runtimeId: input.runtimeId,
+      config: input.config,
+      appPort: pair.appPort,
+    });
+    if (result.handle) {
+      return { appPort: pair.appPort, status: result.status, handle: result.handle };
+    }
+    if (!result.status.lastError || !retryable.has(result.status.lastError)) {
+      throw new Error(`HTTPS exposure reservation failed: ${result.status.lastError ?? "unknown broker error"}`);
+    }
+    reserved.add(pair.appPort);
+    reserved.add(pair.hmrPort);
+    // The preference lost its race with a conflicting/manual/quarantined
+    // mapping; drop it so the retry scans instead of re-offering the same port.
+    preferredAppPort = null;
+  }
+}
+
 async function canBindRuntimePort(port: number): Promise<boolean> {
   return await new Promise<boolean>((resolve, reject) => {
     const server = net.createServer();
@@ -3810,6 +4086,7 @@ function resolveRuntimeServiceReuseIdentity(input: {
               cwd: serviceCwd,
               port: identityPort,
               env: renderedEnv,
+              expose: input.service.expose ?? null,
             }),
           )
           .digest("hex")
@@ -4098,6 +4375,9 @@ function toPersistedWorkspaceRuntimeService(record: RuntimeServiceRecord): typeo
     startedAt: new Date(record.startedAt),
     stoppedAt: record.stoppedAt ? new Date(record.stoppedAt) : null,
     stopPolicy: record.stopPolicy,
+    exposure: record.exposure,
+    exposureHandle: record.exposureHandle,
+    backendUrl: record.backendUrl,
     healthStatus: record.healthStatus,
     updatedAt: new Date(),
   };
@@ -4134,6 +4414,9 @@ async function persistRuntimeServiceRecord(db: Db | undefined, record: RuntimeSe
         startedAt: values.startedAt,
         stoppedAt: values.stoppedAt,
         stopPolicy: values.stopPolicy,
+        exposure: values.exposure,
+        exposureHandle: values.exposureHandle,
+        backendUrl: values.backendUrl,
         healthStatus: values.healthStatus,
         updatedAt: values.updatedAt,
       },
@@ -4270,6 +4553,7 @@ export function normalizeAdapterManagedRuntimeServices(input: {
       stoppedAt: status === "running" || status === "starting" ? null : nowIso,
       stopPolicy: report.stopPolicy ?? null,
       healthStatus,
+      exposure: null,
       reused: false,
     };
   });
@@ -4438,6 +4722,7 @@ function createProvisioningRuntimeServiceRecord(
     stoppedAt: null,
     stopPolicy: parseObject(input.service.stopPolicy),
     healthStatus: "unknown",
+    exposure: null,
     reused: false,
     db: input.db,
     child: null,
@@ -4447,6 +4732,9 @@ function createProvisioningRuntimeServiceRecord(
     serviceKey: `runtime-provision:${runtimeProvisionWorkspaceKey(input)}:${id}`,
     profileKind: "workspace-runtime",
     processGroupId: null,
+    exposureHandle: null,
+    backendUrl: null,
+    exposureConfig: null,
   };
 }
 
@@ -4472,9 +4760,16 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
   const serviceIdentityFingerprint = input.reuseKey ?? envFingerprint;
   const explicitPort = identity.explicitPort;
   const identityPort = identity.identityPort;
+  const resolvedExposure = await resolveRuntimeServiceExposure({
+    service: input.service,
+    serviceName,
+    command,
+  });
+  const exposureConfig = resolvedExposure?.config ?? null;
   const portType = asString(portConfig.type, "");
   const canAllocateFixedPort = Boolean(
-    input.allowFixedPortFallback
+    !exposureConfig
+    && input.allowFixedPortFallback
     && input.db
     && input.executionWorkspaceId
     && explicitPort > 0,
@@ -4489,15 +4784,74 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
     scopeType: input.scopeType,
     scopeId: input.scopeId,
   });
-  let reusableStoppedPort: number | null = null;
-  if (portType === "auto" && stoppedReuseCandidate?.port && !input.excludedPorts?.has(stoppedReuseCandidate.port)) {
-    reusableStoppedPort = await canBindRuntimePort(stoppedReuseCandidate.port)
-      ? stoppedReuseCandidate.port
+  let fixedPortRegistryMatch = false;
+  if (!exposureConfig && canAllocateFixedPort && identityPort) {
+    const identityTemplateData = buildTemplateData({
+      workspace: input.workspace,
+      agent: input.agent,
+      issue: input.issue,
+      adapterEnv: input.adapterEnv,
+      port: identityPort,
+    });
+    const identityExpose = parseObject(input.service.expose);
+    const identityReadiness = parseObject(input.service.readiness);
+    const identityUrlTemplate =
+      asString(identityExpose.urlTemplate, "")
+      || asString(identityReadiness.urlTemplate, "");
+    const identityBackendUrl = identityUrlTemplate
+      ? renderTemplate(identityUrlTemplate, identityTemplateData)
       : null;
+    const identityServiceKey = createLocalServiceKey({
+      profileKind: "workspace-runtime",
+      serviceName,
+      cwd: identity.serviceCwd,
+      command,
+      envFingerprint: serviceIdentityFingerprint,
+      port: identityPort,
+      scope: {
+        scopeType: input.scopeType,
+        scopeId: input.scopeId,
+        executionWorkspaceId: input.executionWorkspaceId ?? null,
+        reuseKey: input.reuseKey,
+      },
+    });
+    fixedPortRegistryMatch = Boolean(await findAdoptableLocalService({
+      serviceKey: identityServiceKey,
+      profileKind: "workspace-runtime",
+      serviceName,
+      command,
+      cwd: identity.serviceCwd,
+      envFingerprint: serviceIdentityFingerprint,
+      port: identityPort,
+      url: identityBackendUrl,
+    }));
   }
-  let port: number | null = null;
-  if (portType === "auto") {
-    port = reusableStoppedPort;
+  const runtimeId = input.runtimeServiceId ?? stoppedReuseCandidate?.id ?? randomUUID();
+  // An exposed runtime always takes its port from the dedicated broker range, so
+  // a configured or previously used port is a *preference*, not a constraint. It
+  // is honored when it is already an allowlisted app port whose HMR companion is
+  // free — that keeps a restart on the same port and keeps a backfilled service
+  // stable across deploys — and quietly relocated when it is not, which is the
+  // only way a legacy pinned port (the Paperclip App template's 45439) can be
+  // published at all. If the backend then fails to listen where we allocated,
+  // the broker's /proc ownership proof refuses the mapping and the start fails
+  // closed; it never falls back to HTTP.
+  const reservedExposure = exposureConfig
+    ? await allocateAndReserveExposure({
+        db: input.db,
+        companyId: input.agent.companyId,
+        runtimeId,
+        config: exposureConfig,
+        preferredAppPort: stoppedReuseCandidate?.port ?? (explicitPort > 0 ? explicitPort : null),
+      })
+    : null;
+  let port: number | null = reservedExposure?.appPort ?? null;
+  if (!reservedExposure && portType === "auto") {
+    if (stoppedReuseCandidate?.port && !input.excludedPorts?.has(stoppedReuseCandidate.port)) {
+      port = await canBindRuntimePort(stoppedReuseCandidate.port)
+        ? stoppedReuseCandidate.port
+        : null;
+    }
     for (let attempt = 0; port === null && attempt < WORKSPACE_RUNTIME_PORT_ALLOCATION_ATTEMPTS; attempt += 1) {
       const candidate = await allocatePort();
       if (!input.excludedPorts?.has(candidate)) port = candidate;
@@ -4509,7 +4863,9 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
         remediation: "Retry the start or configure a different runtime service port.",
       });
     }
-  } else if (canAllocateFixedPort) {
+  } else if (!reservedExposure && canAllocateFixedPort && fixedPortRegistryMatch) {
+    port = explicitPort;
+  } else if (!reservedExposure && canAllocateFixedPort) {
     port = await allocateIsolatedWorkspacePort({
       db: input.db,
       companyId: input.agent.companyId,
@@ -4518,8 +4874,21 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
       stoppedPort: stoppedReuseCandidate?.port ?? null,
       excludedPorts: input.excludedPorts ?? new Set<number>(),
     });
-  } else {
+  } else if (!reservedExposure) {
     port = explicitPort > 0 ? explicitPort : null;
+  }
+  let exposureHostname: string | null = null;
+  if (reservedExposure) {
+    try {
+      exposureHostname = await workspaceRuntimeExposureDeps.resolveHostname();
+      reservedExposure.status.hostname = exposureHostname;
+      reservedExposure.status.updatedAt = new Date().toISOString();
+    } catch {
+      await workspaceRuntimeExposureDeps.broker
+        .remove(runtimeId, reservedExposure.handle)
+        .catch(() => undefined);
+      throw new Error("HTTPS exposure failed: Tailscale MagicDNS hostname unavailable");
+    }
   }
   const templateData = buildTemplateData({
     workspace: input.workspace,
@@ -4544,12 +4913,26 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
     env[portEnvKey] = String(port);
   }
 
+  if (exposureConfig) {
+    // Paperclip dev-runtime-specific hardening. Other managed processes are
+    // still rejected by the broker unless /proc proves loopback-only listeners.
+    env.PAPERCLIP_BIND = "custom";
+    env.PAPERCLIP_BIND_HOST = "127.0.0.1";
+    env.PAPERCLIP_VITE_HMR_PROTOCOL = "wss";
+    env.PAPERCLIP_MANAGED_RUNTIME_EXPOSURE = "tailscale_https";
+    env.PAPERCLIP_ALLOWED_HOSTNAMES = exposureHostname!;
+    env.PAPERCLIP_AUTH_BASE_URL_MODE = "explicit";
+    env.PAPERCLIP_AUTH_PUBLIC_BASE_URL = `https://${exposureHostname}:${port}`;
+    env.PAPERCLIP_PUBLIC_URL = `https://${exposureHostname}:${port}`;
+  }
+
   const expose = parseObject(input.service.expose);
   const readiness = parseObject(input.service.readiness);
   const urlTemplate =
     asString(expose.urlTemplate, "") ||
     asString(readiness.urlTemplate, "");
-  const url = urlTemplate ? renderTemplate(urlTemplate, templateData) : null;
+  const backendUrl = urlTemplate ? renderTemplate(urlTemplate, templateData) : null;
+  let url = exposureConfig ? null : backendUrl;
   const readinessUrlTemplate = asString(readiness.urlTemplate, "");
   const readinessUrl = readinessUrlTemplate ? renderTemplate(readinessUrlTemplate, templateData) : null;
   const stopPolicy = parseObject(input.service.stopPolicy);
@@ -4567,7 +4950,7 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
       reuseKey: input.reuseKey,
     },
   });
-  const adoptedRecord = await findAdoptableLocalService({
+  const adoptedRecord = exposureConfig ? null : await findAdoptableLocalService({
     serviceKey,
     profileKind: "workspace-runtime",
     serviceName,
@@ -4575,10 +4958,10 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
     cwd: serviceCwd,
     envFingerprint: serviceIdentityFingerprint,
     port: port ?? identityPort,
-    url,
+    url: backendUrl,
   });
   if (adoptedRecord) {
-    const adoptedUrl = adoptedRecord.url ?? url;
+    const adoptedUrl = adoptedRecord.url ?? backendUrl;
     if (!(await isRuntimeServiceUrlHealthy(adoptedUrl, { serviceName, command }))) {
       await terminateLocalService(adoptedRecord);
       await removeLocalServiceRegistryRecord(adoptedRecord.serviceKey);
@@ -4610,6 +4993,7 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
           stoppedAt: null,
           stopPolicy,
           healthStatus: "healthy",
+          exposure: null,
           reused: true,
           db: input.db,
           child: null,
@@ -4619,16 +5003,26 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
           serviceKey,
           profileKind: "workspace-runtime",
           processGroupId: adoptedRecord.processGroupId ?? null,
+          exposureHandle: null,
+          backendUrl: adoptedUrl,
+          exposureConfig: null,
         },
         readiness: Promise.resolve(),
       };
     }
   }
-  if (port) {
-    const ownerPid = await readLocalServicePortOwner(port);
+  // A pinned port is only worth a conflict check when the service will actually
+  // bind it. Under HTTPS exposure the port comes from the broker's dedicated
+  // range instead, and both ports in that pair were already probed free before
+  // the lease was taken — so checking the pinned port here would reject a
+  // legacy `port: 45439` service purely because the pre-backfill instance still
+  // holds 45439, which is exactly the workspace this feature has to upgrade.
+  const conflictPort = reservedExposure ? null : port;
+  if (conflictPort) {
+    const ownerPid = await readLocalServicePortOwner(conflictPort);
     if (ownerPid) {
       if (canAllocateFixedPort || portType === "auto") {
-        throw new RuntimeServicePortBindCollision(port);
+        throw new RuntimeServicePortBindCollision(conflictPort);
       }
       const ownerCwd = await readLocalServiceProcessCwd(ownerPid);
       const ownerIsInWorkspace = ownerCwd
@@ -4637,18 +5031,75 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
       const ownerDescription = ownerCwd ? `pid ${ownerPid} (cwd: ${ownerCwd})` : `pid ${ownerPid} (cwd unavailable)`;
       if (ownerIsInWorkspace === false) {
         throw new Error(
-          `Runtime service "${serviceName}" could not start because port ${port} has a cross-workspace port conflict with ${ownerDescription}; requested workspace: ${serviceCwd}. Stop the other service or configure a different port.`,
+          `Runtime service "${serviceName}" could not start because port ${conflictPort} has a cross-workspace port conflict with ${ownerDescription}; requested workspace: ${serviceCwd}. Stop the other service or configure a different port.`,
         );
       }
       throw new Error(
-        `Runtime service "${serviceName}" could not start because port ${port} is already in use by ${ownerDescription}`,
+        `Runtime service "${serviceName}" could not start because port ${conflictPort} is already in use by ${ownerDescription}`,
       );
     }
   }
 
-  await ensureServerWorkspaceLinksCurrent(serviceCwd, {
-    onLog: input.onLog,
-  });
+  const nowIso = new Date().toISOString();
+  const record: RuntimeServiceRecord = {
+    id: runtimeId,
+    companyId: input.agent.companyId,
+    projectId: input.workspace.projectId,
+    projectWorkspaceId: input.workspace.workspaceId,
+    executionWorkspaceId: input.executionWorkspaceId ?? null,
+    issueId: input.issue?.id ?? null,
+    serviceName,
+    status: "starting",
+    lifecycle,
+    scopeType: input.scopeType,
+    scopeId: input.scopeId,
+    reuseKey: input.reuseKey,
+    command,
+    cwd: serviceCwd,
+    port,
+    url,
+    provider: "local_process",
+    providerRef: null,
+    ownerAgentId: input.agent.id ?? null,
+    startedByRunId,
+    lastUsedAt: nowIso,
+    startedAt: nowIso,
+    stoppedAt: null,
+    stopPolicy,
+    healthStatus: "unknown",
+    exposure: reservedExposure?.status ?? null,
+    reused: false,
+    db: input.db,
+    child: null,
+    leaseRunIds: leaseRunId ? new Set([leaseRunId]) : new Set(),
+    idleTimer: null,
+    envFingerprint,
+    serviceKey,
+    profileKind: "workspace-runtime",
+    processGroupId: null,
+    exposureHandle: reservedExposure?.handle ?? null,
+    backendUrl,
+    exposureConfig,
+  };
+  if (reservedExposure) {
+    // The broker reservation and its unguessable handle must be durable before
+    // the child can bind, so a server crash cannot lose cleanup authority.
+    try {
+      await persistRuntimeServiceRecord(input.db, record);
+    } catch (error) {
+      await cleanupRecordExposure(record);
+      throw error;
+    }
+  }
+
+  try {
+    await ensureServerWorkspaceLinksCurrent(serviceCwd, {
+      onLog: input.onLog,
+    });
+  } catch (error) {
+    if (reservedExposure) await cleanupRecordExposure(record);
+    throw error;
+  }
 
   const shell = resolveShell();
   const child = spawn(shell, ["-lc", command], {
@@ -4657,6 +5108,9 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
     detached: process.platform !== "win32",
     stdio: ["ignore", "pipe", "pipe"],
   });
+  record.child = child;
+  record.providerRef = child.pid ? String(child.pid) : null;
+  record.processGroupId = child.pid ?? null;
   const spawnErrorPromise = new Promise<never>((_, reject) => {
     child.once("error", (err) => {
       reject(err);
@@ -4682,44 +5136,6 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
     if (input.onLog) await input.onLog("stderr", `[service:${serviceName}] ${text}`);
   });
 
-  const nowIso = new Date().toISOString();
-  const record: RuntimeServiceRecord = {
-    id: input.runtimeServiceId ?? stoppedReuseCandidate?.id ?? randomUUID(),
-    companyId: input.agent.companyId,
-    projectId: input.workspace.projectId,
-    projectWorkspaceId: input.workspace.workspaceId,
-    executionWorkspaceId: input.executionWorkspaceId ?? null,
-    issueId: input.issue?.id ?? null,
-    serviceName,
-    status: "starting",
-    lifecycle,
-    scopeType: input.scopeType,
-    scopeId: input.scopeId,
-    reuseKey: input.reuseKey,
-    command,
-    cwd: serviceCwd,
-    port,
-    url,
-    provider: "local_process",
-    providerRef: child.pid ? String(child.pid) : null,
-    ownerAgentId: input.agent.id ?? null,
-    startedByRunId,
-    lastUsedAt: nowIso,
-    startedAt: nowIso,
-    stoppedAt: null,
-    stopPolicy,
-    healthStatus: "unknown",
-    reused: false,
-    db: input.db,
-    child,
-    leaseRunIds: leaseRunId ? new Set([leaseRunId]) : new Set(),
-    idleTimer: null,
-    envFingerprint,
-    serviceKey,
-    profileKind: "workspace-runtime",
-    processGroupId: child.pid ?? null,
-  };
-
   if (child.pid) {
     await writeLocalServiceRegistryRecord({
       version: 1,
@@ -4730,7 +5146,7 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
       cwd: serviceCwd,
       envFingerprint: serviceIdentityFingerprint,
       port,
-      url,
+      url: backendUrl,
       pid: child.pid,
       processGroupId: child.pid,
       provider: "local_process",
@@ -4751,7 +5167,7 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
 
   const readinessPromise = Promise.race([
     Promise.all([
-      waitForReadiness({ service: input.service, serviceName, command, url, readinessUrl }),
+      waitForReadiness({ service: input.service, serviceName, command, url: backendUrl, readinessUrl }),
       canAllocateFixedPort && port
         ? waitForAllocatedPortBind({ service: input.service, port, child })
         : Promise.resolve(),
@@ -4759,6 +5175,22 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
     spawnErrorPromise,
     earlyExitPromise,
   ]).then(async () => {
+    if (record.exposureConfig && record.exposureHandle && record.port) {
+      const provisioned = await provisionExposure(workspaceRuntimeExposureDeps, {
+        runtimeId: record.id,
+        config: record.exposureConfig,
+        handle: record.exposureHandle,
+        hostname: exposureHostname!,
+        appPort: record.port,
+      });
+      record.exposure = provisioned.status;
+      record.exposureHandle = provisioned.handle;
+      record.url = provisioned.status.publicUrl;
+      await persistRuntimeServiceRecord(record.db, record);
+      if (provisioned.status.state !== "ready" || !record.url) {
+        throw new Error(`HTTPS exposure failed: ${provisioned.status.lastError ?? "unknown error"}`);
+      }
+    }
     record.status = "running";
     record.healthStatus = "healthy";
     record.lastUsedAt = new Date().toISOString();
@@ -4769,10 +5201,12 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
     });
   }).catch(async (err) => {
     const failureMessage = err instanceof Error ? err.message : String(err);
-    const bindCollision = err instanceof RuntimeServicePortBindCollision || Boolean(
-      port
-      && (input.allowFixedPortFallback || portType === "auto")
-      && /(?:EADDRINUSE|address already in use)/i.test(`${failureMessage}\n${stderrExcerpt}`),
+    const bindCollision = !exposureConfig && (
+      err instanceof RuntimeServicePortBindCollision || Boolean(
+        port
+        && (input.allowFixedPortFallback || portType === "auto")
+        && /(?:EADDRINUSE|address already in use)/i.test(`${failureMessage}\n${stderrExcerpt}`),
+      )
     );
     if (child.pid) {
       await terminateLocalService({
@@ -4780,11 +5214,15 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
         processGroupId: child.pid,
       });
     }
+    await cleanupRecordExposure(record, { preserveFailure: true });
     record.status = "stopped";
     record.healthStatus = "unhealthy";
     record.lastUsedAt = new Date().toISOString();
     record.stoppedAt = new Date().toISOString();
     await removeLocalServiceRegistryRecord(record.serviceKey).catch(() => undefined);
+    if (exposureConfig) {
+      await persistRuntimeServiceRecord(record.db, record).catch(() => undefined);
+    }
     if (bindCollision && port) throw new RuntimeServicePortBindCollision(port);
     throw new Error(
       `Failed to start runtime service "${serviceName}": ${failureMessage}${stderrExcerpt ? ` | stderr: ${stderrExcerpt.trim()}` : ""}`,
@@ -4931,6 +5369,37 @@ function scheduleIdleStop(record: RuntimeServiceRecord) {
   }, idleSeconds * 1000);
 }
 
+async function cleanupRecordExposure(
+  record: RuntimeServiceRecord,
+  options?: { preserveFailure?: boolean },
+) {
+  if (!record.exposure) return;
+  const previous = record.exposure;
+  const ports = previous.listeners.map((listener) => listener.targetPort);
+  const result = await deprovisionExposure(workspaceRuntimeExposureDeps, {
+    runtimeId: record.id,
+    handle: record.exposureHandle,
+    ports,
+  });
+  for (const port of result.quarantinedPorts) quarantinedRuntimeExposurePorts.add(port);
+  if (result.status.state === "removed") {
+    record.exposureHandle = null;
+    record.exposure = options?.preserveFailure && previous.state === "failed"
+      ? { ...previous, publicUrl: null, updatedAt: new Date().toISOString() }
+      : { ...previous, state: "removed", publicUrl: null, lastError: null, updatedAt: new Date().toISOString() };
+  } else {
+    record.exposure = {
+      ...previous,
+      state: "cleanup_pending",
+      publicUrl: null,
+      lastError: result.status.lastError,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  record.url = null;
+  await persistRuntimeServiceRecord(record.db, record).catch(() => undefined);
+}
+
 async function stopRuntimeService(serviceId: string) {
   const record = runtimeServicesById.get(serviceId);
   if (!record) return;
@@ -4943,6 +5412,7 @@ async function stopRuntimeService(serviceId: string) {
   if (record.reuseKey && runtimeServicesByReuseKey.get(record.reuseKey) === record.id) {
     runtimeServicesByReuseKey.delete(record.reuseKey);
   }
+  await cleanupRecordExposure(record);
   if (record.child && record.child.pid) {
     await terminateLocalService({
       pid: record.child.pid,
@@ -4966,6 +5436,43 @@ async function markPersistedRuntimeServicesStoppedForExecutionWorkspace(input: {
   executionWorkspaceId: string;
 }) {
   const now = new Date();
+  const exposureRows = await input.db
+    .select({
+      id: workspaceRuntimeServices.id,
+      exposure: workspaceRuntimeServices.exposure,
+      exposureHandle: workspaceRuntimeServices.exposureHandle,
+    })
+    .from(workspaceRuntimeServices)
+    .where(
+      and(
+        eq(workspaceRuntimeServices.executionWorkspaceId, input.executionWorkspaceId),
+        inArray(workspaceRuntimeServices.status, ["provisioning", "starting", "running"]),
+      ),
+    );
+  for (const row of exposureRows) {
+    if (!row.exposure) continue;
+    const cleanup = await deprovisionExposure(workspaceRuntimeExposureDeps, {
+      runtimeId: row.id,
+      handle: row.exposureHandle,
+      ports: row.exposure.listeners.map((listener) => listener.targetPort),
+    });
+    for (const port of cleanup.quarantinedPorts) quarantinedRuntimeExposurePorts.add(port);
+    const exposure: RuntimeExposureStatus = {
+      ...row.exposure,
+      state: cleanup.status.state,
+      publicUrl: null,
+      lastError: cleanup.status.lastError,
+      updatedAt: now.toISOString(),
+    };
+    await input.db
+      .update(workspaceRuntimeServices)
+      .set({
+        exposure,
+        exposureHandle: cleanup.status.state === "removed" ? null : row.exposureHandle,
+        url: null,
+      })
+      .where(eq(workspaceRuntimeServices.id, row.id));
+  }
   await input.db
     .update(workspaceRuntimeServices)
     .set({
@@ -4981,6 +5488,39 @@ async function markPersistedRuntimeServicesStoppedForExecutionWorkspace(input: {
         inArray(workspaceRuntimeServices.status, ["provisioning", "starting", "running"]),
       ),
     );
+}
+
+async function cleanupPersistedExposureRows(
+  db: Db,
+  rows: Array<{
+    id: string;
+    exposure: RuntimeExposureStatus | null;
+    exposureHandle: string | null;
+  }>,
+) {
+  for (const row of rows) {
+    if (!row.exposure) continue;
+    const cleanup = await deprovisionExposure(workspaceRuntimeExposureDeps, {
+      runtimeId: row.id,
+      handle: row.exposureHandle,
+      ports: row.exposure.listeners.map((listener) => listener.targetPort),
+    });
+    for (const port of cleanup.quarantinedPorts) quarantinedRuntimeExposurePorts.add(port);
+    await db
+      .update(workspaceRuntimeServices)
+      .set({
+        url: null,
+        exposure: {
+          ...row.exposure,
+          state: cleanup.status.state,
+          publicUrl: null,
+          lastError: cleanup.status.lastError,
+          updatedAt: new Date().toISOString(),
+        },
+        exposureHandle: cleanup.status.state === "removed" ? null : row.exposureHandle,
+      })
+      .where(eq(workspaceRuntimeServices.id, row.id));
+  }
 }
 
 function registerRuntimeService(db: Db | undefined, record: RuntimeServiceRecord) {
@@ -5002,8 +5542,11 @@ function registerRuntimeService(db: Db | undefined, record: RuntimeServiceRecord
     if (current.reuseKey && runtimeServicesByReuseKey.get(current.reuseKey) === current.id) {
       runtimeServicesByReuseKey.delete(current.reuseKey);
     }
-    void removeLocalServiceRegistryRecord(current.serviceKey);
-    void persistRuntimeServiceRecord(db, current);
+    void (async () => {
+      await cleanupRecordExposure(current);
+      await removeLocalServiceRegistryRecord(current.serviceKey);
+      await persistRuntimeServiceRecord(db, current);
+    })();
   });
 }
 
@@ -5419,8 +5962,17 @@ export async function startRuntimeServicesForWorkspaceControl(
   const invocationId = input.invocationId ?? randomUUID();
   const runtimeProvisionCommand = resolveRuntimeProvisionCommand(input);
   const provisionCoordinator = createRuntimeProvisionCoordinator();
+  const hasHttpsExposure = await anyRuntimeServiceUsesHttpsExposure(rawServices);
 
-  if (rawServices.length === 0 || !input.db || (!input.executionWorkspaceId && !input.workspace.workspaceId)) {
+  if (
+    rawServices.length === 0
+    || !input.db
+    || (!input.executionWorkspaceId && !input.workspace.workspaceId)
+    // The reservation row must commit before the backend binds. Keeping this
+    // path outside the parent-row transaction avoids a crash window where the
+    // broker lease exists but the DB transaction has not committed its handle.
+    || hasHttpsExposure
+  ) {
     const batch = await startRuntimeServicesForWorkspaceControlUnlocked(
       input,
       rawServices,
@@ -5663,6 +6215,15 @@ export async function stopRuntimeServicesForExecutionWorkspace(input: {
   if (input.db) {
     if (input.runtimeServiceId) {
       const now = new Date();
+      const rows = await input.db
+        .select({
+          id: workspaceRuntimeServices.id,
+          exposure: workspaceRuntimeServices.exposure,
+          exposureHandle: workspaceRuntimeServices.exposureHandle,
+        })
+        .from(workspaceRuntimeServices)
+        .where(eq(workspaceRuntimeServices.id, input.runtimeServiceId));
+      await cleanupPersistedExposureRows(input.db, rows);
       await input.db
         .update(workspaceRuntimeServices)
         .set({
@@ -5700,6 +6261,22 @@ export async function stopRuntimeServicesForProjectWorkspace(input: {
 
   if (input.db) {
     const now = new Date();
+    const exposureCondition = input.runtimeServiceId
+      ? eq(workspaceRuntimeServices.id, input.runtimeServiceId)
+      : and(
+          eq(workspaceRuntimeServices.projectWorkspaceId, input.projectWorkspaceId),
+          eq(workspaceRuntimeServices.scopeType, "project_workspace"),
+          inArray(workspaceRuntimeServices.status, ["provisioning", "starting", "running"]),
+        );
+    const exposureRows = await input.db
+      .select({
+        id: workspaceRuntimeServices.id,
+        exposure: workspaceRuntimeServices.exposure,
+        exposureHandle: workspaceRuntimeServices.exposureHandle,
+      })
+      .from(workspaceRuntimeServices)
+      .where(exposureCondition);
+    await cleanupPersistedExposureRows(input.db, exposureRows);
     await input.db
       .update(workspaceRuntimeServices)
       .set({
@@ -5710,13 +6287,7 @@ export async function stopRuntimeServicesForProjectWorkspace(input: {
         updatedAt: now,
       })
       .where(
-        input.runtimeServiceId
-          ? eq(workspaceRuntimeServices.id, input.runtimeServiceId)
-          : and(
-              eq(workspaceRuntimeServices.projectWorkspaceId, input.projectWorkspaceId),
-              eq(workspaceRuntimeServices.scopeType, "project_workspace"),
-              inArray(workspaceRuntimeServices.status, ["provisioning", "starting", "running"]),
-            ),
+        exposureCondition,
       );
   }
 }
@@ -5749,6 +6320,96 @@ export async function listWorkspaceRuntimeServicesForProjectWorkspaces(
   return grouped;
 }
 
+/**
+ * Statuses that mean "there is, or is supposed to be, a live backend process".
+ * A row in one of these states is what the backfill has to reprovision; a
+ * `stopped` row simply picks the default up on its next start.
+ */
+const LIVE_RUNTIME_SERVICE_STATUSES = new Set(["provisioning", "starting", "running"]);
+
+export type ManagedRuntimeExposureBackfillDecision = {
+  action: "keep" | "reprovision";
+  reason: string;
+};
+
+/**
+ * Decide what the HTTPS backfill should do with one persisted runtime-service
+ * row (PAP-17158).
+ *
+ * Pure so every branch is directly testable: the reasons below are the whole
+ * contract for which pre-feature workspaces get upgraded and which are left
+ * exactly as they are.
+ *
+ * `declaredIntent === null` means no configured service entry could be matched
+ * to this row. Such a row is deliberately left alone: reprovisioning works by
+ * stopping the HTTP backend and letting the desired-state restart bring it back
+ * with exposure, so without a config to restart from we would take a service
+ * down and never bring it back.
+ */
+export function decideManagedRuntimeExposureBackfill(input: {
+  mode: ManagedRuntimeHttpsMode;
+  brokerAvailable: boolean;
+  provider: string;
+  serviceName: string;
+  command: string | null;
+  status: string;
+  hasExposure: boolean;
+  declaredIntent: RuntimeExposureIntent | null;
+}): ManagedRuntimeExposureBackfillDecision {
+  if (input.mode === "off") return { action: "keep", reason: "https_default_disabled" };
+  if (input.provider !== "local_process") return { action: "keep", reason: "not_a_managed_local_process" };
+  // Idempotence: a row that already carries exposure state is never re-driven,
+  // so repeated deploys and restarts converge instead of churning listeners.
+  if (input.hasExposure) return { action: "keep", reason: "already_exposed" };
+  if (input.declaredIntent === "disabled") return { action: "keep", reason: "deliberate_opt_out" };
+  if (input.declaredIntent === null) return { action: "keep", reason: "no_configured_service_entry" };
+  if (!isManagedHttpsDefaultCandidate({ serviceName: input.serviceName, command: input.command })) {
+    return { action: "keep", reason: "unmanaged_or_custom_service" };
+  }
+  if (input.mode !== "force" && !input.brokerAvailable) {
+    return { action: "keep", reason: "broker_unavailable" };
+  }
+  if (!LIVE_RUNTIME_SERVICE_STATUSES.has(input.status)) {
+    return { action: "keep", reason: "stopped_defaults_on_next_start" };
+  }
+  return { action: "reprovision", reason: "http_only_managed_service" };
+}
+
+/**
+ * Look up the exposure intent a persisted runtime-service row inherits from its
+ * owning workspace configuration, by matching the row's service name against the
+ * configured entries. Returns null when no entry matches.
+ */
+async function buildPersistedRuntimeExposureIntentLookup(db: Db) {
+  const [projectWorkspaceRows, executionWorkspaceRows] = await Promise.all([
+    db.select().from(projectWorkspaces),
+    db.select().from(executionWorkspaces),
+  ]);
+  const projectRuntimeById = new Map(projectWorkspaceRows.map((row) => [
+    row.id,
+    readProjectWorkspaceRuntimeConfig((row.metadata as Record<string, unknown> | null) ?? null)?.workspaceRuntime ?? null,
+  ] as const));
+  const executionRuntimeById = new Map(executionWorkspaceRows.map((row) => [
+    row.id,
+    readExecutionWorkspaceConfig((row.metadata as Record<string, unknown> | null) ?? null)?.workspaceRuntime
+      ?? (row.projectWorkspaceId ? projectRuntimeById.get(row.projectWorkspaceId) ?? null : null),
+  ] as const));
+
+  return (row: {
+    serviceName: string;
+    projectWorkspaceId: string | null;
+    executionWorkspaceId: string | null;
+  }): RuntimeExposureIntent | null => {
+    const runtime = (row.executionWorkspaceId ? executionRuntimeById.get(row.executionWorkspaceId) : null)
+      ?? (row.projectWorkspaceId ? projectRuntimeById.get(row.projectWorkspaceId) ?? null : null);
+    if (!runtime) return null;
+    const entries = listConfiguredRuntimeServiceEntries({ workspaceRuntime: runtime });
+    const entry = entries.find((candidate) => asString(candidate.name, "service") === row.serviceName);
+    if (!entry) return null;
+    return readRuntimeExposureIntent(parseObject(entry.expose));
+  };
+}
+
 export async function reconcilePersistedRuntimeServicesOnStartup(db: Db) {
   const rows = await db
     .select()
@@ -5760,12 +6421,71 @@ export async function reconcilePersistedRuntimeServicesOnStartup(db: Db) {
       ),
     );
 
-  if (rows.length === 0) return { reconciled: 0, adopted: 0, stopped: 0 };
+  // Backfill inputs, resolved once per startup rather than per row.
+  const httpsMode = resolveManagedRuntimeHttpsMode();
+  const brokerAvailable = httpsMode === "off"
+    ? false
+    : await workspaceRuntimeExposureDeps.isBrokerAvailable().catch(() => false);
+  const readDeclaredExposureIntent = await buildPersistedRuntimeExposureIntentLookup(db);
+
+  let ownedExposureListeners: Awaited<ReturnType<BrokerClient["list"]>> | null = [];
+  if (rows.some((row) => row.exposure && row.exposure.state !== "removed")) {
+    try {
+      ownedExposureListeners = await workspaceRuntimeExposureDeps.broker.list();
+    } catch {
+      ownedExposureListeners = null;
+    }
+  }
 
   let reconciled = 0;
   let adopted = 0;
   let stopped = 0;
+  let backfilled = 0;
   for (const row of rows) {
+    if (row.status === "stopped" && row.exposure && row.exposure.state !== "removed") {
+      await cleanupPersistedExposureRows(db, [{
+        id: row.id,
+        exposure: row.exposure,
+        exposureHandle: row.exposureHandle,
+      }]);
+      reconciled += 1;
+      continue;
+    }
+    const rowExposureListeners = ownedExposureListeners?.filter((listener) => listener.runtimeId === row.id) ?? [];
+    const exposureMappingMatches = !row.exposure || (
+      row.exposure.state === "ready"
+      && Boolean(row.exposureHandle)
+      && rowExposureListeners.length === row.exposure.listeners.length
+      && row.exposure.listeners.every((expected) => rowExposureListeners.some((actual) => (
+        actual.port === expected.targetPort && actual.purpose === expected.purpose
+      )))
+    );
+    const exposureHealthMatches = !row.exposure || (
+      exposureMappingMatches
+      && Boolean(row.exposure.publicUrl)
+      && await workspaceRuntimeExposureDeps.probeHealth(
+        new URL("/api/health", row.exposure.publicUrl!).toString(),
+      )
+    );
+    // Pre-feature rows carry no exposure state at all. An eligible one that is
+    // still serving plain HTTP must not be adopted as-is, or the deploy would
+    // leave `http://paperclip-dev:<port>` as the canonical URL forever. Stopping
+    // it here hands it to the desired-state restart below, which brings it back
+    // through the normal fail-closed exposure lifecycle.
+    const backfillDecision = decideManagedRuntimeExposureBackfill({
+      mode: httpsMode,
+      brokerAvailable,
+      provider: row.provider,
+      serviceName: row.serviceName,
+      command: row.command,
+      status: row.status,
+      hasExposure: Boolean(row.exposure && row.exposure.state !== "removed"),
+      declaredIntent: readDeclaredExposureIntent({
+        serviceName: row.serviceName,
+        projectWorkspaceId: row.projectWorkspaceId ?? null,
+        executionWorkspaceId: row.executionWorkspaceId ?? null,
+      }),
+    });
     let adoptedRecord = await findLocalServiceRegistryRecordByRuntimeServiceId({
       runtimeServiceId: row.id,
       profileKind: "workspace-runtime",
@@ -5805,12 +6525,18 @@ export async function reconcilePersistedRuntimeServicesOnStartup(db: Db) {
         cwd: row.cwd,
         envFingerprint: row.reuseKey ?? "",
         port: row.port ?? null,
-        url: row.url ?? null,
+        url: row.backendUrl ?? row.url ?? null,
       });
     }
     if (adoptedRecord) {
-      const adoptedUrl = adoptedRecord.url ?? row.url ?? null;
-      if (!(await isRuntimeServiceUrlHealthy(adoptedUrl, { serviceName: row.serviceName, command: row.command }))) {
+      const adoptedUrl = adoptedRecord.url ?? row.backendUrl ?? row.url ?? null;
+      if (
+        backfillDecision.action === "reprovision"
+        || !exposureHealthMatches
+        || !(await isRuntimeServiceUrlHealthy(adoptedUrl, { serviceName: row.serviceName, command: row.command }))
+      ) {
+        if (backfillDecision.action === "reprovision") backfilled += 1;
+        await terminateLocalService(adoptedRecord);
         await removeLocalServiceRegistryRecord(adoptedRecord.serviceKey);
       } else {
         const record: RuntimeServiceRecord = {
@@ -5829,7 +6555,7 @@ export async function reconcilePersistedRuntimeServicesOnStartup(db: Db) {
           command: row.command ?? null,
           cwd: row.cwd ?? null,
           port: adoptedRecord.port ?? row.port ?? null,
-          url: adoptedRecord.url ?? row.url ?? null,
+          url: row.exposure?.publicUrl ?? adoptedRecord.url ?? row.url ?? null,
           provider: "local_process",
           providerRef: String(adoptedRecord.pid),
           ownerAgentId: row.ownerAgentId ?? null,
@@ -5839,6 +6565,7 @@ export async function reconcilePersistedRuntimeServicesOnStartup(db: Db) {
           stoppedAt: null,
           stopPolicy: (row.stopPolicy as Record<string, unknown> | null) ?? null,
           healthStatus: "healthy",
+          exposure: row.exposure ?? null,
           reused: true,
           db,
           child: null,
@@ -5848,6 +6575,9 @@ export async function reconcilePersistedRuntimeServicesOnStartup(db: Db) {
           serviceKey: adoptedRecord.serviceKey,
           profileKind: "workspace-runtime",
           processGroupId: adoptedRecord.processGroupId ?? null,
+          exposureHandle: row.exposureHandle ?? null,
+          backendUrl: adoptedUrl,
+          exposureConfig: null,
         };
         registerRuntimeService(db, record);
         await touchLocalServiceRegistryRecord(adoptedRecord.serviceKey, {
@@ -5866,11 +6596,35 @@ export async function reconcilePersistedRuntimeServicesOnStartup(db: Db) {
     }
 
     const now = new Date();
+    let stoppedExposure = row.exposure ?? null;
+    let stoppedExposureHandle = row.exposureHandle ?? null;
+    if (stoppedExposure) {
+      const cleanup = await deprovisionExposure(workspaceRuntimeExposureDeps, {
+        runtimeId: row.id,
+        handle: stoppedExposureHandle,
+        ports: stoppedExposure.listeners.map((listener) => listener.targetPort),
+      });
+      for (const port of cleanup.quarantinedPorts) quarantinedRuntimeExposurePorts.add(port);
+      stoppedExposure = {
+        ...stoppedExposure,
+        state: cleanup.status.state,
+        publicUrl: null,
+        lastError: cleanup.status.lastError,
+        updatedAt: now.toISOString(),
+      };
+      if (cleanup.status.state === "removed") stoppedExposureHandle = null;
+    }
     await db
       .update(workspaceRuntimeServices)
       .set({
         status: "stopped",
         healthStatus: "unknown",
+        // A row queued for HTTPS backfill drops its HTTP URL now rather than
+        // keeping it until the restart succeeds: if the restart fails, the
+        // fail-closed contract says show no URL, not a working HTTP one.
+        url: stoppedExposure || backfillDecision.action === "reprovision" ? null : row.url,
+        exposure: stoppedExposure,
+        exposureHandle: stoppedExposureHandle,
         stoppedAt: now,
         lastUsedAt: now,
         updatedAt: now,
@@ -5887,7 +6641,26 @@ export async function reconcilePersistedRuntimeServicesOnStartup(db: Db) {
     stopped += 1;
   }
 
-  return { reconciled, adopted, stopped };
+  // Row reconciliation alone cannot repair the process-start crash window: the
+  // local service registry may contain a healthy managed process whose DB row
+  // was never committed. Re-applying persisted desired state adopts that
+  // registry entry (or restarts a missing service) and makes it visible to
+  // workspace cleanup through workspace_runtime_services again.
+  //
+  // It is also the second half of the HTTPS backfill: services stopped above as
+  // HTTP-only come back here through the ordinary start path, which now applies
+  // the `tailscale_https` default and only reports them healthy behind a
+  // verified HTTPS URL.
+  const desiredState = await restartDesiredRuntimeServicesOnStartup(db);
+
+  return {
+    reconciled,
+    adopted,
+    stopped,
+    backfilled,
+    restarted: desiredState.restarted,
+    restartFailed: desiredState.failed,
+  };
 }
 
 export async function restartDesiredRuntimeServicesOnStartup(db: Db) {
@@ -6045,6 +6818,9 @@ export async function persistAdapterManagedRuntimeServices(input: {
         startedAt,
         stoppedAt: ref.stoppedAt ? new Date(ref.stoppedAt) : null,
         stopPolicy: ref.stopPolicy,
+        exposure: null,
+        exposureHandle: null,
+        backendUrl: null,
         healthStatus: ref.healthStatus,
         createdAt,
         updatedAt: new Date(),
@@ -6074,6 +6850,9 @@ export async function persistAdapterManagedRuntimeServices(input: {
           startedAt,
           stoppedAt: ref.stoppedAt ? new Date(ref.stoppedAt) : null,
           stopPolicy: ref.stopPolicy,
+          exposure: null,
+          exposureHandle: null,
+          backendUrl: null,
           healthStatus: ref.healthStatus,
           updatedAt: new Date(),
         },

@@ -64,6 +64,12 @@ import {
 } from "./services/index.js";
 import { queueIssueAssignmentWakeup } from "./services/issue-assignment-wakeup.js";
 import { createSecretProposalsService } from "./services/secret-proposals.js";
+import { environmentRuntimeService } from "./services/environment-runtime.js";
+import { createDbAdapterAuthSessionStore } from "./services/codex-device-login-service.js";
+import {
+  createCodexDeviceLoginReaper,
+  createProductionLoginSessionReaperRuntime,
+} from "./services/codex-device-login-reaper.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
 import {
   parseAdapterRegistryEnv,
@@ -813,9 +819,23 @@ export async function startServer(): Promise<StartedServer> {
 
   void reconcilePersistedRuntimeServicesOnStartup(db as any)
     .then((result) => {
-      if (result.reconciled > 0) {
+      if (
+        result.reconciled > 0
+        || result.restarted > 0
+        || result.restartFailed > 0
+        || result.backfilled > 0
+      ) {
         logger.warn(
-          { reconciled: result.reconciled },
+          {
+            reconciled: result.reconciled,
+            adopted: result.adopted,
+            stopped: result.stopped,
+            // Managed HTTP-only services taken down so they come back on a
+            // verified HTTPS origin (PAP-17158).
+            httpsBackfilled: result.backfilled,
+            restarted: result.restarted,
+            restartFailed: result.restartFailed,
+          },
           "reconciled persisted runtime services from a previous server process",
         );
       }
@@ -1002,6 +1022,41 @@ export async function startServer(): Promise<StartedServer> {
           logger.error({ err }, "terminal issue workspace reaper failed");
         }));
     };
+
+    // The restart-safe cleanup backstop for adapter login sessions. The
+    // in-process five-minute timer stays the primary control. This reaper runs
+    // on startup and on the scheduler interval. It deletes the login sandbox for
+    // any expired non-terminal session, retries the delete for any terminal
+    // session left in `cleanup_pending`, and deletes a tagged lease that no live
+    // session references.
+    const adapterLoginReaper = createCodexDeviceLoginReaper({
+      store: createDbAdapterAuthSessionStore(db as any),
+      runtime: createProductionLoginSessionReaperRuntime({
+        db: db as any,
+        environmentRuntime: environmentRuntimeService(db as any, { pluginWorkerManager }),
+      }),
+    });
+    const logAdapterLoginReaperResult = (
+      result: Awaited<ReturnType<typeof adapterLoginReaper.sweep>>,
+    ) => {
+      if (
+        result.expiredTimedOut > 0 ||
+        result.cleanupCleared > 0 ||
+        result.orphanLeasesDeleted > 0 ||
+        result.cleanupPendingRemaining > 0
+      ) {
+        logger.info(result, "adapter login reaper swept login sessions");
+      }
+    };
+    const scheduleAdapterLoginReaperSweep = () => {
+      if (heartbeatSchedulerStopped) return;
+      trackHeartbeatSchedulerWork(adapterLoginReaper
+        .sweep()
+        .then(logAdapterLoginReaperResult)
+        .catch((err) => {
+          logger.error({ err }, "adapter login reaper sweep failed");
+        }));
+    };
     const tools = toolAccessService(db as any, {
       deploymentMode: config.deploymentMode,
       deploymentExposure: config.deploymentExposure,
@@ -1129,6 +1184,16 @@ export async function startServer(): Promise<StartedServer> {
       logger.warn({ ...toolHealthSweep }, "startup tool connection health sweep found failing connections");
     }
     await decisionExecutor.sweepExpired();
+
+    // Run the adapter login reaper once at startup, so a login sandbox that
+    // outlived a server restart is deleted before timer ticks start.
+    await adapterLoginReaper
+      .sweep()
+      .then(logAdapterLoginReaperResult)
+      .catch((err) => {
+        logger.error({ err }, "startup adapter login reaper sweep failed");
+      });
+
     const runRetentionSweep = async () => {
       const activeCompanies = await db.select({ id: companies.id }).from(companies).where(eq(companies.status, "active"));
       let archived = 0;
@@ -1187,6 +1252,7 @@ export async function startServer(): Promise<StartedServer> {
         if (heartbeatSchedulerStopped) return;
         scheduleMergedPullRequestConfirmationSweep();
         scheduleTerminalWorkspaceSweep();
+        scheduleAdapterLoginReaperSweep();
 
         if (heartbeatSchedulerStopped) return;
         trackHeartbeatSchedulerWork(routines

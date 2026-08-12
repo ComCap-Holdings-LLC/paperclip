@@ -798,6 +798,13 @@ export type {
   AdapterEnvironmentTestStatus,
   AdapterEnvironmentCheck,
   AdapterEnvironmentTestResult,
+  AdapterAuthSessionStatus,
+  AdapterAuthSessionInternalStatus,
+  AdapterAuthSessionFailure,
+  AdapterAuthSessionResponse,
+  AdapterAuthSessionPrompt,
+  AdapterAuthSessionOwnerResponse,
+  StartAdapterAuthSessionRequest,
   AssetImage,
   Project,
   ProjectBudgetSummary,
@@ -1411,6 +1418,24 @@ export {
   COMPANY_SEARCH_SORTS,
   COMPANY_SEARCH_UPDATED_WITHIN_OPTIONS,
 } from "./types/index.js";
+export {
+  ADAPTER_AUTH_SESSION_STATUSES,
+  ADAPTER_AUTH_SESSION_INTERNAL_STATUSES,
+} from "./types/index.js";
+export {
+  ADAPTER_AUTH_SESSION_ACTIVE_STATUSES,
+  isActiveAdapterAuthSessionStatus,
+  toPublicAdapterAuthSessionStatus,
+  type AdapterAuthSessionActiveStatus,
+} from "./adapter-auth-session.js";
+export {
+  adapterAuthSessionStatusSchema,
+  adapterAuthSessionFailureSchema,
+  adapterAuthSessionResponseSchema,
+  adapterAuthSessionPromptSchema,
+  adapterAuthSessionOwnerResponseSchema,
+  startAdapterAuthSessionRequestSchema,
+} from "./validators/adapter-auth-session.js";
 export {
   ISSUE_REFERENCE_IDENTIFIER_RE,
   buildIssueReferenceHref,
@@ -2384,3 +2409,46 @@ export {
   type FeatureTier,
   type InstanceFeatureKey,
 } from "./feature-catalog.js";
+
+// --- Runtime exposure (opt-in Tailscale HTTPS for managed branch runtimes) ---
+// PAP-17049 plan, PAP-17050 threat-model verdict. Contract shared across DB,
+// server, UI, runtime, and the least-privilege host broker.
+export type {
+  RuntimeExposureProvider,
+  RuntimeExposureFailurePolicy,
+  RuntimeExposureConfig,
+  RuntimeExposureState,
+  RuntimeExposureListenerPurpose,
+  RuntimeExposureListener,
+  RuntimeExposureStatus,
+} from "./types/runtime-exposure.js";
+export {
+  runtimeExposureProviderSchema,
+  runtimeExposureFailurePolicySchema,
+  runtimeExposureConfigSchema,
+  runtimeExposureStateSchema,
+  runtimeExposureListenerPurposeSchema,
+  runtimeExposureListenerSchema,
+  runtimeExposureStatusSchema,
+  parseRuntimeExposureConfig,
+  readRuntimeExposureIntent,
+  resolveDeclaredRuntimeExposureConfig,
+  DEFAULT_TAILSCALE_HTTPS_EXPOSURE,
+  type RuntimeExposureConfigInput,
+  type RuntimeExposureIntent,
+  type RuntimeExposureStatusInput,
+} from "./validators/runtime-exposure.js";
+export {
+  RUNTIME_EXPOSURE_APP_PORT_MIN,
+  RUNTIME_EXPOSURE_APP_PORT_MAX,
+  RUNTIME_EXPOSURE_HMR_PORT_OFFSET,
+  RUNTIME_EXPOSURE_HMR_PORT_MIN,
+  RUNTIME_EXPOSURE_HMR_PORT_MAX,
+  isRuntimeExposureAppPort,
+  isRuntimeExposureHmrPort,
+  isAllowedRuntimeExposurePort,
+  deriveViteHmrPort,
+  derivePaperclipViteHmrPort,
+  buildRuntimeExposureUrl,
+  buildRuntimeExposureHealthUrl,
+} from "./runtime-exposure/ports.js";

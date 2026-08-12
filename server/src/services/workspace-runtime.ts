@@ -26,13 +26,15 @@ import {
   type WorkspaceRuntimeDesiredState,
   type WorkspaceRuntimeServiceStateMap,
 } from "@paperclipai/shared";
-import { and, desc, eq, inArray, isNull, ne } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, lte, ne, or } from "drizzle-orm";
 import { asNumber, asString, parseObject, renderTemplate } from "../adapters/utils.js";
+import { conflict } from "../errors.js";
 import { resolveHomeAwarePath } from "../home-paths.js";
 import {
   createLocalServiceKey,
   findLocalServiceRegistryRecordByRuntimeServiceId,
   findAdoptableLocalService,
+  isLocalServiceProcessOwnedBy,
   isLocalServiceProcessInWorkspace,
   readLocalServiceProcessCwd,
   readLocalServicePortOwner,
@@ -194,6 +196,10 @@ type LocalRuntimeServiceStart = {
   readiness: Promise<void>;
 };
 
+type PendingRuntimeServiceReadiness = LocalRuntimeServiceStart & {
+  service: Record<string, unknown>;
+};
+
 type StoppedRuntimeServiceReuseCandidate = {
   id: string;
   port: number | null;
@@ -205,7 +211,19 @@ const runtimeServiceLeasesByRun = new Map<string, string[]>();
 const runtimeProvisionByWorkspace = new Map<string, Promise<void>>();
 const quarantinedRuntimeExposurePorts = new Set<number>();
 const DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES = 256 * 1024;
+export const WORKSPACE_RUNTIME_PORT_ALLOCATION_ATTEMPTS = 32;
+const ACTIVE_RUNTIME_PORT_RESERVATION_STATUSES = ["provisioning", "starting", "running"] as const;
 const DEFAULT_TAILSCALE_BROKER_SOCKET = "/run/paperclip-tailscale-broker/broker.sock";
+
+class RuntimeServicePortBindCollision extends Error {
+  readonly port: number;
+
+  constructor(port: number) {
+    super(`Runtime service could not bind allocated port ${port}`);
+    this.name = "RuntimeServicePortBindCollision";
+    this.port = port;
+  }
+}
 
 export type WorkspaceRuntimeExposureDeps = ExposureManagerDeps & {
   resolveHostname: () => Promise<string>;
@@ -2618,21 +2636,6 @@ export function formatManagedGitWorktreeBranchInspection(input: ManagedGitWorktr
   };
 }
 
-function terminateChildProcess(child: ChildProcess) {
-  if (!child.pid) return;
-  if (process.platform !== "win32") {
-    try {
-      process.kill(-child.pid, "SIGTERM");
-      return;
-    } catch {
-      // Fall through to the direct child kill.
-    }
-  }
-  if (!child.killed) {
-    child.kill("SIGTERM");
-  }
-}
-
 function buildWorkspaceCommandEnv(input: {
   base: ExecutionWorkspaceInput;
   repoRoot: string;
@@ -3836,6 +3839,160 @@ async function allocateAndReserveExposure(input: {
   }
 }
 
+async function canBindRuntimePort(port: number): Promise<boolean> {
+  return await new Promise<boolean>((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "EADDRINUSE" || error.code === "EACCES") {
+        resolve(false);
+        return;
+      }
+      reject(error);
+    });
+    server.listen(port, "127.0.0.1", () => {
+      server.close((error) => {
+        if (error) reject(error);
+        else resolve(true);
+      });
+    });
+  });
+}
+
+async function readReservedRuntimePorts(input: {
+  db?: Db;
+  ports: number[];
+  executionWorkspaceId: string | null;
+}) {
+  if (!input.db || input.ports.length === 0) return new Set<number>();
+  const lowerBound = Math.min(...input.ports);
+  const upperBound = Math.max(...input.ports);
+  const otherWorkspaceCondition = input.executionWorkspaceId
+    ? or(
+        isNull(workspaceRuntimeServices.executionWorkspaceId),
+        ne(workspaceRuntimeServices.executionWorkspaceId, input.executionWorkspaceId),
+      )
+    : undefined;
+  const rows = await input.db
+    .select({ port: workspaceRuntimeServices.port })
+    .from(workspaceRuntimeServices)
+    .where(
+      and(
+        inArray(workspaceRuntimeServices.status, [...ACTIVE_RUNTIME_PORT_RESERVATION_STATUSES]),
+        gte(workspaceRuntimeServices.port, lowerBound),
+        lte(workspaceRuntimeServices.port, upperBound),
+        otherWorkspaceCondition,
+      ),
+    );
+  return new Set(rows.flatMap((row) => row.port === null ? [] : [row.port]));
+}
+
+async function buildRuntimePortAllocationConflict(input: {
+  db?: Db;
+  companyId: string;
+  executionWorkspaceId: string | null;
+  preferredPort: number;
+  attemptedPorts: number[];
+}) {
+  const conflictRows = input.db && input.attemptedPorts.length > 0
+    ? await input.db
+        .select({
+          port: workspaceRuntimeServices.port,
+          executionWorkspaceId: workspaceRuntimeServices.executionWorkspaceId,
+          projectWorkspaceId: workspaceRuntimeServices.projectWorkspaceId,
+        })
+        .from(workspaceRuntimeServices)
+        .where(
+          and(
+            eq(workspaceRuntimeServices.companyId, input.companyId),
+            inArray(workspaceRuntimeServices.status, [...ACTIVE_RUNTIME_PORT_RESERVATION_STATUSES]),
+            inArray(workspaceRuntimeServices.port, input.attemptedPorts),
+            input.executionWorkspaceId
+              ? or(
+                  isNull(workspaceRuntimeServices.executionWorkspaceId),
+                  ne(workspaceRuntimeServices.executionWorkspaceId, input.executionWorkspaceId),
+                )
+              : undefined,
+          ),
+        )
+    : [];
+  const attemptedRank = new Map(input.attemptedPorts.map((port, index) => [port, index]));
+  const authorizedConflict = conflictRows
+    .sort((left, right) =>
+      (attemptedRank.get(left.port ?? -1) ?? Number.MAX_SAFE_INTEGER)
+      - (attemptedRank.get(right.port ?? -1) ?? Number.MAX_SAFE_INTEGER))
+    .find((row) => row.executionWorkspaceId || row.projectWorkspaceId) ?? null;
+  const remediation =
+    "Stop the conflicting managed service or configure a different preferred port, then retry the start.";
+
+  return conflict(
+    `No safe runtime service port is available in the bounded allocation range starting at ${input.preferredPort}.`,
+    {
+      code: "workspace_runtime_port_allocation_exhausted",
+      port: input.preferredPort,
+      attemptedPortCount: input.attemptedPorts.length,
+      ...(authorizedConflict?.executionWorkspaceId
+        ? { conflictingExecutionWorkspaceId: authorizedConflict.executionWorkspaceId }
+        : {}),
+      ...(authorizedConflict?.projectWorkspaceId
+        ? { conflictingProjectWorkspaceId: authorizedConflict.projectWorkspaceId }
+        : {}),
+      remediation,
+    },
+  );
+}
+
+async function allocateIsolatedWorkspacePort(input: {
+  db?: Db;
+  companyId: string;
+  executionWorkspaceId: string;
+  preferredPort: number;
+  stoppedPort: number | null;
+  excludedPorts: ReadonlySet<number>;
+}) {
+  const lastPort = Math.min(
+    65_535,
+    input.preferredPort + WORKSPACE_RUNTIME_PORT_ALLOCATION_ATTEMPTS - 1,
+  );
+  const candidates: number[] = [];
+  const addCandidate = (port: number | null) => {
+    if (
+      port === null
+      || port < input.preferredPort
+      || port > lastPort
+      || input.excludedPorts.has(port)
+      || candidates.includes(port)
+    ) return;
+    candidates.push(port);
+  };
+  addCandidate(input.stoppedPort);
+  for (let port = input.preferredPort; port <= lastPort; port += 1) addCandidate(port);
+
+  const reservedPorts = await readReservedRuntimePorts({
+    db: input.db,
+    ports: candidates,
+    executionWorkspaceId: input.executionWorkspaceId,
+  });
+  for (const port of candidates) {
+    if (reservedPorts.has(port)) continue;
+    if (await canBindRuntimePort(port)) return port;
+  }
+  const attemptedPorts = [
+    ...input.excludedPorts,
+    ...candidates,
+  ].filter((port, index, ports) =>
+    port >= input.preferredPort
+    && port <= lastPort
+    && ports.indexOf(port) === index);
+
+  throw await buildRuntimePortAllocationConflict({
+    db: input.db,
+    companyId: input.companyId,
+    executionWorkspaceId: input.executionWorkspaceId,
+    preferredPort: input.preferredPort,
+    attemptedPorts,
+  });
+}
+
 function buildTemplateData(input: {
   workspace: RealizedExecutionWorkspace;
   agent: ExecutionWorkspaceAgentRef;
@@ -4099,6 +4256,53 @@ async function waitForReadiness(input: {
     await delay(intervalMs);
   }
   throw new Error(`Readiness check failed for ${readinessUrl}: ${lastError}`);
+}
+
+async function waitForAllocatedPortBind(input: {
+  service: Record<string, unknown>;
+  port: number;
+  child: ChildProcess;
+}) {
+  const deadline = Date.now() + resolveWorkspaceRuntimeReadinessTimeoutSec(input.service) * 1000;
+  while (Date.now() < deadline) {
+    if (input.child.exitCode !== null || input.child.signalCode !== null) {
+      throw new Error("service process exited before binding its allocated port");
+    }
+
+    const ownerPid = await readLocalServicePortOwner(input.port);
+    if (ownerPid) {
+      const childPid = input.child.pid ?? null;
+      if (!childPid || !(await isLocalServiceProcessOwnedBy(ownerPid, childPid))) {
+        throw new RuntimeServicePortBindCollision(input.port);
+      }
+      // Require the same launched process group to retain ownership across a stability delay.
+      // Cwd matching alone is insufficient because sibling services can share a workspace.
+      await delay(250);
+      if (input.child.exitCode !== null || input.child.signalCode !== null) {
+        throw new Error("service process exited after losing its allocated port");
+      }
+      const stableOwnerPid = await readLocalServicePortOwner(input.port);
+      if (!stableOwnerPid || !(await isLocalServiceProcessOwnedBy(stableOwnerPid, childPid))) {
+        throw new RuntimeServicePortBindCollision(input.port);
+      }
+      return;
+    }
+
+    // A failed bind probe proves only that some listener appeared. If listener ownership cannot
+    // be attributed to this child after a stability delay, retry instead of accepting a sibling.
+    if (!(await canBindRuntimePort(input.port))) {
+      await delay(250);
+      if (input.child.exitCode !== null || input.child.signalCode !== null) {
+        throw new Error("service process exited after losing its allocated port");
+      }
+      const stableOwnerPid = await readLocalServicePortOwner(input.port);
+      const childPid = input.child.pid ?? null;
+      if (stableOwnerPid && childPid && await isLocalServiceProcessOwnedBy(stableOwnerPid, childPid)) return;
+      throw new RuntimeServicePortBindCollision(input.port);
+    }
+    await delay(50);
+  }
+  throw new Error(`Runtime service did not bind allocated port ${input.port} before timeout`);
 }
 
 function isPaperclipDevRuntimeService(input: { serviceName?: string | null; command?: string | null }) {
@@ -4372,6 +4576,8 @@ type StartLocalRuntimeServiceInput = {
   provisionCoordinator?: RuntimeProvisionCoordinator;
   preparedProvisioningRecord?: RuntimeServiceRecord | null;
   runtimeServiceId?: string;
+  allowFixedPortFallback?: boolean;
+  excludedPorts?: ReadonlySet<number>;
   reuseKey: string | null;
   scopeType: "project_workspace" | "execution_workspace" | "run" | "agent";
   scopeId: string | null;
@@ -4560,6 +4766,14 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
     command,
   });
   const exposureConfig = resolvedExposure?.config ?? null;
+  const portType = asString(portConfig.type, "");
+  const canAllocateFixedPort = Boolean(
+    !exposureConfig
+    && input.allowFixedPortFallback
+    && input.db
+    && input.executionWorkspaceId
+    && explicitPort > 0,
+  );
   const stoppedReuseCandidate = await findStoppedRuntimeServiceReuseCandidate({
     db: input.db,
     companyId: input.agent.companyId,
@@ -4570,10 +4784,47 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
     scopeType: input.scopeType,
     scopeId: input.scopeId,
   });
-  let reusableStoppedPort: number | null = null;
-  if (asString(portConfig.type, "") === "auto" && stoppedReuseCandidate?.port) {
-    const ownerPid = await readLocalServicePortOwner(stoppedReuseCandidate.port);
-    reusableStoppedPort = ownerPid ? null : stoppedReuseCandidate.port;
+  let fixedPortRegistryMatch = false;
+  if (!exposureConfig && canAllocateFixedPort && identityPort) {
+    const identityTemplateData = buildTemplateData({
+      workspace: input.workspace,
+      agent: input.agent,
+      issue: input.issue,
+      adapterEnv: input.adapterEnv,
+      port: identityPort,
+    });
+    const identityExpose = parseObject(input.service.expose);
+    const identityReadiness = parseObject(input.service.readiness);
+    const identityUrlTemplate =
+      asString(identityExpose.urlTemplate, "")
+      || asString(identityReadiness.urlTemplate, "");
+    const identityBackendUrl = identityUrlTemplate
+      ? renderTemplate(identityUrlTemplate, identityTemplateData)
+      : null;
+    const identityServiceKey = createLocalServiceKey({
+      profileKind: "workspace-runtime",
+      serviceName,
+      cwd: identity.serviceCwd,
+      command,
+      envFingerprint: serviceIdentityFingerprint,
+      port: identityPort,
+      scope: {
+        scopeType: input.scopeType,
+        scopeId: input.scopeId,
+        executionWorkspaceId: input.executionWorkspaceId ?? null,
+        reuseKey: input.reuseKey,
+      },
+    });
+    fixedPortRegistryMatch = Boolean(await findAdoptableLocalService({
+      serviceKey: identityServiceKey,
+      profileKind: "workspace-runtime",
+      serviceName,
+      command,
+      cwd: identity.serviceCwd,
+      envFingerprint: serviceIdentityFingerprint,
+      port: identityPort,
+      url: identityBackendUrl,
+    }));
   }
   const runtimeId = input.runtimeServiceId ?? stoppedReuseCandidate?.id ?? randomUUID();
   // An exposed runtime always takes its port from the dedicated broker range, so
@@ -4594,13 +4845,38 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
         preferredAppPort: stoppedReuseCandidate?.port ?? (explicitPort > 0 ? explicitPort : null),
       })
     : null;
-  const port = reservedExposure
-    ? reservedExposure.appPort
-    : asString(portConfig.type, "") === "auto"
-      ? (reusableStoppedPort ?? await allocatePort())
-      : explicitPort > 0
-        ? explicitPort
+  let port: number | null = reservedExposure?.appPort ?? null;
+  if (!reservedExposure && portType === "auto") {
+    if (stoppedReuseCandidate?.port && !input.excludedPorts?.has(stoppedReuseCandidate.port)) {
+      port = await canBindRuntimePort(stoppedReuseCandidate.port)
+        ? stoppedReuseCandidate.port
         : null;
+    }
+    for (let attempt = 0; port === null && attempt < WORKSPACE_RUNTIME_PORT_ALLOCATION_ATTEMPTS; attempt += 1) {
+      const candidate = await allocatePort();
+      if (!input.excludedPorts?.has(candidate)) port = candidate;
+    }
+    if (port === null) {
+      throw conflict("No safe automatically allocated runtime service port is available.", {
+        code: "workspace_runtime_port_allocation_exhausted",
+        attemptedPortCount: WORKSPACE_RUNTIME_PORT_ALLOCATION_ATTEMPTS,
+        remediation: "Retry the start or configure a different runtime service port.",
+      });
+    }
+  } else if (!reservedExposure && canAllocateFixedPort && fixedPortRegistryMatch) {
+    port = explicitPort;
+  } else if (!reservedExposure && canAllocateFixedPort) {
+    port = await allocateIsolatedWorkspacePort({
+      db: input.db,
+      companyId: input.agent.companyId,
+      executionWorkspaceId: input.executionWorkspaceId!,
+      preferredPort: explicitPort,
+      stoppedPort: stoppedReuseCandidate?.port ?? null,
+      excludedPorts: input.excludedPorts ?? new Set<number>(),
+    });
+  } else if (!reservedExposure) {
+    port = explicitPort > 0 ? explicitPort : null;
+  }
   let exposureHostname: string | null = null;
   if (reservedExposure) {
     try {
@@ -4741,10 +5017,13 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
   // the lease was taken — so checking the pinned port here would reject a
   // legacy `port: 45439` service purely because the pre-backfill instance still
   // holds 45439, which is exactly the workspace this feature has to upgrade.
-  const conflictPort = reservedExposure ? null : identityPort;
+  const conflictPort = reservedExposure ? null : port;
   if (conflictPort) {
-      const ownerPid = await readLocalServicePortOwner(conflictPort);
+    const ownerPid = await readLocalServicePortOwner(conflictPort);
     if (ownerPid) {
+      if (canAllocateFixedPort || portType === "auto") {
+        throw new RuntimeServicePortBindCollision(conflictPort);
+      }
       const ownerCwd = await readLocalServiceProcessCwd(ownerPid);
       const ownerIsInWorkspace = ownerCwd
         ? await isLocalServiceProcessInWorkspace(ownerCwd, serviceCwd)
@@ -4837,6 +5116,13 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
       reject(err);
     });
   });
+  const earlyExitPromise = new Promise<never>((_, reject) => {
+    child.once("exit", (code, signal) => {
+      reject(new Error(
+        `service process exited before readiness (code ${code ?? "unknown"}, signal ${signal ?? "none"})`,
+      ));
+    });
+  });
   let stderrExcerpt = "";
   let stdoutExcerpt = "";
   child.stdout?.on("data", async (chunk) => {
@@ -4880,8 +5166,14 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
   }
 
   const readinessPromise = Promise.race([
-    waitForReadiness({ service: input.service, serviceName, command, url: backendUrl, readinessUrl }),
+    Promise.all([
+      waitForReadiness({ service: input.service, serviceName, command, url: backendUrl, readinessUrl }),
+      canAllocateFixedPort && port
+        ? waitForAllocatedPortBind({ service: input.service, port, child })
+        : Promise.resolve(),
+    ]).then(() => undefined),
     spawnErrorPromise,
+    earlyExitPromise,
   ]).then(async () => {
     if (record.exposureConfig && record.exposureHandle && record.port) {
       const provisioned = await provisionExposure(workspaceRuntimeExposureDeps, {
@@ -4908,16 +5200,32 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
       lastSeenAt: record.lastUsedAt,
     });
   }).catch(async (err) => {
-    terminateChildProcess(child);
+    const failureMessage = err instanceof Error ? err.message : String(err);
+    const bindCollision = !exposureConfig && (
+      err instanceof RuntimeServicePortBindCollision || Boolean(
+        port
+        && (input.allowFixedPortFallback || portType === "auto")
+        && /(?:EADDRINUSE|address already in use)/i.test(`${failureMessage}\n${stderrExcerpt}`),
+      )
+    );
+    if (child.pid) {
+      await terminateLocalService({
+        pid: child.pid,
+        processGroupId: child.pid,
+      });
+    }
     await cleanupRecordExposure(record, { preserveFailure: true });
     record.status = "stopped";
     record.healthStatus = "unhealthy";
     record.lastUsedAt = new Date().toISOString();
     record.stoppedAt = new Date().toISOString();
     await removeLocalServiceRegistryRecord(record.serviceKey).catch(() => undefined);
-    await persistRuntimeServiceRecord(record.db, record).catch(() => undefined);
+    if (exposureConfig) {
+      await persistRuntimeServiceRecord(record.db, record).catch(() => undefined);
+    }
+    if (bindCollision && port) throw new RuntimeServicePortBindCollision(port);
     throw new Error(
-      `Failed to start runtime service "${serviceName}": ${err instanceof Error ? err.message : String(err)}${stderrExcerpt ? ` | stderr: ${stderrExcerpt.trim()}` : ""}`,
+      `Failed to start runtime service "${serviceName}": ${failureMessage}${stderrExcerpt ? ` | stderr: ${stderrExcerpt.trim()}` : ""}`,
     );
   });
 
@@ -4987,24 +5295,57 @@ async function startLocalRuntimeService(
     ? await prepareRuntimeProvisioning(input)
     : input.preparedProvisioningRecord;
   let started: LocalRuntimeServiceStart | null = null;
+  const excludedPorts = new Set(input.excludedPorts ?? []);
+  const portConfig = parseObject(input.service.port);
+  const portType = asString(portConfig.type, "");
+  const explicitPort = asNumber(portConfig.value, asNumber(input.service.port, 0));
+  const fixedPortFallbackEnabled = Boolean(
+    input.allowFixedPortFallback && portType !== "auto" && explicitPort > 0,
+  );
+  const retryBindCollisions = fixedPortFallbackEnabled || portType === "auto";
+  const deferReadiness = Boolean(options?.deferReadiness);
 
   try {
-    started = await spawnLocalRuntimeService({
-      ...input,
-      runtimeServiceId: provisioningRecord?.id ?? input.runtimeServiceId,
+    for (let attempt = 0; attempt < WORKSPACE_RUNTIME_PORT_ALLOCATION_ATTEMPTS; attempt += 1) {
+      try {
+        started = await spawnLocalRuntimeService({
+          ...input,
+          excludedPorts,
+          runtimeServiceId: provisioningRecord?.id ?? input.runtimeServiceId,
+        });
+        if (runtimeProvisionCommand) {
+          await persistRuntimeServiceRecord(input.db, started.record);
+        }
+        if (provisioningRecord && started.record.id !== provisioningRecord.id && input.db) {
+          await input.db
+            .delete(workspaceRuntimeServices)
+            .where(eq(workspaceRuntimeServices.id, provisioningRecord.id));
+        }
+        if (!deferReadiness) {
+          await started.readiness;
+        }
+        return started;
+      } catch (error) {
+        if (!(error instanceof RuntimeServicePortBindCollision) || !retryBindCollisions) throw error;
+        excludedPorts.add(error.port);
+        started = null;
+      }
+    }
+
+    if (fixedPortFallbackEnabled && input.executionWorkspaceId) {
+      throw await buildRuntimePortAllocationConflict({
+        db: input.db,
+        companyId: input.agent.companyId,
+        executionWorkspaceId: input.executionWorkspaceId,
+        preferredPort: explicitPort,
+        attemptedPorts: [...excludedPorts],
+      });
+    }
+    throw conflict("No safe automatically allocated runtime service port is available.", {
+      code: "workspace_runtime_port_allocation_exhausted",
+      attemptedPortCount: excludedPorts.size,
+      remediation: "Retry the start or configure a different runtime service port.",
     });
-    if (runtimeProvisionCommand) {
-      await persistRuntimeServiceRecord(input.db, started.record);
-    }
-    if (provisioningRecord && started.record.id !== provisioningRecord.id && input.db) {
-      await input.db
-        .delete(workspaceRuntimeServices)
-        .where(eq(workspaceRuntimeServices.id, provisioningRecord.id));
-    }
-    if (!options?.deferReadiness) {
-      await started.readiness;
-    }
-    return started;
   } catch (error) {
     if (!started && provisioningRecord && provisioningRecord.status === "starting") {
       const nowIso = new Date().toISOString();
@@ -5299,6 +5640,26 @@ function selectRuntimeServiceEntries(input: {
   });
 }
 
+async function isPersistedIsolatedExecutionWorkspace(input: {
+  db?: Db;
+  companyId: string;
+  executionWorkspaceId?: string | null;
+}) {
+  if (!input.db || !input.executionWorkspaceId) return false;
+  const row = await input.db
+    .select({ mode: executionWorkspaces.mode })
+    .from(executionWorkspaces)
+    .where(
+      and(
+        eq(executionWorkspaces.id, input.executionWorkspaceId),
+        eq(executionWorkspaces.companyId, input.companyId),
+      ),
+    )
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  return row?.mode === "isolated_workspace";
+}
+
 export async function ensureRuntimeServicesForRun(input: {
   db?: Db;
   runId: string;
@@ -5321,6 +5682,11 @@ export async function ensureRuntimeServicesForRun(input: {
   const refs: RuntimeServiceRef[] = [];
   const runtimeProvisionCommand = resolveRuntimeProvisionCommand(input);
   const provisionCoordinator = createRuntimeProvisionCoordinator();
+  const allowFixedPortFallback = await isPersistedIsolatedExecutionWorkspace({
+    db: input.db,
+    companyId: input.agent.companyId,
+    executionWorkspaceId: input.executionWorkspaceId,
+  });
   runtimeServiceLeasesByRun.set(input.runId, acquiredServiceIds);
 
   try {
@@ -5375,6 +5741,7 @@ export async function ensureRuntimeServicesForRun(input: {
         runtimeProvisionCommand,
         recorder: input.recorder,
         provisionCoordinator,
+        allowFixedPortFallback,
         reuseKey,
         scopeType,
         scopeId,
@@ -5410,7 +5777,7 @@ type StartRuntimeServicesForWorkspaceControlInput = {
 
 type WorkspaceControlStartBatch = {
   refs: RuntimeServiceRef[];
-  pendingReadiness: LocalRuntimeServiceStart[];
+  pendingReadiness: PendingRuntimeServiceReadiness[];
   startedServiceIds: string[];
 };
 
@@ -5422,16 +5789,18 @@ async function startRuntimeServicesForWorkspaceControlUnlocked(
   registryDb = input.db,
   options?: {
     deferReadiness?: boolean;
+    allowFixedPortFallback?: boolean;
     runtimeProvisionCommand?: string;
     provisionCoordinator?: RuntimeProvisionCoordinator;
     preparedProvisioning?: {
       service: Record<string, unknown>;
       record: RuntimeServiceRecord;
     } | null;
+    excludedPorts?: ReadonlySet<number>;
   },
 ): Promise<WorkspaceControlStartBatch> {
   const refs: RuntimeServiceRef[] = [];
-  const pendingReadiness: LocalRuntimeServiceStart[] = [];
+  const pendingReadiness: PendingRuntimeServiceReadiness[] = [];
   const startedServiceIds: string[] = [];
 
   for (const service of rawServices) {
@@ -5495,6 +5864,8 @@ async function startRuntimeServicesForWorkspaceControlUnlocked(
         options?.preparedProvisioning?.service === service
           ? options.preparedProvisioning.record
           : undefined,
+      allowFixedPortFallback: options?.allowFixedPortFallback,
+      excludedPorts: options?.excludedPorts,
       reuseKey,
       scopeType,
       scopeId,
@@ -5509,16 +5880,73 @@ async function startRuntimeServicesForWorkspaceControlUnlocked(
     await persistRuntimeServiceRecord(persistenceDb, started.record);
     refs.push(toRuntimeServiceRef(started.record));
 
-    if (options?.deferReadiness && !started.record.reused) {
+    if (options?.deferReadiness && started.record.status === "starting" && !started.record.reused) {
       // Attach a rejection handler immediately; the caller awaits the same promise after
       // the DB transaction commits, but transaction failures may skip that wait path.
       started.readiness.catch(() => undefined);
-      pendingReadiness.push(started);
+      pendingReadiness.push({ ...started, service });
       startedServiceIds.push(started.record.id);
     }
   }
 
   return { refs, pendingReadiness, startedServiceIds };
+}
+
+async function lockWorkspaceRuntimeStartParents(
+  db: Db,
+  input: StartRuntimeServicesForWorkspaceControlInput,
+) {
+  let allowFixedPortFallback = false;
+  if (input.executionWorkspaceId) {
+    const [lockedExecutionWorkspace] = await db
+      .select({ id: executionWorkspaces.id, mode: executionWorkspaces.mode })
+      .from(executionWorkspaces)
+      .where(
+        and(
+          eq(executionWorkspaces.id, input.executionWorkspaceId),
+          eq(executionWorkspaces.companyId, input.actor.companyId),
+        ),
+      )
+      .for("update");
+    if (!lockedExecutionWorkspace) throw new Error("Execution workspace not found before starting runtime services");
+    allowFixedPortFallback = lockedExecutionWorkspace.mode === "isolated_workspace";
+  }
+
+  if (input.workspace.workspaceId) {
+    const [lockedProjectWorkspace] = await db
+      .select({ id: projectWorkspaces.id })
+      .from(projectWorkspaces)
+      .where(
+        and(
+          eq(projectWorkspaces.id, input.workspace.workspaceId),
+          eq(projectWorkspaces.companyId, input.actor.companyId),
+        ),
+      )
+      .for("update");
+    if (!lockedProjectWorkspace) throw new Error("Project workspace not found before starting runtime services");
+  }
+
+  return allowFixedPortFallback;
+}
+
+function canRetryDeferredPortBindCollision(
+  service: Record<string, unknown>,
+  allowFixedPortFallback: boolean,
+) {
+  const portConfig = parseObject(service.port);
+  const portType = asString(portConfig.type, "");
+  const explicitPort = asNumber(portConfig.value, asNumber(service.port, 0));
+  return portType === "auto" || Boolean(allowFixedPortFallback && explicitPort > 0);
+}
+
+async function discardFailedDeferredRuntimeStart(db: Db, record: RuntimeServiceRecord) {
+  clearIdleTimer(record);
+  if (runtimeServicesById.get(record.id) === record) runtimeServicesById.delete(record.id);
+  if (record.reuseKey && runtimeServicesByReuseKey.get(record.reuseKey) === record.id) {
+    runtimeServicesByReuseKey.delete(record.reuseKey);
+  }
+  await removeLocalServiceRegistryRecord(record.serviceKey).catch(() => undefined);
+  await persistRuntimeServiceRecord(db, record);
 }
 
 export async function startRuntimeServicesForWorkspaceControl(
@@ -5565,6 +5993,7 @@ export async function startRuntimeServicesForWorkspaceControl(
     service: Record<string, unknown>;
     record: RuntimeServiceRecord;
   } | null = null;
+  let allowFixedPortFallback = false;
   try {
     if (runtimeProvisionCommand) {
       for (const service of rawServices) {
@@ -5615,34 +6044,7 @@ export async function startRuntimeServicesForWorkspaceControl(
 
     await input.db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
-
-      if (input.executionWorkspaceId) {
-        const [lockedExecutionWorkspace] = await tx
-          .select({ id: executionWorkspaces.id })
-          .from(executionWorkspaces)
-          .where(
-            and(
-              eq(executionWorkspaces.id, input.executionWorkspaceId),
-              eq(executionWorkspaces.companyId, input.actor.companyId),
-            ),
-          )
-          .for("update");
-        if (!lockedExecutionWorkspace) throw new Error("Execution workspace not found before starting runtime services");
-      }
-
-      if (input.workspace.workspaceId) {
-        const [lockedProjectWorkspace] = await tx
-          .select({ id: projectWorkspaces.id })
-          .from(projectWorkspaces)
-          .where(
-            and(
-              eq(projectWorkspaces.id, input.workspace.workspaceId),
-              eq(projectWorkspaces.companyId, input.actor.companyId),
-            ),
-          )
-          .for("update");
-        if (!lockedProjectWorkspace) throw new Error("Project workspace not found before starting runtime services");
-      }
+      allowFixedPortFallback = await lockWorkspaceRuntimeStartParents(txDb, input);
 
       // Branch reconciliation takes these same parent row locks before mutating
       // a recorded branch. Persisting a `starting` service row before commit closes
@@ -5655,6 +6057,7 @@ export async function startRuntimeServicesForWorkspaceControl(
         input.db,
         {
           deferReadiness: true,
+          allowFixedPortFallback,
           runtimeProvisionCommand,
           provisionCoordinator,
           preparedProvisioning,
@@ -5662,13 +6065,86 @@ export async function startRuntimeServicesForWorkspaceControl(
       );
     });
 
-    for (const pending of startBatch.pendingReadiness) {
-      try {
-        await pending.readiness;
-        await persistRuntimeServiceRecord(input.db, pending.record);
-      } catch (error) {
-        await persistRuntimeServiceRecord(input.db, pending.record).catch(() => undefined);
-        throw error;
+    // Readiness never uses the transaction-scoped DB handle. A late bind collision is
+    // recorded after commit, then only the next bounded reservation re-enters a short
+    // parent-locked transaction. Slow builds therefore cannot retain the parent locks.
+    for (const initialPending of startBatch.pendingReadiness) {
+      let pending: PendingRuntimeServiceReadiness | null = initialPending;
+      const excludedPorts = new Set<number>();
+
+      while (pending) {
+        try {
+          await pending.readiness;
+          await persistRuntimeServiceRecord(input.db, pending.record);
+          break;
+        } catch (error) {
+          await discardFailedDeferredRuntimeStart(input.db, pending.record);
+          if (
+            !(error instanceof RuntimeServicePortBindCollision)
+            || !canRetryDeferredPortBindCollision(pending.service, allowFixedPortFallback)
+          ) {
+            throw error;
+          }
+
+          excludedPorts.add(error.port);
+          if (excludedPorts.size >= WORKSPACE_RUNTIME_PORT_ALLOCATION_ATTEMPTS) {
+            const portConfig = parseObject(pending.service.port);
+            const portType = asString(portConfig.type, "");
+            const preferredPort = asNumber(portConfig.value, asNumber(pending.service.port, 0));
+            if (allowFixedPortFallback && portType !== "auto" && preferredPort > 0 && input.executionWorkspaceId) {
+              throw await buildRuntimePortAllocationConflict({
+                db: input.db,
+                companyId: input.actor.companyId,
+                executionWorkspaceId: input.executionWorkspaceId,
+                preferredPort,
+                attemptedPorts: [...excludedPorts],
+              });
+            }
+            throw conflict("No safe automatically allocated runtime service port is available.", {
+              code: "workspace_runtime_port_allocation_exhausted",
+              attemptedPortCount: excludedPorts.size,
+              remediation: "Retry the start or configure a different runtime service port.",
+            });
+          }
+
+          const failedRecordId = pending.record.id;
+          let retryBatch: WorkspaceControlStartBatch = {
+            refs: [],
+            pendingReadiness: [],
+            startedServiceIds: [],
+          };
+          let retryAllowsFixedPortFallback = false;
+          await input.db.transaction(async (tx) => {
+            const txDb = tx as unknown as Db;
+            retryAllowsFixedPortFallback = await lockWorkspaceRuntimeStartParents(txDb, input);
+            if (!canRetryDeferredPortBindCollision(pending!.service, retryAllowsFixedPortFallback)) {
+              throw error;
+            }
+            retryBatch = await startRuntimeServicesForWorkspaceControlUnlocked(
+              { ...input, db: txDb },
+              [pending!.service],
+              invocationId,
+              txDb,
+              input.db,
+              {
+                deferReadiness: true,
+                allowFixedPortFallback: retryAllowsFixedPortFallback,
+                provisionCoordinator,
+                excludedPorts,
+              },
+            );
+          });
+          allowFixedPortFallback = retryAllowsFixedPortFallback;
+          for (const serviceId of retryBatch.startedServiceIds) {
+            if (!startBatch.startedServiceIds.includes(serviceId)) {
+              startBatch.startedServiceIds.push(serviceId);
+            }
+          }
+          const replacementRef = retryBatch.refs[0];
+          const failedRefIndex = startBatch.refs.findIndex((ref) => ref.id === failedRecordId);
+          if (replacementRef && failedRefIndex >= 0) startBatch.refs[failedRefIndex] = replacementRef;
+          pending = retryBatch.pendingReadiness[0] ?? null;
+        }
       }
     }
 

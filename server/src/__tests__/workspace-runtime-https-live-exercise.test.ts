@@ -96,13 +96,15 @@ if (optedIn && !live) {
     // An ephemeral legacy port rather than the real template's 45439, so this
     // never contends with the live workspace runtime on the same host.
     const reservePort = async () => {
-      const probe = net.createServer();
-      await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
-      const address = probe.address();
-      const port = typeof address === "object" && address ? address.port : null;
-      await new Promise<void>((resolve, reject) => probe.close((e) => (e ? reject(e) : resolve())));
-      if (!port) throw new Error("failed to reserve a legacy port");
-      return port;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const probe = net.createServer();
+        await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+        const address = probe.address();
+        const port = typeof address === "object" && address ? address.port : null;
+        await new Promise<void>((resolve, reject) => probe.close((e) => (e ? reject(e) : resolve())));
+        if (port && port <= 55_535 && (port < 42_000 || port > 42_999)) return port;
+      }
+      throw new Error("failed to reserve a legacy port outside the broker range");
     };
 
     const companyId = randomUUID();

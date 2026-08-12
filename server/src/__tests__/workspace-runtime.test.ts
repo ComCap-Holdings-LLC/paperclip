@@ -41,8 +41,10 @@ import {
   resolveWorkspaceRuntimeReadinessTimeoutSec,
   resolveShell,
   sanitizeRuntimeServiceBaseEnv,
+  setWorkspaceRuntimeExposureDepsForTests,
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForExecutionWorkspace,
+  stopRuntimeServicesForProjectWorkspace,
   type RealizedExecutionWorkspace,
 } from "../services/workspace-runtime.ts";
 import {
@@ -5799,6 +5801,222 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
       await fs.rm(paperclipHome, { recursive: true, force: true });
     }
   }, 20_000);
+
+  it("backfills a pre-existing HTTP-only managed worktree runtime to verified HTTPS in place", async () => {
+    // PAP-17158: an eligible workspace created before the feature must come
+    // forward on the *same* workspace/runtime-service row — not by recreating it
+    // — and must never keep its HTTP URL as a healthy fallback.
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-https-backfill-"));
+    const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-home-"));
+    const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+    const previousPaperclipInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    const previousHttpsMode = process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = `runtime-https-backfill-${randomUUID()}`;
+
+    const reservePort = async () => {
+      const probe = net.createServer();
+      await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+      const address = probe.address();
+      const port = typeof address === "object" && address ? address.port : null;
+      await new Promise<void>((resolve, reject) => {
+        probe.close((error) => error ? reject(error) : resolve());
+      });
+      if (!port) throw new Error("Failed to reserve HTTPS backfill test port");
+      return port;
+    };
+    const isLoopbackPortFree = async (port: number) => {
+      const probe = net.createServer();
+      return await new Promise<boolean>((resolve) => {
+        probe.once("error", () => resolve(false));
+        probe.listen(port, "127.0.0.1", () => {
+          probe.close(() => resolve(true));
+        });
+      });
+    };
+
+    // Stands in for the persisted template's hard-coded 45439: a pinned port
+    // outside the broker's dedicated allowlist, so the backfill has to relocate.
+    const legacyPort = await reservePort();
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    // Binds the app port and its HMR companion, both loopback-only.
+    const command =
+      "node -e \"const http=require('node:http');const p=Number(process.env.PORT);for(const q of [p,p+10000])http.createServer((req,res)=>res.end('ok')).listen(q,'127.0.0.1');setInterval(()=>{},1000)\"";
+    const workspaceRuntime = {
+      services: [
+        {
+          name: "paperclip-dev",
+          command,
+          port: legacyPort,
+          // The pre-feature block: backend URL only, no exposure declaration.
+          expose: { type: "url", urlTemplate: "http://127.0.0.1:{{port}}" },
+          readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 10, intervalMs: 50 },
+          lifecycle: "shared",
+          reuseScope: "project_workspace",
+          stopPolicy: { type: "manual" },
+        },
+      ],
+    };
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Runtime HTTPS backfill",
+      status: "in_progress",
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary",
+      sourceType: "local_path",
+      cwd: workspaceRoot,
+      isPrimary: true,
+      metadata: {
+        runtimeConfig: {
+          workspaceRuntime,
+          desiredState: "running",
+          serviceStates: { "0": "running" },
+        },
+      },
+    });
+
+    const actor = { id: null, name: "Paperclip", companyId };
+    const workspace = {
+      ...buildWorkspace(workspaceRoot),
+      projectId,
+      workspaceId: projectWorkspaceId,
+    };
+
+    // A broker fake that remembers what it published, so a second reconciliation
+    // can recognize its own live listeners instead of tearing them down.
+    const exposedByRuntimeId = new Map<string, { port: number; purpose: "app" | "vite_hmr" }[]>();
+    const pendingByHandle = new Map<string, { runtimeId: string; listeners: { port: number; purpose: "app" | "vite_hmr" }[] }>();
+    let handleCounter = 0;
+    const brokerCalls: string[] = [];
+    const broker = {
+      async reserve(runtimeId: string, listeners: { port: number; purpose: "app" | "vite_hmr" }[]) {
+        brokerCalls.push("reserve");
+        handleCounter += 1;
+        const handle = `backfill-handle-${handleCounter}`;
+        pendingByHandle.set(handle, { runtimeId, listeners: listeners.map((l) => ({ ...l })) });
+        return { handle, reservedPorts: listeners.map((listener) => listener.port) };
+      },
+      async expose(runtimeId: string, handle: string) {
+        brokerCalls.push("expose");
+        const pending = pendingByHandle.get(handle);
+        if (!pending || pending.runtimeId !== runtimeId) throw new Error("listener_ownership_mismatch");
+        exposedByRuntimeId.set(runtimeId, pending.listeners);
+        return { handle, publicPorts: pending.listeners.map((listener) => listener.port) };
+      },
+      async remove(runtimeId: string, handle: string) {
+        brokerCalls.push("remove");
+        const listeners = exposedByRuntimeId.get(runtimeId) ?? pendingByHandle.get(handle)?.listeners ?? [];
+        exposedByRuntimeId.delete(runtimeId);
+        pendingByHandle.delete(handle);
+        return { removedPorts: listeners.map((listener) => listener.port) };
+      },
+      async list() {
+        return [...exposedByRuntimeId.entries()].flatMap(([runtimeId, listeners]) =>
+          listeners.map((listener) => ({ runtimeId, port: listener.port, purpose: listener.purpose })),
+        );
+      },
+    };
+    const installExposureDeps = () => setWorkspaceRuntimeExposureDepsForTests({
+      broker,
+      isPortAvailable: isLoopbackPortFree,
+      isBrokerAvailable: async () => true,
+      resolveHostname: async () => "runner.tail123.ts.net",
+      probeHealth: async () => true,
+      now: () => new Date().toISOString(),
+    });
+
+    try {
+      // ---- Before: the workspace as it exists today, on plain HTTP. ----
+      process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS = "off";
+      const before = await startRuntimeServicesForWorkspaceControl({
+        db,
+        actor,
+        issue: null,
+        workspace,
+        config: { workspaceRuntime, desiredState: "running", serviceStates: { "0": "running" } },
+        adapterEnv: {},
+      });
+      const runtimeServiceId = before[0]?.id;
+      expect(runtimeServiceId).toBeTruthy();
+      expect(before[0]?.port).toBe(legacyPort);
+      expect(before[0]?.url).toBe(`http://127.0.0.1:${legacyPort}`);
+      const [httpRow] = await db.select().from(workspaceRuntimeServices);
+      expect(httpRow.exposure).toBeNull();
+      expect(httpRow.url).toBe(`http://127.0.0.1:${legacyPort}`);
+      await expect(fetch(`http://127.0.0.1:${legacyPort}`)).resolves.toMatchObject({ ok: true });
+      expect(brokerCalls).toEqual([]);
+
+      // ---- Deploy: the feature turns on and Paperclip restarts. ----
+      await resetRuntimeServicesForTests();
+      delete process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
+      installExposureDeps();
+
+      const result = await reconcilePersistedRuntimeServicesOnStartup(db);
+      expect(result).toMatchObject({ backfilled: 1, restarted: 1, restartFailed: 0 });
+      expect(brokerCalls).toEqual(["reserve", "expose"]);
+
+      // ---- After: same row, verified HTTPS URL, no HTTP anywhere. ----
+      const afterRows = await db.select().from(workspaceRuntimeServices);
+      expect(afterRows).toHaveLength(1);
+      const httpsRow = afterRows[0]!;
+      expect(httpsRow.id).toBe(runtimeServiceId);
+      expect(httpsRow.status).toBe("running");
+      expect(httpsRow.port).not.toBe(legacyPort);
+      expect(httpsRow.port).toBeGreaterThanOrEqual(42_000);
+      expect(httpsRow.port).toBeLessThanOrEqual(42_999);
+      expect(httpsRow.url).toBe(`https://runner.tail123.ts.net:${httpsRow.port}`);
+      expect(httpsRow.exposure).toMatchObject({
+        provider: "tailscale_https",
+        state: "ready",
+        publicUrl: `https://runner.tail123.ts.net:${httpsRow.port}`,
+        hostname: "runner.tail123.ts.net",
+      });
+      expect(httpsRow.exposureHandle).toBeTruthy();
+      // The old HTTP backend is gone, not merely shadowed.
+      await expect(fetch(`http://127.0.0.1:${legacyPort}`)).rejects.toThrow();
+
+      // ---- Repeat deploy: converges, no listener churn, same port. ----
+      await resetRuntimeServicesForTests();
+      installExposureDeps();
+      brokerCalls.length = 0;
+      const second = await reconcilePersistedRuntimeServicesOnStartup(db);
+      expect(second).toMatchObject({ backfilled: 0 });
+      expect(brokerCalls).toEqual([]);
+      const [repeatRow] = await db.select().from(workspaceRuntimeServices);
+      expect(repeatRow.port).toBe(httpsRow.port);
+      expect(repeatRow.url).toBe(httpsRow.url);
+      expect(repeatRow.status).toBe("running");
+    } finally {
+      await stopRuntimeServicesForProjectWorkspace({
+        db,
+        projectWorkspaceId,
+        workspaceCwd: workspaceRoot,
+      }).catch(() => undefined);
+      await resetRuntimeServicesForTests();
+      await fs.rm(paperclipHome, { recursive: true, force: true });
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+      if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousPaperclipHome;
+      if (previousPaperclipInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousPaperclipInstanceId;
+      if (previousHttpsMode === undefined) delete process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
+      else process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS = previousHttpsMode;
+    }
+  }, 40_000);
 
   it("adopts a live auto-port shared service after runtime state is reset", async () => {
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-reconcile-"));

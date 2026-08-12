@@ -15,6 +15,7 @@ import {
   readRuntimeExposureIntent,
   resolveDeclaredRuntimeExposureConfig,
   type RuntimeExposureConfigInput,
+  type RuntimeExposureIntent,
   type RuntimeExposureStatus,
   type GitWorktreeBranchAncestryVerdict,
   type GitWorktreeBranchIncoherenceEvidence as SharedGitWorktreeBranchIncoherenceEvidence,
@@ -5823,6 +5824,96 @@ export async function listWorkspaceRuntimeServicesForProjectWorkspaces(
   return grouped;
 }
 
+/**
+ * Statuses that mean "there is, or is supposed to be, a live backend process".
+ * A row in one of these states is what the backfill has to reprovision; a
+ * `stopped` row simply picks the default up on its next start.
+ */
+const LIVE_RUNTIME_SERVICE_STATUSES = new Set(["provisioning", "starting", "running"]);
+
+export type ManagedRuntimeExposureBackfillDecision = {
+  action: "keep" | "reprovision";
+  reason: string;
+};
+
+/**
+ * Decide what the HTTPS backfill should do with one persisted runtime-service
+ * row (PAP-17158).
+ *
+ * Pure so every branch is directly testable: the reasons below are the whole
+ * contract for which pre-feature workspaces get upgraded and which are left
+ * exactly as they are.
+ *
+ * `declaredIntent === null` means no configured service entry could be matched
+ * to this row. Such a row is deliberately left alone: reprovisioning works by
+ * stopping the HTTP backend and letting the desired-state restart bring it back
+ * with exposure, so without a config to restart from we would take a service
+ * down and never bring it back.
+ */
+export function decideManagedRuntimeExposureBackfill(input: {
+  mode: ManagedRuntimeHttpsMode;
+  brokerAvailable: boolean;
+  provider: string;
+  serviceName: string;
+  command: string | null;
+  status: string;
+  hasExposure: boolean;
+  declaredIntent: RuntimeExposureIntent | null;
+}): ManagedRuntimeExposureBackfillDecision {
+  if (input.mode === "off") return { action: "keep", reason: "https_default_disabled" };
+  if (input.provider !== "local_process") return { action: "keep", reason: "not_a_managed_local_process" };
+  // Idempotence: a row that already carries exposure state is never re-driven,
+  // so repeated deploys and restarts converge instead of churning listeners.
+  if (input.hasExposure) return { action: "keep", reason: "already_exposed" };
+  if (input.declaredIntent === "disabled") return { action: "keep", reason: "deliberate_opt_out" };
+  if (input.declaredIntent === null) return { action: "keep", reason: "no_configured_service_entry" };
+  if (!isManagedHttpsDefaultCandidate({ serviceName: input.serviceName, command: input.command })) {
+    return { action: "keep", reason: "unmanaged_or_custom_service" };
+  }
+  if (input.mode !== "force" && !input.brokerAvailable) {
+    return { action: "keep", reason: "broker_unavailable" };
+  }
+  if (!LIVE_RUNTIME_SERVICE_STATUSES.has(input.status)) {
+    return { action: "keep", reason: "stopped_defaults_on_next_start" };
+  }
+  return { action: "reprovision", reason: "http_only_managed_service" };
+}
+
+/**
+ * Look up the exposure intent a persisted runtime-service row inherits from its
+ * owning workspace configuration, by matching the row's service name against the
+ * configured entries. Returns null when no entry matches.
+ */
+async function buildPersistedRuntimeExposureIntentLookup(db: Db) {
+  const [projectWorkspaceRows, executionWorkspaceRows] = await Promise.all([
+    db.select().from(projectWorkspaces),
+    db.select().from(executionWorkspaces),
+  ]);
+  const projectRuntimeById = new Map(projectWorkspaceRows.map((row) => [
+    row.id,
+    readProjectWorkspaceRuntimeConfig((row.metadata as Record<string, unknown> | null) ?? null)?.workspaceRuntime ?? null,
+  ] as const));
+  const executionRuntimeById = new Map(executionWorkspaceRows.map((row) => [
+    row.id,
+    readExecutionWorkspaceConfig((row.metadata as Record<string, unknown> | null) ?? null)?.workspaceRuntime
+      ?? (row.projectWorkspaceId ? projectRuntimeById.get(row.projectWorkspaceId) ?? null : null),
+  ] as const));
+
+  return (row: {
+    serviceName: string;
+    projectWorkspaceId: string | null;
+    executionWorkspaceId: string | null;
+  }): RuntimeExposureIntent | null => {
+    const runtime = (row.executionWorkspaceId ? executionRuntimeById.get(row.executionWorkspaceId) : null)
+      ?? (row.projectWorkspaceId ? projectRuntimeById.get(row.projectWorkspaceId) ?? null : null);
+    if (!runtime) return null;
+    const entries = listConfiguredRuntimeServiceEntries({ workspaceRuntime: runtime });
+    const entry = entries.find((candidate) => asString(candidate.name, "service") === row.serviceName);
+    if (!entry) return null;
+    return readRuntimeExposureIntent(parseObject(entry.expose));
+  };
+}
+
 export async function reconcilePersistedRuntimeServicesOnStartup(db: Db) {
   const rows = await db
     .select()
@@ -5833,6 +5924,13 @@ export async function reconcilePersistedRuntimeServicesOnStartup(db: Db) {
         inArray(workspaceRuntimeServices.status, ["provisioning", "starting", "running", "stopped"]),
       ),
     );
+
+  // Backfill inputs, resolved once per startup rather than per row.
+  const httpsMode = resolveManagedRuntimeHttpsMode();
+  const brokerAvailable = httpsMode === "off"
+    ? false
+    : await workspaceRuntimeExposureDeps.isBrokerAvailable().catch(() => false);
+  const readDeclaredExposureIntent = await buildPersistedRuntimeExposureIntentLookup(db);
 
   let ownedExposureListeners: Awaited<ReturnType<BrokerClient["list"]>> | null = [];
   if (rows.some((row) => row.exposure && row.exposure.state !== "removed")) {
@@ -5846,6 +5944,7 @@ export async function reconcilePersistedRuntimeServicesOnStartup(db: Db) {
   let reconciled = 0;
   let adopted = 0;
   let stopped = 0;
+  let backfilled = 0;
   for (const row of rows) {
     if (row.status === "stopped" && row.exposure && row.exposure.state !== "removed") {
       await cleanupPersistedExposureRows(db, [{
@@ -5872,6 +5971,25 @@ export async function reconcilePersistedRuntimeServicesOnStartup(db: Db) {
         new URL("/api/health", row.exposure.publicUrl!).toString(),
       )
     );
+    // Pre-feature rows carry no exposure state at all. An eligible one that is
+    // still serving plain HTTP must not be adopted as-is, or the deploy would
+    // leave `http://paperclip-dev:<port>` as the canonical URL forever. Stopping
+    // it here hands it to the desired-state restart below, which brings it back
+    // through the normal fail-closed exposure lifecycle.
+    const backfillDecision = decideManagedRuntimeExposureBackfill({
+      mode: httpsMode,
+      brokerAvailable,
+      provider: row.provider,
+      serviceName: row.serviceName,
+      command: row.command,
+      status: row.status,
+      hasExposure: Boolean(row.exposure && row.exposure.state !== "removed"),
+      declaredIntent: readDeclaredExposureIntent({
+        serviceName: row.serviceName,
+        projectWorkspaceId: row.projectWorkspaceId ?? null,
+        executionWorkspaceId: row.executionWorkspaceId ?? null,
+      }),
+    });
     let adoptedRecord = await findLocalServiceRegistryRecordByRuntimeServiceId({
       runtimeServiceId: row.id,
       profileKind: "workspace-runtime",
@@ -5917,9 +6035,11 @@ export async function reconcilePersistedRuntimeServicesOnStartup(db: Db) {
     if (adoptedRecord) {
       const adoptedUrl = adoptedRecord.url ?? row.backendUrl ?? row.url ?? null;
       if (
-        !exposureHealthMatches
+        backfillDecision.action === "reprovision"
+        || !exposureHealthMatches
         || !(await isRuntimeServiceUrlHealthy(adoptedUrl, { serviceName: row.serviceName, command: row.command }))
       ) {
+        if (backfillDecision.action === "reprovision") backfilled += 1;
         await terminateLocalService(adoptedRecord);
         await removeLocalServiceRegistryRecord(adoptedRecord.serviceKey);
       } else {
@@ -6003,7 +6123,10 @@ export async function reconcilePersistedRuntimeServicesOnStartup(db: Db) {
       .set({
         status: "stopped",
         healthStatus: "unknown",
-        url: stoppedExposure ? null : row.url,
+        // A row queued for HTTPS backfill drops its HTTP URL now rather than
+        // keeping it until the restart succeeds: if the restart fails, the
+        // fail-closed contract says show no URL, not a working HTTP one.
+        url: stoppedExposure || backfillDecision.action === "reprovision" ? null : row.url,
         exposure: stoppedExposure,
         exposureHandle: stoppedExposureHandle,
         stoppedAt: now,
@@ -6027,12 +6150,18 @@ export async function reconcilePersistedRuntimeServicesOnStartup(db: Db) {
   // was never committed. Re-applying persisted desired state adopts that
   // registry entry (or restarts a missing service) and makes it visible to
   // workspace cleanup through workspace_runtime_services again.
+  //
+  // It is also the second half of the HTTPS backfill: services stopped above as
+  // HTTP-only come back here through the ordinary start path, which now applies
+  // the `tailscale_https` default and only reports them healthy behind a
+  // verified HTTPS URL.
   const desiredState = await restartDesiredRuntimeServicesOnStartup(db);
 
   return {
     reconciled,
     adopted,
     stopped,
+    backfilled,
     restarted: desiredState.restarted,
     restartFailed: desiredState.failed,
   };

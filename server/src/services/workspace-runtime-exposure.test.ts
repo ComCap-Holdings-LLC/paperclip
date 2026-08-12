@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { BrokerClient, BrokerListenerRequest } from "./runtime-exposure/broker-client.js";
 import {
@@ -11,7 +11,18 @@ import {
 const EXECUTION_WORKSPACE_ID = "11111111-2222-4333-8444-555566667777";
 const HANDLE = "handle-abcdef1234567890";
 
+// The shared test setup pins the automatic default off so unrelated suites do
+// not probe for a real host broker. This suite is about the default, so it opts
+// back in and restores the harness value afterwards.
+let previousHttpsMode: string | undefined;
+beforeEach(() => {
+  previousHttpsMode = process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
+  process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS = "auto";
+});
+
 afterEach(async () => {
+  if (previousHttpsMode === undefined) delete process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
+  else process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS = previousHttpsMode;
   await resetRuntimeServicesForTests();
 });
 

@@ -5894,6 +5894,96 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
     }
   }, 20_000);
 
+  it("commits fixed-port reservations before readiness windows longer than 60 seconds", async () => {
+    const fixture = await createRuntimeFixture();
+    const cleanupRuntimeHome = await createRuntimeHome();
+    const workspace = fixture.workspaces[0]!;
+    const basePort = await findFreePort();
+    const spawnedMarkerPath = path.join(workspace.cwd, "slow-readiness-spawned.marker");
+    const releaseMarkerPath = path.join(workspace.cwd, "slow-readiness-release.marker");
+    const serverScript = [
+      "const fs=require('node:fs');",
+      "const http=require('node:http');",
+      `const spawned=${JSON.stringify(spawnedMarkerPath)};`,
+      `const release=${JSON.stringify(releaseMarkerPath)};`,
+      "fs.writeFileSync(spawned,'spawned');",
+      "const timer=setInterval(()=>{",
+      "if(!fs.existsSync(release))return;",
+      "clearInterval(timer);",
+      "http.createServer((_req,res)=>res.end('ok')).listen(Number(process.env.PORT),'127.0.0.1');",
+      "},25);",
+      "setInterval(()=>{},1000);",
+    ].join("");
+    const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(serverScript)}`;
+    const config = fixedPortRuntimeConfig(basePort, command);
+    config.workspaceRuntime.services[0]!.readiness.timeoutSec = 70;
+    let startPromise: ReturnType<typeof startRuntimeServicesForWorkspaceControl> | null = null;
+
+    try {
+      startPromise = startRuntimeServicesForWorkspaceControl({
+        db,
+        actor: fixture.actor,
+        issue: null,
+        workspace: fixture.realizedWorkspace(workspace),
+        executionWorkspaceId: workspace.id,
+        config,
+        adapterEnv: {},
+      });
+      startPromise.catch(() => undefined);
+
+      const markerDeadline = Date.now() + 5_000;
+      while (!existsSync(spawnedMarkerPath) && Date.now() < markerDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(existsSync(spawnedMarkerPath)).toBe(true);
+
+      const parentWrite = (async () => await db
+        .update(executionWorkspaces)
+        .set({ updatedAt: new Date() })
+        .where(eq(executionWorkspaces.id, workspace.id)))();
+      const parentWriteOutcome = await Promise.race([
+        parentWrite.then(() => "committed" as const),
+        new Promise<"locked">((resolve) => setTimeout(() => resolve("locked"), 2_000)),
+      ]);
+
+      const readinessWaitStartedAt = Date.now();
+      await new Promise((resolve) => setTimeout(resolve, 60_250));
+      expect(Date.now() - readinessWaitStartedAt).toBeGreaterThanOrEqual(60_000);
+
+      await fs.writeFile(releaseMarkerPath, "release");
+      const started = (await startPromise)[0]!;
+      await parentWrite;
+
+      expect(parentWriteOutcome).toBe("committed");
+      expect(started).toMatchObject({
+        port: basePort,
+        url: `http://127.0.0.1:${basePort}`,
+        status: "running",
+        healthStatus: "healthy",
+      });
+      const persisted = await db
+        .select()
+        .from(workspaceRuntimeServices)
+        .where(eq(workspaceRuntimeServices.executionWorkspaceId, workspace.id))
+        .then((rows) => rows[0] ?? null);
+      expect(persisted).toMatchObject({
+        port: basePort,
+        url: `http://127.0.0.1:${basePort}`,
+        status: "running",
+      });
+    } finally {
+      await fs.writeFile(releaseMarkerPath, "release").catch(() => undefined);
+      await startPromise?.catch(() => undefined);
+      await stopRuntimeServicesForExecutionWorkspace({
+        db,
+        executionWorkspaceId: workspace.id,
+        workspaceCwd: workspace.cwd,
+      }).catch(() => undefined);
+      await cleanupRuntimeHome();
+      await fixture.cleanup();
+    }
+  }, 80_000);
+
   it("reuses a stopped isolated workspace's actual port when it is free", async () => {
     const fixture = await createRuntimeFixture();
     const cleanupRuntimeHome = await createRuntimeHome();

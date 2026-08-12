@@ -394,7 +394,27 @@ type ProcessOutputAccumulator = {
   finish(): ProcessOutputCapture;
 };
 
-export async function resetRuntimeServicesForTests() {
+/**
+ * Drops in-memory runtime state between tests.
+ *
+ * By default the spawned backend processes are deliberately left running: the
+ * startup-reconciliation suites use this to simulate a Paperclip restart, where
+ * the point is that a live backend survives and has to be adopted.
+ *
+ * Suites that spawn real backends and do *not* need that must pass
+ * `terminateProcesses` — otherwise every test leaks a listener that keeps
+ * squatting a port in the dedicated exposure range for the life of the host.
+ * Termination runs before the exposure deps are restored so the suite's own
+ * broker fake handles the removal rather than the real host broker.
+ */
+export async function resetRuntimeServicesForTests(
+  opts: { terminateProcesses?: boolean } = {},
+) {
+  if (opts.terminateProcesses) {
+    for (const serviceId of [...runtimeServicesById.keys()]) {
+      await stopRuntimeService(serviceId).catch(() => undefined);
+    }
+  }
   for (const record of runtimeServicesById.values()) {
     clearIdleTimer(record);
   }

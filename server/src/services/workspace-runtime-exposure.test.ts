@@ -23,7 +23,9 @@ beforeEach(() => {
 afterEach(async () => {
   if (previousHttpsMode === undefined) delete process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
   else process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS = previousHttpsMode;
-  await resetRuntimeServicesForTests();
+  // These tests spawn real loopback backends on dedicated-range ports; reap them
+  // rather than leaving one squatting 42xxx/52xxx for every test in the file.
+  await resetRuntimeServicesForTests({ terminateProcesses: true });
 });
 
 function serviceCommand() {

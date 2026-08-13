@@ -145,6 +145,15 @@ export interface EnvironmentDriverAcquireInput {
    * of the base image, matching what real agent runs do.
    */
   applyCustomImageTemplate?: boolean;
+  /**
+   * The latest time the acquired lease may stay active. A caller with an
+   * independent deadline (for example the setup-token login session) sets it,
+   * so the driver bounds the persisted lease expiry to this time. The driver
+   * records the earlier of this time and the provider expiry. Null or undefined
+   * keeps the provider expiry only, so all other callers keep the current
+   * behavior.
+   */
+  requestedExpiresAt?: Date | null;
 }
 
 export interface EnvironmentDriverReleaseInput {
@@ -1046,7 +1055,10 @@ function createSandboxEnvironmentDriver(
           leasePolicy: resolvedLeasePolicy,
           provider: parsed.config.provider,
           providerLeaseId: acquiredLease.providerLeaseId,
-          expiresAt: acquiredLease.expiresAt ? new Date(acquiredLease.expiresAt) : undefined,
+          expiresAt: boundLeaseExpiresAt(
+            input.requestedExpiresAt,
+            acquiredLease.expiresAt ? new Date(acquiredLease.expiresAt) : undefined,
+          ),
           metadata: {
             ...(input.agentId ? { agentId: input.agentId } : {}),
             driver: input.environment.driver,
@@ -1193,6 +1205,7 @@ function createSandboxEnvironmentDriver(
         leasePolicy: resolvedLeasePolicy,
         provider: parsed.config.provider,
         providerLeaseId: providerLease.providerLeaseId,
+        expiresAt: boundLeaseExpiresAt(input.requestedExpiresAt, undefined),
         metadata: {
           ...(input.agentId ? { agentId: input.agentId } : {}),
           driver: input.environment.driver,
@@ -1560,6 +1573,26 @@ function parseExpiresAt(value: string | null | undefined): Date | null {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
+/**
+ * Bounds a persisted lease expiry to a caller-requested deadline. It returns the
+ * earlier of the requested deadline and the provider expiry. It returns the
+ * requested deadline when the provider gives no expiry. It returns the provider
+ * expiry when the caller requests no deadline, so all other callers keep the
+ * current behavior. It ignores an invalid requested deadline.
+ */
+function boundLeaseExpiresAt(
+  requestedExpiresAt: Date | null | undefined,
+  providerExpiresAt: Date | null | undefined,
+): Date | null | undefined {
+  const requested =
+    requestedExpiresAt instanceof Date && !Number.isNaN(requestedExpiresAt.getTime())
+      ? requestedExpiresAt
+      : null;
+  if (!requested) return providerExpiresAt;
+  if (!providerExpiresAt) return requested;
+  return providerExpiresAt.getTime() <= requested.getTime() ? providerExpiresAt : requested;
+}
+
 function pluginDriverProviderKey(config: PluginEnvironmentConfig): string {
   return `${config.pluginKey}:${config.driverKey}`;
 }
@@ -1719,7 +1752,7 @@ function createPluginEnvironmentDriver(
         leasePolicy: "ephemeral",
         provider: `plugin:${parsed.config.pluginKey}:${parsed.config.driverKey}`,
         providerLeaseId: providerLease.providerLeaseId,
-        expiresAt: parseExpiresAt(providerLease.expiresAt),
+        expiresAt: boundLeaseExpiresAt(input.requestedExpiresAt, parseExpiresAt(providerLease.expiresAt)),
         metadata: {
           ...(input.agentId ? { agentId: input.agentId } : {}),
           providerMetadata: providerLease.metadata ?? {},
@@ -1936,6 +1969,12 @@ export function environmentRuntimeService(
        * lease uses the operator-prepared custom image.
        */
       applyCustomImageTemplate?: boolean;
+      /**
+       * The latest time the acquired lease may stay active. The driver bounds
+       * the persisted lease expiry to this time. Null or undefined keeps the
+       * provider expiry only.
+       */
+      requestedExpiresAt?: Date | null;
     }): Promise<EnvironmentRuntimeLeaseRecord> {
       if (input.environment.status !== "active") {
         throw new Error(`Environment "${input.environment.name}" is not active.`);
@@ -1956,6 +1995,7 @@ export function environmentRuntimeService(
         executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
         adapterType: input.adapterType ?? null,
         applyCustomImageTemplate: input.applyCustomImageTemplate ?? false,
+        requestedExpiresAt: input.requestedExpiresAt ?? null,
       });
 
       return {

@@ -108,7 +108,7 @@ export function InboxAgentPolicyControl({ companyId }: { companyId: string | nul
     );
   }
 
-  if (policyQuery.isLoading || !draft) {
+  if (policyQuery.isLoading || !policy || !draft) {
     return <div className="text-sm text-muted-foreground">Loading inbox agent policy…</div>;
   }
 

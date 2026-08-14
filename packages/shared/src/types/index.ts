@@ -290,11 +290,14 @@ export type {
   ClaudeSetupTokenSessionOwnerResponse,
   SubmitBrowserCodeRequest,
   ClaudeSetupTokenCompletionResponse,
+  SetupTokenTransportAdvisory,
+  SetupTokenTransportAdvisoryCode,
 } from "./agent.js";
 export {
   ADAPTER_AUTH_SESSION_STATUSES,
   ADAPTER_AUTH_SESSION_INTERNAL_STATUSES,
   ADAPTER_AUTH_PANEL_MODES,
+  SETUP_TOKEN_TRANSPORT_ADVISORY_CODE,
 } from "./agent.js";
 export type {
   AgentEligibilityAgent,

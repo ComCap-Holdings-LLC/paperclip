@@ -811,6 +811,8 @@ export type {
   ClaudeSetupTokenSessionOwnerResponse,
   SubmitBrowserCodeRequest,
   ClaudeSetupTokenCompletionResponse,
+  SetupTokenTransportAdvisory,
+  SetupTokenTransportAdvisoryCode,
   AssetImage,
   Project,
   ProjectBudgetSummary,
@@ -1430,6 +1432,7 @@ export {
   ADAPTER_AUTH_SESSION_STATUSES,
   ADAPTER_AUTH_SESSION_INTERNAL_STATUSES,
   ADAPTER_AUTH_PANEL_MODES,
+  SETUP_TOKEN_TRANSPORT_ADVISORY_CODE,
 } from "./types/index.js";
 export {
   ADAPTER_AUTH_SESSION_ACTIVE_STATUSES,
@@ -1451,6 +1454,7 @@ export {
   claudeSetupTokenSessionResponseSchema,
   claudeSetupTokenSessionPromptSchema,
   claudeSetupTokenSessionOwnerResponseSchema,
+  setupTokenTransportAdvisorySchema,
   submitBrowserCodeRequestSchema,
   browserCodeSchema,
   isValidBrowserCode,

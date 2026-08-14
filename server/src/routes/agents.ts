@@ -15,6 +15,7 @@ import {
   deriveAgentUrlKey,
   isUuidLike,
   normalizeIssueIdentifier,
+  pullAgentLifecycleReportSchema,
   resetAgentSessionSchema,
   testAdapterEnvironmentSchema,
   type AgentDesiredSkillEntry,
@@ -148,6 +149,7 @@ import {
   changeConsentGateService,
   touchesAgentProfileChangeConsentFields,
 } from "../services/change-consent-gate.js";
+import { pullAgentLifecycleService } from "../services/pull-agent-lifecycle.js";
 
 const AGENT_SKILL_ASSIGNMENT_MODES = ["add", "remove", "replace"] as const;
 
@@ -383,6 +385,7 @@ export function agentRoutes(
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: options.pluginWorkerManager,
   });
+  const pullLifecycle = pullAgentLifecycleService(db);
   const recovery = recoveryService(db, { enqueueWakeup: heartbeat.wakeup });
   const issueApprovalsSvc = issueApprovalService(db);
   const secretsSvc = secretService(db);
@@ -2928,6 +2931,56 @@ export function agentRoutes(
     const state = await heartbeat.getRuntimeState(id);
     res.json(state);
   });
+
+  router.get("/agents/:id/lifecycle", async (req, res) => {
+    const id = req.params.id as string;
+    const agent = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
+    if (!agent) return;
+    if (!(await assertAgentReadAllowed(req, res, agent))) return;
+
+    res.json(await pullLifecycle.get(agent));
+  });
+
+  router.post(
+    "/agents/:id/lifecycle-report",
+    validate(pullAgentLifecycleReportSchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const agent = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
+      if (!agent) return;
+
+      if (req.actor.type === "agent") {
+        if (req.actor.agentId !== id) {
+          res.status(403).json({ error: "Agent can only report its own lifecycle" });
+          return;
+        }
+      } else {
+        await assertBoardCanManageAgentsForCompany(req, agent.companyId);
+      }
+      if (agent.runtimeConfig.executionModel !== "pull") {
+        throw unprocessable("Lifecycle reports are only accepted for pull-executed agents");
+      }
+
+      const lifecycle = await pullLifecycle.report(agent, req.body);
+      const actor = getActorInfo(req);
+      await logActivity(db, {
+        companyId: agent.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        action: "agent.pull_lifecycle_reported",
+        entityType: "agent",
+        entityId: id,
+        details: {
+          source: lifecycle.source,
+          state: lifecycle.state,
+          evidenceCount: lifecycle.evidence.length,
+          expiresAt: lifecycle.expiresAt?.toISOString() ?? null,
+        },
+      });
+      res.json(lifecycle);
+    },
+  );
 
   router.get("/agents/:id/task-sessions", async (req, res) => {
     assertBoard(req);

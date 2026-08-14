@@ -119,6 +119,23 @@ import {
   classifyRunLiveness,
   type RunLivenessClassificationInput,
 } from "./run-liveness.js";
+
+export function resolveAgentHeartbeatDispatchPolicy(runtimeConfig: unknown): {
+  executionModel: "push" | "pull";
+  dispatchEnabled: boolean;
+} {
+  const config = parseObject(runtimeConfig);
+  const executionModel = config.executionModel === "pull" ? "pull" : "push";
+  if (executionModel === "push") {
+    return { executionModel, dispatchEnabled: true };
+  }
+
+  const pull = parseObject(config.pull);
+  return {
+    executionModel,
+    dispatchEnabled: pull.dispatchEnabled === true,
+  };
+}
 import {
   ISSUE_NEW_INPUT_ACTIVITY_ACTIONS,
   ISSUE_PROGRESS_ACTIVITY_ACTIONS,
@@ -17479,6 +17496,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
       });
     };
+
+    const dispatchPolicy = resolveAgentHeartbeatDispatchPolicy(agent.runtimeConfig);
+    if (!dispatchPolicy.dispatchEnabled) {
+      await writeSkippedHeartbeatRequest("heartbeat.pull_dispatch_disabled", {
+        executionModel: dispatchPolicy.executionModel,
+        dispatchEnabled: false,
+      });
+      return null;
+    }
 
     const schedulingSuppression = await getSchedulingSuppression();
     if (schedulingSuppression.suppressed) {

@@ -1474,9 +1474,13 @@ export function agentRoutes(
   }
 
   function parseSchedulerHeartbeatPolicy(runtimeConfig: unknown) {
-    const heartbeat = asRecord(asRecord(runtimeConfig)?.heartbeat) ?? {};
+    const config = asRecord(runtimeConfig) ?? {};
+    const heartbeat = asRecord(config.heartbeat) ?? {};
+    const pull = asRecord(config.pull) ?? {};
+    const pullDispatchDisabled = config.executionModel === "pull" &&
+      (parseBooleanLike(pull.dispatchEnabled) ?? false) !== true;
     return {
-      enabled: parseBooleanLike(heartbeat.enabled) ?? false,
+      enabled: !pullDispatchDisabled && (parseBooleanLike(heartbeat.enabled) ?? false),
       intervalSec: Math.max(0, parseNumberLike(heartbeat.intervalSec) ?? 0),
     };
   }

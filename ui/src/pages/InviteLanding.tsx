@@ -242,11 +242,22 @@ export function InviteLandingPage() {
     retry: false,
   });
 
+  // The `["companies"]` entry is shared app-wide and carries no account identity, so a
+  // list fetched seconds ago for a *different* account is still inside the app-wide
+  // staleTime and would be served from cache here. This page reads that list as proof
+  // of membership, so it revalidates on mount and trusts only what it fetched itself
+  // for the account signed in now. `local_trusted` instances have no accounts at all,
+  // so there the shared list is the only identity there is.
   const companiesQuery = useQuery({
     ...companiesListQueryOptions,
     enabled: !!sessionQuery.data && !!inviteQuery.data?.companyId,
+    staleTime: 0,
   });
-  const companyList = companiesQuery.data?.companies ?? [];
+  const membershipIsAccountScoped = healthQuery.data?.deploymentMode !== "local_trusted";
+  const membershipListIsCurrent = membershipIsAccountScoped
+    ? Boolean(sessionQuery.data) && companiesQuery.isFetchedAfterMount
+    : true;
+  const companyList = membershipListIsCurrent ? companiesQuery.data?.companies ?? [] : [];
 
   useEffect(() => {
     if (token) rememberPendingInviteToken(token);
@@ -257,18 +268,19 @@ export function InviteLandingPage() {
   }, [token]);
 
   useEffect(() => {
+    if (!membershipListIsCurrent) return;
     const list = companiesQuery.data?.companies;
     if (!list || !inviteQuery.data?.companyId) return;
     if (list.some((c) => c.id === inviteQuery.data!.companyId)) {
       clearPendingInviteToken(token);
     }
-  }, [companiesQuery.data, inviteQuery.data, token]);
+  }, [companiesQuery.data, inviteQuery.data, membershipListIsCurrent, token]);
 
   const invite = inviteQuery.data;
   const isCheckingExistingMembership =
     Boolean(sessionQuery.data) &&
     Boolean(invite?.companyId) &&
-    companiesQuery.isLoading;
+    !membershipListIsCurrent;
   const isCurrentMember =
     Boolean(invite?.companyId) &&
     companyList.some((company) => company.id === invite?.companyId);
@@ -370,7 +382,19 @@ export function InviteLandingPage() {
       await queryClient.invalidateQueries({ queryKey: queryKeys.auth.session });
       await queryClient.invalidateQueries({ queryKey: queryKeys.health });
       await queryClient.invalidateQueries({ queryKey: queryKeys.access.currentBoardAccess });
-      const { companies: freshCompanies } = await queryClient.fetchQuery(companiesListQueryOptions);
+      // `fetchQuery` returns the cached `["companies"]` entry without a request while
+      // it is inside the app-wide staleTime, and that entry is not account-scoped: a
+      // list fetched for whoever was signed in before this form was submitted would
+      // come back verbatim and be read as proof that the account that just signed in
+      // already belongs to the invited company. Cancel anything still in flight for
+      // the previous session and force a fetch for this one. Not `resetQueries`: that
+      // rewinds the update counters `isFetchedAfterMount` is derived from, which would
+      // strand this page on the membership check above.
+      await queryClient.cancelQueries({ queryKey: queryKeys.companies.all });
+      const { companies: freshCompanies } = await queryClient.fetchQuery({
+        ...companiesListQueryOptions,
+        staleTime: 0,
+      });
 
       if (invite?.companyId && freshCompanies.some((company) => company.id === invite.companyId)) {
         clearPendingInviteToken(token);

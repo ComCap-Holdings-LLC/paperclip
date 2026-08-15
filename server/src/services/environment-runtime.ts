@@ -154,6 +154,17 @@ export interface EnvironmentDriverAcquireInput {
    * behavior.
    */
   requestedExpiresAt?: Date | null;
+  /**
+   * Re-check the environment company binding inside the lease insert
+   * transaction. The login acquire paths set this so a managed reconciliation
+   * that binds the sandbox to another company between the route guard and this
+   * acquire cannot let the login run in a foreign-company sandbox. The lease
+   * insert then rejects a foreign-company environment with the 403
+   * `environment_company_mismatch` and holds no lease. An unbound
+   * (instance-global) environment stays open. Other callers keep the current
+   * behavior.
+   */
+  assertCompanyBinding?: boolean;
 }
 
 export interface EnvironmentDriverReleaseInput {
@@ -1057,6 +1068,7 @@ function createSandboxEnvironmentDriver(
           executionWorkspaceId: input.executionWorkspaceId,
           issueId: input.issueId,
           heartbeatRunId: input.heartbeatRunId,
+          assertCompanyBinding: input.assertCompanyBinding,
           leasePolicy: resolvedLeasePolicy,
           provider: parsed.config.provider,
           providerLeaseId: acquiredLease.providerLeaseId,
@@ -1210,6 +1222,7 @@ function createSandboxEnvironmentDriver(
         executionWorkspaceId: input.executionWorkspaceId,
         issueId: input.issueId,
         heartbeatRunId: input.heartbeatRunId,
+        assertCompanyBinding: input.assertCompanyBinding,
         leasePolicy: resolvedLeasePolicy,
         provider: parsed.config.provider,
         providerLeaseId: providerLease.providerLeaseId,
@@ -2009,6 +2022,12 @@ export function environmentRuntimeService(
        * provider expiry only.
        */
       requestedExpiresAt?: Date | null;
+      /**
+       * Re-check the environment company binding inside the lease insert
+       * transaction. The login acquire paths set this to reject a foreign-company
+       * environment with the 403 `environment_company_mismatch`.
+       */
+      assertCompanyBinding?: boolean;
     }): Promise<EnvironmentRuntimeLeaseRecord> {
       if (input.environment.status !== "active") {
         throw new Error(`Environment "${input.environment.name}" is not active.`);
@@ -2030,6 +2049,7 @@ export function environmentRuntimeService(
         adapterType: input.adapterType ?? null,
         applyCustomImageTemplate: input.applyCustomImageTemplate ?? false,
         requestedExpiresAt: input.requestedExpiresAt ?? null,
+        assertCompanyBinding: input.assertCompanyBinding,
       });
 
       return {

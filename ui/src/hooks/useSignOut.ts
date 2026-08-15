@@ -36,6 +36,23 @@ export function useSignOut({ onSignedOut }: UseSignOutOptions = {}) {
       if (target === "cloud") return;
 
       onSignedOut?.();
+      // If this grows into a sweep of the account-scoped caches, clear them with
+      // `resetQueries`, not `removeQueries`. Removal does not notify observers
+      // that are already subscribed — nothing rebinds them until some other
+      // change forces a render — so the entry disappears while every mounted
+      // observer keeps serving the signed-out account's value, and the redirect
+      // in CloudAccessGate that fires on the session going empty never runs.
+      // Reset notifies, the refetch returns null, and the app leaves. Measured
+      // against query-core 5.101.4: removal produced 0 notifications and left
+      // the observer holding the old session; reset produced 3 and null.
+      //
+      // The opposite advice holds for a *local* reset under an observer that
+      // stays mounted (InviteLanding, the onboarding draft gate): reset rewinds
+      // the update counters `isFetchedAfterMount` is derived from while that
+      // observer keeps its bind-time baseline, so the flag can never read true
+      // again and the gate withholds forever. Those spots avoid reset. Sign-out
+      // is not one of them: it resets the session too, so those consumers
+      // redirect, unmount, and remount fresh.
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: queryKeys.auth.session }),
         queryClient.invalidateQueries({ queryKey: queryKeys.health }),

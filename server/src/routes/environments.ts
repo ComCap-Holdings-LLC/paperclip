@@ -724,6 +724,7 @@ export function environmentRoutes(
             templateRefKind: driver.templateRefKind,
             templateConfigBinding: driver.templateConfigBinding,
             supportsTemplateDelete: driver.supportsTemplateDelete,
+            supportsSetupTokenLogin: driver.supportsSetupTokenLogin ?? false,
             displayName: driver.displayName,
             description: driver.description,
             source: "plugin" as const,

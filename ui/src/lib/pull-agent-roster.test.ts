@@ -4,6 +4,7 @@ import {
   agentRosterStatus,
   isPullAgent,
   pullAgentHeartbeatDispatchEnabled,
+  pullAgentHeartbeatLocked,
   rosterMatchesActiveFilter,
 } from "./pull-agent-roster";
 
@@ -47,9 +48,14 @@ describe("pull-agent-roster", () => {
 
   it("keeps pull heartbeat dispatch off unless explicitly enabled", () => {
     expect(pullAgentHeartbeatDispatchEnabled(pullStale)).toBe(false);
+    expect(pullAgentHeartbeatLocked(pullStale)).toBe(true);
+    expect(pullAgentHeartbeatLocked(pushAgent)).toBe(false);
     expect(pullAgentHeartbeatDispatchEnabled({
       runtimeConfig: { executionModel: "pull", pull: { dispatchEnabled: true } },
     })).toBe(true);
+    expect(pullAgentHeartbeatLocked({
+      runtimeConfig: { executionModel: "pull", pull: { dispatchEnabled: true } },
+    })).toBe(false);
   });
 
   it("puts queued and blocked pull seats in Active, not unreachable", () => {

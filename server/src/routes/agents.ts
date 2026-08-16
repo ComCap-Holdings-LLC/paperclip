@@ -149,7 +149,7 @@ import {
   changeConsentGateService,
   touchesAgentProfileChangeConsentFields,
 } from "../services/change-consent-gate.js";
-import { applyPullHeartbeatWriteGuard } from "../services/heartbeat.js";
+import { applyPullHeartbeatWriteGuard } from "../services/pull-agent-dispatch.js";
 import { pullAgentLifecycleService } from "../services/pull-agent-lifecycle.js";
 
 const AGENT_SKILL_ASSIGNMENT_MODES = ["add", "remove", "replace"] as const;

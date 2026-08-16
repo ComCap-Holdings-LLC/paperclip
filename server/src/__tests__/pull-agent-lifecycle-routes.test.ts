@@ -509,8 +509,61 @@ describeEmbeddedPostgres("pull agent lifecycle routes", () => {
     ]);
   });
 
-  it("derives running from a live heartbeat run even when lastRunId still points at a finalized run", async () => {
+  it("does not treat leftover heartbeat rows as active when pull dispatch is disabled", async () => {
     const { actor, agentId, companyId } = await seedAgent();
+    const finishedId = randomUUID();
+    const leftoverId = randomUUID();
+    const zombieId = randomUUID();
+    await ctx.db.insert(heartbeatRuns).values([
+      {
+        id: finishedId,
+        companyId,
+        agentId,
+        status: "succeeded",
+        finishedAt: new Date("2026-08-16T16:00:00.000Z"),
+      },
+      {
+        id: leftoverId,
+        companyId,
+        agentId,
+        status: "queued",
+      },
+      {
+        id: zombieId,
+        companyId,
+        agentId,
+        status: "running",
+      },
+    ]);
+    await ctx.db.insert(agentTaskSessions).values({
+      companyId,
+      agentId,
+      adapterType: "process",
+      taskKey: "issue:COM-10564",
+      sessionDisplayId: "sess-stale-last-run",
+      lastRunId: finishedId,
+      updatedAt: new Date(),
+    });
+    const app = routeApp(ctx.db, actor, agentRoutes);
+    const res = await request(app).get(`/api/agents/${agentId}/lifecycle`);
+    expect(res.status).toBe(200);
+    expect(res.body.state).toBe("unreachable");
+    expect(res.body.evidence).toEqual([
+      expect.objectContaining({
+        kind: "task_session",
+        id: "sess-stale-last-run",
+        active: false,
+        status: "succeeded",
+      }),
+    ]);
+    expect(res.body.evidence.some((item: { id: string }) => item.id === leftoverId || item.id === zombieId)).toBe(false);
+  });
+
+  it("derives running from a live heartbeat run when pull dispatch is enabled", async () => {
+    const { actor, agentId, companyId } = await seedAgent({
+      executionModel: "pull",
+      pull: { dispatchEnabled: true },
+    });
     const finishedId = randomUUID();
     const liveId = randomUUID();
     await ctx.db.insert(heartbeatRuns).values([
@@ -558,8 +611,11 @@ describeEmbeddedPostgres("pull agent lifecycle routes", () => {
     ]));
   });
 
-  it("derives running from a live heartbeat run attached to a task session", async () => {
-    const { actor, agentId, companyId } = await seedAgent();
+  it("derives running from a live heartbeat run attached to a task session when dispatch is enabled", async () => {
+    const { actor, agentId, companyId } = await seedAgent({
+      executionModel: "pull",
+      pull: { dispatchEnabled: true },
+    });
     const runId = randomUUID();
     await ctx.db.insert(heartbeatRuns).values({
       id: runId,

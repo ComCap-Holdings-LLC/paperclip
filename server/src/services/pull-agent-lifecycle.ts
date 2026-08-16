@@ -9,6 +9,7 @@ import type {
   PullAgentLifecycleReport,
   PullAgentLifecycleState,
 } from "@paperclipai/shared";
+import { resolveAgentHeartbeatDispatchPolicy } from "./pull-agent-dispatch.js";
 
 const DEFAULT_PULL_LEASE_TTL_SEC = 120;
 const MAX_PULL_LEASE_TTL_SEC = 3600;
@@ -172,23 +173,26 @@ export function pullAgentLifecycleService(db: Db) {
   }
 
   async function nativeEvidence(agent: typeof agents.$inferSelect, _now: Date) {
+    const dispatchEnabled = resolveAgentHeartbeatDispatchPolicy(agent.runtimeConfig).dispatchEnabled;
     const [liveRuns, rows] = await Promise.all([
-      db
-        .select({
-          id: heartbeatRuns.id,
-          status: heartbeatRuns.status,
-          finishedAt: heartbeatRuns.finishedAt,
-          startedAt: heartbeatRuns.startedAt,
-          createdAt: heartbeatRuns.createdAt,
-        })
-        .from(heartbeatRuns)
-        .where(and(
-          eq(heartbeatRuns.companyId, agent.companyId),
-          eq(heartbeatRuns.agentId, agent.id),
-          inArray(heartbeatRuns.status, [...LIVE_HEARTBEAT_RUN_STATUSES]),
-        ))
-        .orderBy(desc(heartbeatRuns.createdAt))
-        .limit(NATIVE_SESSION_LIMIT),
+      dispatchEnabled
+        ? db
+          .select({
+            id: heartbeatRuns.id,
+            status: heartbeatRuns.status,
+            finishedAt: heartbeatRuns.finishedAt,
+            startedAt: heartbeatRuns.startedAt,
+            createdAt: heartbeatRuns.createdAt,
+          })
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.companyId, agent.companyId),
+            eq(heartbeatRuns.agentId, agent.id),
+            inArray(heartbeatRuns.status, [...LIVE_HEARTBEAT_RUN_STATUSES]),
+          ))
+          .orderBy(desc(heartbeatRuns.createdAt))
+          .limit(NATIVE_SESSION_LIMIT)
+        : Promise.resolve([]),
       db
         .select({
           id: agentTaskSessions.id,

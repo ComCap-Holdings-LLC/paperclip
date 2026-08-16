@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   applyPullHeartbeatWriteGuard,
   resolveAgentHeartbeatDispatchPolicy,
-} from "../services/heartbeat.js";
+} from "../services/pull-agent-dispatch.js";
 
 describe("pull-agent heartbeat dispatch policy", () => {
   it("keeps existing push agents dispatchable", () => {

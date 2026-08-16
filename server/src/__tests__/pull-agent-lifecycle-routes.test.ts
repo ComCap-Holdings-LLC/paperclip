@@ -326,6 +326,69 @@ describeEmbeddedPostgres("pull agent lifecycle routes", () => {
     expect(runs).toEqual([]);
   });
 
+  it("PATCH clamps a future observedAt so the native lease cannot outlive now plus TTL", async () => {
+    const { actor, agentId } = await seedAgent({
+      executionModel: "pull",
+      pull: { dispatchEnabled: false },
+      heartbeat: { enabled: false },
+    });
+    const app = routeApp(ctx.db, actor, agentRoutes);
+    const before = Date.now();
+    const patched = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({
+        runtimeConfig: {
+          executionModel: "pull",
+          pull: { dispatchEnabled: false },
+          heartbeat: { enabled: false },
+          pullLifecycle: freshLease({
+            observedAt: new Date(Date.now() + 3_600_000).toISOString(),
+            expiresAt: new Date(Date.now() + 7_200_000).toISOString(),
+          }),
+        },
+      });
+    const after = Date.now();
+    expect(patched.status).toBe(200);
+    expect(patched.body.pullLifecycle.state).toBe("running");
+    const stored = await ctx.db
+      .select({ stateJson: agentRuntimeState.stateJson })
+      .from(agentRuntimeState)
+      .then((rows) => rows[0]?.stateJson as { pullLifecycleReport?: { observedAt: string; expiresAt: string } });
+    const observedMs = new Date(stored.pullLifecycleReport!.observedAt).getTime();
+    const expiresMs = new Date(stored.pullLifecycleReport!.expiresAt).getTime();
+    expect(observedMs).toBeGreaterThanOrEqual(before - 1_000);
+    expect(observedMs).toBeLessThanOrEqual(after + 1_000);
+    expect(expiresMs - observedMs).toBeLessThanOrEqual(3600 * 1000);
+    expect(expiresMs).toBeLessThanOrEqual(after + 3600 * 1000 + 1_000);
+  });
+
+  it("does not treat queued, retry, or orphaned running rows as live when dispatch is enabled", async () => {
+    const { actor, agentId, companyId } = await seedAgent({
+      executionModel: "pull",
+      pull: { dispatchEnabled: true },
+    });
+    const queuedId = randomUUID();
+    const retryId = randomUUID();
+    const orphanId = randomUUID();
+    await ctx.db.insert(heartbeatRuns).values([
+      { id: queuedId, companyId, agentId, status: "queued" },
+      { id: retryId, companyId, agentId, status: "scheduled_retry" },
+      {
+        id: orphanId,
+        companyId,
+        agentId,
+        status: "running",
+        startedAt: new Date("2026-01-01T00:00:00.000Z"),
+      },
+    ]);
+    const app = routeApp(ctx.db, actor, agentRoutes);
+    const res = await request(app).get(`/api/agents/${agentId}/lifecycle`);
+    expect(res.status).toBe(200);
+    expect(res.body.state).toBe("unreachable");
+    expect(res.body.evidence.some((item: { active?: boolean }) => item.active)).toBe(false);
+    expect(res.body.evidence.some((item: { id: string }) => item.id === queuedId || item.id === retryId || item.id === orphanId)).toBe(false);
+  });
+
   it("GET /agents/:id expires a stale runtimeConfig lease onto idle without a heartbeat run", async () => {
     const { actor, agentId } = await seedAgent({
       executionModel: "pull",
@@ -579,6 +642,9 @@ describeEmbeddedPostgres("pull agent lifecycle routes", () => {
         companyId,
         agentId,
         status: "running",
+        startedAt: new Date(),
+        processPid: 4242,
+        lastOutputAt: new Date(),
       },
     ]);
     await ctx.db.insert(agentTaskSessions).values({
@@ -622,6 +688,9 @@ describeEmbeddedPostgres("pull agent lifecycle routes", () => {
       companyId,
       agentId,
       status: "running",
+      startedAt: new Date(),
+      processPid: 4242,
+      lastOutputAt: new Date(),
     });
     await ctx.db.insert(agentTaskSessions).values({
       companyId,

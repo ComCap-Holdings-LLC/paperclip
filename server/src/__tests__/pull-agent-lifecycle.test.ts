@@ -84,6 +84,22 @@ describe("derivePullAgentLifecycle", () => {
     expect(lifecycle.state).toBe("unreachable");
   });
 
+  it("does not treat a future observedAt as extending the lease past now plus TTL", () => {
+    const lifecycle = derivePullAgentLifecycle({
+      runtimeConfig: { executionModel: "pull" },
+      storedReport: report({
+        observedAt: "2026-08-14T21:00:00.000Z",
+        expiresAt: "2026-08-14T23:00:00.000Z",
+        state: "running",
+      }),
+      queuedIssueCount: 0,
+      blockedIssueCount: 0,
+      now: new Date("2026-08-14T20:01:01.000Z"),
+    });
+
+    expect(lifecycle.state).toBe("unreachable");
+  });
+
   it("still honors a far-future expiresAt until the observedAt plus max TTL", () => {
     const lifecycle = derivePullAgentLifecycle({
       runtimeConfig: { executionModel: "pull" },

@@ -936,7 +936,7 @@ function createSandboxEnvironmentDriver(
         config: sandboxConfigForLeaseMetadata(metadataConfig),
       });
       if (parsed.driver === "sandbox") {
-        return parsed.config as unknown as Record<string, unknown>;
+        return dropInternalPluginSandboxConfigKeys(parsed.config as unknown as Record<string, unknown>);
       }
     }
 
@@ -948,7 +948,7 @@ function createSandboxEnvironmentDriver(
           input.environment,
         );
         if (parsed.driver === "sandbox" && parsed.config.provider === input.provider) {
-          return parsed.config as unknown as Record<string, unknown>;
+          return dropInternalPluginSandboxConfigKeys(parsed.config as unknown as Record<string, unknown>);
         }
       } catch {
         // Lease metadata below is intentionally kept sufficient for cleanup
@@ -958,7 +958,7 @@ function createSandboxEnvironmentDriver(
 
     return {
       provider: input.provider,
-      ...sanitizePluginSandboxConfigFromLeaseMetadata(input.lease.metadata),
+      ...dropInternalPluginSandboxConfigKeys(input.lease.metadata),
     };
   }
 
@@ -1763,12 +1763,26 @@ function createSandboxEnvironmentDriver(
       cleanupStatus = "failed";
     }
 
-    const releaseStatus =
-      input.lease.leasePolicy === "retain_on_failure" && input.status === "failed"
-        ? ("retained" as const)
+    // A failed release verification leaves the provider resource active. The
+    // cleanup reaper retries only `pending_cleanup` leases, so route a failed
+    // release into that retry flow. A `retain_on_failure` lease keeps the
+    // resource on purpose for reuse, so it stays `retained` and never enters the
+    // reaper, which would destroy the resource the retain policy wants to keep.
+    const retained =
+      input.lease.leasePolicy === "retain_on_failure" && input.status === "failed";
+    const releaseStatus = retained
+      ? ("retained" as const)
+      : cleanupStatus === "failed"
+        ? ("pending_cleanup" as const)
         : input.status;
+    const failureReason =
+      input.status === "failed"
+        ? "adapter_or_run_failure"
+        : cleanupStatus === "failed"
+          ? "release_cleanup_failed"
+          : undefined;
     return await environmentsSvc.releaseLease(input.lease.id, releaseStatus, {
-      failureReason: input.status === "failed" ? "adapter_or_run_failure" : undefined,
+      failureReason,
       cleanupStatus,
     });
   }
@@ -1857,21 +1871,32 @@ function readString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
+// Keys the runtime stores in the lease metadata that are not part of the
+// provider driver config. Some are host-internal control fields. `remoteCwd` is
+// a per-lease runtime value. The host reads `remoteCwd` from the lease metadata
+// directly, so the worker never needs it as config. Drop every key here before
+// the runtime sends a config to a lifecycle RPC.
 const INTERNAL_PLUGIN_SANDBOX_CONFIG_KEYS = new Set([
   "driver",
   "executionWorkspaceMode",
   "pluginId",
   "pluginKey",
   "providerMetadata",
+  "remoteCwd",
   "shellCommand",
   "sandboxProviderPlugin",
 ]);
 
-function sanitizePluginSandboxConfigFromLeaseMetadata(
-  metadata: Record<string, unknown> | null | undefined,
+// Drop the host-internal and per-lease runtime keys from a sandbox config
+// record. The runtime stores these keys in the lease metadata and in some
+// resolved configs, but the plugin worker must receive only the provider driver
+// config. Use this on every config the runtime sends to a lifecycle RPC, so no
+// host-internal field reaches the worker.
+function dropInternalPluginSandboxConfigKeys(
+  config: Record<string, unknown> | null | undefined,
 ): Record<string, unknown> {
   const sanitized: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(metadata ?? {})) {
+  for (const [key, value] of Object.entries(config ?? {})) {
     if (INTERNAL_PLUGIN_SANDBOX_CONFIG_KEYS.has(key)) continue;
     sanitized[key] = value;
   }

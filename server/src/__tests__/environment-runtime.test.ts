@@ -2042,7 +2042,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
   // methods. The lease lifecycle paths must verify the live worker before they
   // dispatch a lifecycle RPC, so the runtime fails closed instead of a doomed
   // dispatch.
-  async function seedStaleLifecycleReusableLease() {
+  async function seedStaleLifecycleReusableLease(
+    leasePolicy: "reuse_by_environment" | "retain_on_failure" = "reuse_by_environment",
+  ) {
     const pluginId = randomUUID();
     const { companyId, agentId, environment: baseEnvironment, runId } = await seedEnvironment();
     const providerConfig = {
@@ -2120,7 +2122,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       environmentId: environment.id,
       executionWorkspaceId,
       heartbeatRunId: runId,
-      leasePolicy: "reuse_by_environment",
+      leasePolicy,
       provider: "fake-plugin",
       providerLeaseId: "stale-lifecycle-lease",
       metadata: {
@@ -2151,7 +2153,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     return { pluginId, environment, runId, lease, workerManager, runtimeWithPlugin };
   }
 
-  it("fails closed on release when the worker no longer advertises the release lifecycle method", async () => {
+  it("routes release to pending_cleanup when the worker no longer advertises the release lifecycle method", async () => {
     const { pluginId, lease, workerManager, runtimeWithPlugin } = await seedStaleLifecycleReusableLease();
 
     const released = await runtimeWithPlugin.releaseRunLeases(lease.heartbeatRunId!);
@@ -2163,8 +2165,27 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       expect.anything(),
       expect.anything(),
     );
+    // The failed release verification must enter the pending-cleanup retry flow.
+    // The reaper sweeps only `pending_cleanup` leases, so a `released` status
+    // here would strand the still-active provider resource.
     await expect(environmentService(db).getLeaseById(lease.id)).resolves.toMatchObject({
-      status: "released",
+      status: "pending_cleanup",
+      cleanupStatus: "failed",
+      failureReason: "release_cleanup_failed",
+    });
+  });
+
+  it("retains a retain_on_failure lease on failed release instead of routing to pending_cleanup", async () => {
+    const { lease, runtimeWithPlugin } = await seedStaleLifecycleReusableLease("retain_on_failure");
+
+    const released = await runtimeWithPlugin.releaseRunLeases(lease.heartbeatRunId!, "failed");
+
+    expect(released).toHaveLength(1);
+    // A retain_on_failure lease keeps the provider resource for reuse. The
+    // reaper destroys `pending_cleanup` leases, so the retained lease must not
+    // enter that flow even when the release verification fails.
+    await expect(environmentService(db).getLeaseById(lease.id)).resolves.toMatchObject({
+      status: "retained",
       cleanupStatus: "failed",
     });
   });

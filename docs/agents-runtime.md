@@ -77,7 +77,7 @@ Status and evidence then come from:
 - `GET /api/agents/:id/lifecycle`
 - `POST /api/agents/:id/lifecycle-report` or `paperclip agent lifecycle-report`
 
-A fresh lease plus live `agent_task_sessions` derive `running`, `idle`, `idle_queued`, `blocked`, or `unreachable`. Timer ticks reconcile expired leases onto `idle` and still skip adapter wakeup.
+A fresh lease plus live `agent_task_sessions` derive `running`, `idle`, `idle_queued`, `blocked`, or `unreachable`. Timer ticks reconcile expired leases onto `idle` and still skip adapter wakeup. Manual `/heartbeat/invoke` and `/wakeup` also skip when dispatch is off and record `heartbeat.pull_dispatch_disabled`. Host bridges should PATCH `agents.status` only while `GET /lifecycle` is 404.
 
 ## 3.4 Working directory and execution limits
 

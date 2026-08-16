@@ -4,6 +4,7 @@ import { expect, it } from "vitest";
 import {
   activityLog,
   agentRuntimeState,
+  agentWakeupRequests,
   agents,
   heartbeatRuns,
   issues,
@@ -22,6 +23,7 @@ describeEmbeddedPostgres("pull agent lifecycle routes", () => {
   const ctx = useEmbeddedPostgres("paperclip-pull-agent-lifecycle-routes-", {
     resetEach: async (db) => {
       await db.delete(activityLog);
+      await db.delete(agentWakeupRequests);
       await db.delete(agentRuntimeState);
       await db.delete(heartbeatRuns);
       await db.delete(issues);
@@ -407,5 +409,31 @@ describeEmbeddedPostgres("pull agent lifecycle routes", () => {
     });
     const runs = await ctx.db.select({ id: heartbeatRuns.id }).from(heartbeatRuns);
     expect(runs).toEqual([]);
+  });
+
+  it("POST /heartbeat/invoke and /wakeup skip pull agents without creating a run", async () => {
+    const { actor, agentId } = await seedAgent({
+      executionModel: "pull",
+      pull: { dispatchEnabled: false },
+      heartbeat: { enabled: true, intervalSec: 60 },
+    });
+    const app = routeApp(ctx.db, actor, agentRoutes);
+
+    const invoked = await request(app).post(`/api/agents/${agentId}/heartbeat/invoke`).send({});
+    expect(invoked.status).toBe(202);
+    expect(invoked.body).toEqual({ status: "skipped" });
+
+    const woken = await request(app).post(`/api/agents/${agentId}/wakeup`).send({ source: "on_demand" });
+    expect(woken.status).toBe(202);
+    expect(woken.body.status ?? woken.body).toBeTruthy();
+
+    const runs = await ctx.db.select({ id: heartbeatRuns.id }).from(heartbeatRuns);
+    expect(runs).toEqual([]);
+    const skipped = await ctx.db
+      .select({ reason: agentWakeupRequests.reason, status: agentWakeupRequests.status })
+      .from(agentWakeupRequests);
+    expect(skipped.length).toBeGreaterThanOrEqual(2);
+    expect(skipped.every((row) => row.status === "skipped")).toBe(true);
+    expect(skipped.every((row) => row.reason === "heartbeat.pull_dispatch_disabled")).toBe(true);
   });
 });

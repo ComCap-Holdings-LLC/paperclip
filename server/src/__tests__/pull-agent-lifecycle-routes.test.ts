@@ -389,6 +389,38 @@ describeEmbeddedPostgres("pull agent lifecycle routes", () => {
     expect(res.body.evidence.some((item: { id: string }) => item.id === queuedId || item.id === retryId || item.id === orphanId)).toBe(false);
   });
 
+  it("keeps a quiet dispatch-enabled run live when its adapter pid is still recorded", async () => {
+    const { actor, agentId, companyId } = await seedAgent({
+      executionModel: "pull",
+      pull: { dispatchEnabled: true },
+    });
+    const quietId = randomUUID();
+    const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
+    await ctx.db.insert(heartbeatRuns).values({
+      id: quietId,
+      companyId,
+      agentId,
+      status: "running",
+      startedAt: tenMinutesAgo,
+      processStartedAt: tenMinutesAgo,
+      lastOutputAt: tenMinutesAgo,
+      processPid: 4242,
+    });
+    const app = routeApp(ctx.db, actor, agentRoutes);
+    const res = await request(app).get(`/api/agents/${agentId}/lifecycle`);
+    expect(res.status).toBe(200);
+    expect(res.body.state).toBe("running");
+    expect(res.body.source).toBe("task_session");
+    expect(res.body.evidence).toEqual([
+      expect.objectContaining({
+        kind: "task_session",
+        id: quietId,
+        active: true,
+        status: "running",
+      }),
+    ]);
+  });
+
   it("GET /agents/:id expires a stale runtimeConfig lease onto idle without a heartbeat run", async () => {
     const { actor, agentId } = await seedAgent({
       executionModel: "pull",

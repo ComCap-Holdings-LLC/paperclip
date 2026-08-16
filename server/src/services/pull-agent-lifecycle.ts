@@ -95,9 +95,14 @@ function isExecutingHeartbeatRun(
 ): boolean {
   if (run.finishedAt) return false;
   if (run.status !== "running") return false;
+  // A recorded adapter pid means the run is still the live process. Do not
+  // expire that on the short host-lease TTL — quiet thinking exceeds 120s.
+  // Heartbeat's orphan reaper owns dead pids after restart. Rows with no pid
+  // still need recent output or process-start so leftover running shells
+  // after a restart do not look live.
+  if (run.processPid != null) return true;
   return isRecentTimestamp(run.lastOutputAt, now, ttlSec)
-    || isRecentTimestamp(run.processStartedAt, now, ttlSec)
-    || (run.processPid != null && isRecentTimestamp(run.startedAt, now, ttlSec));
+    || isRecentTimestamp(run.processStartedAt, now, ttlSec);
 }
 
 function isFreshLease(

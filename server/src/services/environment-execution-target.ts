@@ -246,42 +246,57 @@ export async function resolveEnvironmentExecutionTarget(input: {
     // Resolve the read-only effective capability snapshot for this lease. The
     // runtime resolves it as the provider declaration ∩ the verified worker
     // methods ∩ narrowing. Freeze it so a consumer reads it but never changes
-    // it. A resolution failure leaves the snapshot absent, never a wrong grant.
-    const effectiveCapabilities =
-      input.environmentRuntime?.effectiveSandboxCapabilities && input.lease
-        ? await input.environmentRuntime
-            .effectiveSandboxCapabilities({
-              environment: input.environment as Environment,
-              lease: input.lease,
-            })
-            .catch(() => null)
-        : null;
+    // it. Track a resolution error apart from a genuinely absent snapshot: a
+    // rejected resolution must not read as an open grant.
+    let effectiveCapabilities: Awaited<
+      ReturnType<NonNullable<EnvironmentRuntimeService["effectiveSandboxCapabilities"]>>
+    > | null = null;
+    let capabilityResolutionFailed = false;
+    if (input.environmentRuntime?.effectiveSandboxCapabilities && input.lease) {
+      try {
+        effectiveCapabilities = await input.environmentRuntime.effectiveSandboxCapabilities({
+          environment: input.environment as Environment,
+          lease: input.lease,
+        });
+      } catch {
+        // The runtime could not resolve the snapshot. Fail closed for the
+        // persistent-session gates below; never grant persistent-session
+        // behavior from an unknown capability set.
+        capabilityResolutionFailed = true;
+        effectiveCapabilities = null;
+      }
+    }
 
     // Gate the sync, session, and execution decisions below on the effective
-    // snapshot. An absent snapshot keeps the prior behavior, so a resolution
-    // failure never removes a working path. A present snapshot can only remove
-    // a capability, never add one back.
+    // snapshot. A genuinely absent snapshot (no runtime, no lease) keeps the
+    // prior behavior, so it never removes a working path. A present snapshot
+    // can only remove a capability, never add one back.
     //
     // Native file sync needs BOTH sync verbs: the runner exposes syncIn and
     // syncOut both-or-neither, so a consumer either uses the native path for
     // both directions or keeps the base64 fallback for both. When the snapshot
-    // removes either verb, keep the byte-identical base64 fallback.
+    // removes either verb, keep the byte-identical base64 fallback. This
+    // preserves the existing reusable-lease sync enforcement unchanged.
     const nativeSyncAllowed =
       !effectiveCapabilities ||
       (effectiveCapabilities.nativeSyncIn && effectiveCapabilities.nativeSyncOut);
     // The persistent-session output-streaming path needs the provider to keep a
     // persistent process session AND to run independent one-shot control
     // commands beside the long-lived agent command. When the snapshot removes
-    // either capability, drop back to the host output-file poll path.
+    // either capability, drop back to the host output-file poll path. When the
+    // resolution failed, fail closed and keep the poll path too.
     const sessionOutputStreamingAllowed =
-      !effectiveCapabilities ||
-      (effectiveCapabilities.persistentProcessSessions &&
-        effectiveCapabilities.independentControlCommands);
+      !capabilityResolutionFailed &&
+      (!effectiveCapabilities ||
+        (effectiveCapabilities.persistentProcessSessions &&
+          effectiveCapabilities.independentControlCommands));
     // A command that opts onto the persistent session needs the provider to keep
     // persistent process sessions. When the snapshot removes that capability,
-    // never force the session; the command runs one-shot instead.
+    // never force the session; the command runs one-shot instead. When the
+    // resolution failed, fail closed and never force the session.
     const persistentSessionsAllowed =
-      !effectiveCapabilities || effectiveCapabilities.persistentProcessSessions;
+      !capabilityResolutionFailed &&
+      (!effectiveCapabilities || effectiveCapabilities.persistentProcessSessions);
 
     return {
       kind: "remote",

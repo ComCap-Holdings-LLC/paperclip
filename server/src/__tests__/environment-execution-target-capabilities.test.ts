@@ -41,6 +41,8 @@ async function buildSandboxTarget(input: {
   snapshot: EffectiveSandboxCapabilities | null;
   supportsSync: boolean;
   config?: Record<string, unknown>;
+  // Reject the capability resolution to exercise the fail-closed error path.
+  rejectResolution?: boolean;
 }) {
   mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({
     driver: "sandbox",
@@ -60,9 +62,12 @@ async function buildSandboxTarget(input: {
     supportsSync: () => input.supportsSync,
     syncIn: vi.fn(),
     syncOut: vi.fn(),
-    effectiveSandboxCapabilities: vi.fn(async () =>
-      input.snapshot ? Object.freeze({ ...input.snapshot }) : null,
-    ),
+    effectiveSandboxCapabilities: vi.fn(async () => {
+      if (input.rejectResolution) {
+        throw new Error("capability resolution failed");
+      }
+      return input.snapshot ? Object.freeze({ ...input.snapshot }) : null;
+    }),
   } as unknown as EnvironmentRuntimeService;
 
   const target = await resolveEnvironmentExecutionTarget({
@@ -233,6 +238,48 @@ describe("effective snapshot gates the persistent-session execution decision", (
     const { target, execute } = await buildSandboxTarget({
       snapshot: { ...FULL_GRANT, persistentProcessSessions: false },
       supportsSync: false,
+    });
+    await target.runner?.execute({ command: "node", args: ["agent.js"], useSession: true });
+    const call = execute.mock.calls[0]![0] as { forceSession?: boolean };
+    expect(call.forceSession).toBe(false);
+  });
+});
+
+describe("a rejected capability resolution fails closed for persistent-session behavior", () => {
+  beforeEach(() => {
+    mockResolveEnvironmentDriverConfigForRuntime.mockReset();
+  });
+
+  it("omits the snapshot when the resolution rejects", async () => {
+    // A rejected resolution carries no snapshot; the target never publishes a
+    // guessed capability set.
+    const { target } = await buildSandboxTarget({
+      snapshot: null,
+      supportsSync: false,
+      rejectResolution: true,
+    });
+    expect(target.effectiveCapabilities).toBeUndefined();
+  });
+
+  it("drops session output streaming when the resolution rejects", async () => {
+    // A rejected resolution must not read as an open grant that enables
+    // streaming; keep the host output-file poll path.
+    const { target } = await buildSandboxTarget({
+      snapshot: null,
+      supportsSync: false,
+      config: { streamAgentSessionOutput: true },
+      rejectResolution: true,
+    });
+    expect(target.streamAgentSessionOutput).toBe(false);
+  });
+
+  it("never forces the persistent session when the resolution rejects", async () => {
+    // The bridge asks for the session with `useSession`, but a rejected
+    // resolution fails closed, so the seam runs the command one-shot instead.
+    const { target, execute } = await buildSandboxTarget({
+      snapshot: null,
+      supportsSync: false,
+      rejectResolution: true,
     });
     await target.runner?.execute({ command: "node", args: ["agent.js"], useSession: true });
     const call = execute.mock.calls[0]![0] as { forceSession?: boolean };

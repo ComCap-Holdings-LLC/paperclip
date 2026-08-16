@@ -1,6 +1,6 @@
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agentRuntimeState, agentTaskSessions, agents, issues } from "@paperclipai/db";
+import { agentRuntimeState, agentTaskSessions, agents, heartbeatRuns, issues } from "@paperclipai/db";
 import type {
   AgentRuntimeConfig,
   AgentStatus,
@@ -15,6 +15,7 @@ const REPORT_STATE_KEY = "pullLifecycleReport";
 const REPORT_RUNTIME_KEY = "pullLifecycle";
 const NATIVE_SESSION_LIMIT = 20;
 const MUTABLE_AGENT_STATUS = new Set<AgentStatus>(["idle", "running", "error", "active"]);
+const LIVE_HEARTBEAT_RUN_STATUSES = new Set(["queued", "scheduled_retry", "running"]);
 
 interface StoredPullAgentLifecycleReport extends PullAgentLifecycleReport {
   observedAt: string;
@@ -133,17 +134,19 @@ export function pullAgentLifecycleService(db: Db) {
     };
   }
 
-  async function nativeEvidence(agent: typeof agents.$inferSelect, now: Date) {
-    const runtimeConfig = agent.runtimeConfig as AgentRuntimeConfig;
-    const ttlSec = runtimeConfig.pull?.leaseTtlSec ?? DEFAULT_PULL_LEASE_TTL_SEC;
+  async function nativeEvidence(agent: typeof agents.$inferSelect, _now: Date) {
     const rows = await db
       .select({
         id: agentTaskSessions.id,
         taskKey: agentTaskSessions.taskKey,
         sessionDisplayId: agentTaskSessions.sessionDisplayId,
         updatedAt: agentTaskSessions.updatedAt,
+        lastError: agentTaskSessions.lastError,
+        runStatus: heartbeatRuns.status,
+        runFinishedAt: heartbeatRuns.finishedAt,
       })
       .from(agentTaskSessions)
+      .leftJoin(heartbeatRuns, eq(agentTaskSessions.lastRunId, heartbeatRuns.id))
       .where(and(
         eq(agentTaskSessions.companyId, agent.companyId),
         eq(agentTaskSessions.agentId, agent.id),
@@ -152,11 +155,16 @@ export function pullAgentLifecycleService(db: Db) {
       .limit(NATIVE_SESSION_LIMIT);
     return rows.map((row): PullAgentLifecycleEvidence => {
       const updatedAt = row.updatedAt instanceof Date ? row.updatedAt : new Date(row.updatedAt);
-      const ageMs = now.getTime() - updatedAt.getTime();
+      const liveRun = Boolean(
+        row.runStatus
+        && LIVE_HEARTBEAT_RUN_STATUSES.has(row.runStatus)
+        && !row.runFinishedAt,
+      );
       return {
         kind: "task_session",
         id: row.sessionDisplayId || row.taskKey || row.id,
-        active: Number.isFinite(ageMs) && ageMs >= 0 && ageMs < ttlSec * 1_000,
+        active: liveRun,
+        status: row.runStatus ?? (row.lastError ? "error" : "idle"),
         observedAt: Number.isNaN(updatedAt.getTime()) ? undefined : updatedAt.toISOString(),
         detail: row.taskKey,
       };
@@ -194,7 +202,10 @@ export function pullAgentLifecycleService(db: Db) {
     if (!next) return;
     if (!MUTABLE_AGENT_STATUS.has(agent.status as AgentStatus)) return;
     if (agent.status === next) return;
-    await db.update(agents).set({ status: next, updatedAt: now }).where(eq(agents.id, agent.id));
+    await db.update(agents).set({ status: next, updatedAt: now }).where(and(
+      eq(agents.id, agent.id),
+      eq(agents.status, agent.status),
+    ));
   }
 
   async function report(agent: typeof agents.$inferSelect, input: PullAgentLifecycleReport, now = new Date()) {
@@ -249,22 +260,29 @@ export function pullAgentLifecycleService(db: Db) {
 
   /** Promote a host-written runtimeConfig.pullLifecycle blob into the native
    *  runtime-state lease and derive agents.status. Existing PATCH /agents/:id
-   *  is the production write path until POST /lifecycle-report is deployed. */
+   *  is the production write path until POST /lifecycle-report is deployed.
+   *  Expired blobs are not renewed: report() would stamp a new observedAt/expiresAt. */
   async function ingestRuntimeConfigLease(
     agent: typeof agents.$inferSelect,
     now = new Date(),
   ) {
     const stored = resolveStoredPullReport(null, agent.runtimeConfig);
-    if (!stored) return reconcile(agent, now);
-    const state = stored.state === "blocked" || stored.state === "idle" || stored.state === "running"
-      ? stored.state
-      : undefined;
-    return report(agent, {
-      source: stored.source,
-      state,
-      leaseTtlSec: stored.leaseTtlSec,
-      evidence: stored.evidence,
-    }, now);
+    if (!stored || !isFreshLease(stored, now)) return reconcile(agent, now);
+
+    const patch = { [REPORT_STATE_KEY]: stored };
+    await db.insert(agentRuntimeState).values({
+      agentId: agent.id,
+      companyId: agent.companyId,
+      adapterType: agent.adapterType,
+      stateJson: patch,
+    }).onConflictDoUpdate({
+      target: agentRuntimeState.agentId,
+      set: {
+        stateJson: sql`${agentRuntimeState.stateJson} || ${JSON.stringify(patch)}::jsonb`,
+        updatedAt: now,
+      },
+    });
+    return reconcile(agent, now);
   }
 
   return { get, report, reconcile, reconcilePullAgents, ingestRuntimeConfigLease };

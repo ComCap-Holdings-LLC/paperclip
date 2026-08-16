@@ -1,14 +1,17 @@
 import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import request from "supertest";
 import { expect, it } from "vitest";
 import {
   activityLog,
   agentRuntimeState,
+  agentTaskSessions,
   agentWakeupRequests,
   agents,
   heartbeatRuns,
   issues,
 } from "@paperclipai/db";
+import { pullAgentLifecycleService } from "../services/pull-agent-lifecycle.js";
 import { agentRoutes } from "../routes/agents.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import {
@@ -25,6 +28,7 @@ describeEmbeddedPostgres("pull agent lifecycle routes", () => {
       await db.delete(activityLog);
       await db.delete(agentWakeupRequests);
       await db.delete(agentRuntimeState);
+      await db.delete(agentTaskSessions);
       await db.delete(heartbeatRuns);
       await db.delete(issues);
       await db.delete(agents);
@@ -435,5 +439,123 @@ describeEmbeddedPostgres("pull agent lifecycle routes", () => {
     expect(skipped.length).toBeGreaterThanOrEqual(2);
     expect(skipped.every((row) => row.status === "skipped")).toBe(true);
     expect(skipped.every((row) => row.reason === "heartbeat.pull_dispatch_disabled")).toBe(true);
+  });
+
+  it("PATCH does not renew an expired runtimeConfig lease as a fresh native report", async () => {
+    const { actor, agentId } = await seedAgent({
+      executionModel: "pull",
+      pull: { dispatchEnabled: false },
+      heartbeat: { enabled: false },
+    });
+    const app = routeApp(ctx.db, actor, agentRoutes);
+    const patched = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({
+        runtimeConfig: {
+          executionModel: "pull",
+          pull: { dispatchEnabled: false },
+          heartbeat: { enabled: false },
+          pullLifecycle: {
+            source: "resident-seat",
+            state: "running",
+            observedAt: "2026-08-14T19:58:00.000Z",
+            expiresAt: "2026-08-14T19:59:59.000Z",
+            evidence: [{ kind: "external_lease", id: "vps-poller", active: true }],
+          },
+        },
+      });
+    expect(patched.status).toBe(200);
+    expect(patched.body.status).toBe("idle");
+    expect(patched.body.pullLifecycle.state).toBe("unreachable");
+    const stored = await ctx.db
+      .select({ stateJson: agentRuntimeState.stateJson })
+      .from(agentRuntimeState)
+      .then((rows) => rows[0]?.stateJson as Record<string, unknown> | undefined);
+    expect(stored?.pullLifecycleReport).toBeUndefined();
+  });
+
+  it("treats a retained session as inactive after its last run finishes", async () => {
+    const { actor, agentId, companyId } = await seedAgent();
+    const runId = randomUUID();
+    await ctx.db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "succeeded",
+      finishedAt: new Date("2026-08-16T16:00:00.000Z"),
+    });
+    await ctx.db.insert(agentTaskSessions).values({
+      companyId,
+      agentId,
+      adapterType: "process",
+      taskKey: "issue:COM-10564",
+      sessionDisplayId: "sess-finished",
+      lastRunId: runId,
+      updatedAt: new Date(),
+    });
+    const app = routeApp(ctx.db, actor, agentRoutes);
+    const res = await request(app).get(`/api/agents/${agentId}/lifecycle`);
+    expect(res.status).toBe(200);
+    expect(res.body.state).toBe("unreachable");
+    expect(res.body.evidence).toEqual([
+      expect.objectContaining({
+        kind: "task_session",
+        id: "sess-finished",
+        active: false,
+        status: "succeeded",
+      }),
+    ]);
+  });
+
+  it("derives running from a live heartbeat run attached to a task session", async () => {
+    const { actor, agentId, companyId } = await seedAgent();
+    const runId = randomUUID();
+    await ctx.db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+    });
+    await ctx.db.insert(agentTaskSessions).values({
+      companyId,
+      agentId,
+      adapterType: "process",
+      taskKey: "issue:COM-10564",
+      sessionDisplayId: "sess-live",
+      lastRunId: runId,
+      updatedAt: new Date("2020-01-01T00:00:00.000Z"),
+    });
+    const app = routeApp(ctx.db, actor, agentRoutes);
+    const res = await request(app).get(`/api/agents/${agentId}/lifecycle`);
+    expect(res.status).toBe(200);
+    expect(res.body.state).toBe("running");
+    expect(res.body.source).toBe("task_session");
+    expect(res.body.evidence).toEqual([
+      expect.objectContaining({
+        kind: "task_session",
+        id: "sess-live",
+        active: true,
+        status: "running",
+      }),
+    ]);
+  });
+
+  it("does not overwrite a paused agent from a stale running snapshot", async () => {
+    const { agentId } = await seedAgent({
+      executionModel: "pull",
+      pullLifecycle: {
+        source: "resident-seat",
+        state: "running",
+        observedAt: "2026-08-16T15:00:00.000Z",
+        expiresAt: "2027-08-16T16:00:00.000Z",
+        evidence: [{ kind: "external_lease", id: "vps-poller", active: true }],
+      },
+    });
+    const [snapshot] = await ctx.db.select().from(agents).where(eq(agents.id, agentId));
+    expect(snapshot?.status).toBe("idle");
+    await ctx.db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+    await pullAgentLifecycleService(ctx.db).reconcile(snapshot!);
+    const after = await ctx.db.select({ status: agents.status }).from(agents);
+    expect(after).toEqual([{ status: "paused" }]);
   });
 });

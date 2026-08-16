@@ -2661,7 +2661,8 @@ export function agentRoutes(
         const policy = parseSchedulerHeartbeatPolicy(row.runtimeConfig);
         const runtime = asRecord(row.runtimeConfig) ?? {};
         const pull = asRecord(runtime.pull) ?? {};
-        const executionModel = runtime.executionModel === "pull" ? "pull" : "push";
+        const executionModel: InstanceSchedulerHeartbeatAgent["executionModel"] =
+          runtime.executionModel === "pull" ? "pull" : "push";
         const pullDispatchEnabled = executionModel === "push"
           || (parseBooleanLike(pull.dispatchEnabled) ?? false) === true;
         const statusEligible =

@@ -786,6 +786,7 @@ export type {
   AgentAccessState,
   AgentChainOfCommandEntry,
   AgentDetail,
+  AgentRuntimeConfig,
   PullAgentEvidenceKind,
   PullAgentLifecycle,
   PullAgentLifecycleEvidence,

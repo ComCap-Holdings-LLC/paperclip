@@ -127,6 +127,41 @@ describe("sandbox capability contract normalizer", () => {
     expect(noKey.persistentProcessSessions).toBeUndefined();
   });
 
+  it("test_config_resolution_failure_fails_closed_on_persistent_process_sessions", () => {
+    const verifiedMethods = ["environmentExecute"];
+    const declared = { persistentProcessSessions: true };
+
+    // Config resolution failed, so the runtime cannot read `useSessions`. The
+    // narrowing must deny persistent process sessions instead of allowing them
+    // through an empty config. Without the fail-closed guard this narrowing key
+    // stays undefined and `persistentProcessSessions` resolves to true.
+    const narrowing = buildSandboxCapabilityNarrowing({
+      leasePolicy: "ephemeral",
+      leaseMetadata: {},
+      config: {},
+      configResolutionFailed: true,
+    });
+    expect(narrowing.persistentProcessSessions).toBe(false);
+
+    const effective = resolveEffectiveSandboxCapabilities({
+      verifiedMethods,
+      declared,
+      narrowing,
+    });
+    expect(effective.persistentProcessSessions).toBe(false);
+
+    // Native sync and reusable lease enforcement stay unchanged on failure.
+    const syncNarrowing = buildSandboxCapabilityNarrowing({
+      leasePolicy: "reuse_by_environment",
+      leaseMetadata: { backend: "job" },
+      config: {},
+      configResolutionFailed: true,
+    });
+    expect(syncNarrowing.reusableLeases).toBe(true);
+    expect(syncNarrowing.nativeSyncIn).toBe(false);
+    expect(syncNarrowing.nativeSyncOut).toBe(false);
+  });
+
   it("test_builtin_provider_branch_uses_same_normalizer_as_plugin_branch", () => {
     const declared = { reusableLeases: true, persistentProcessSessions: true };
 

@@ -1046,7 +1046,12 @@ function createSandboxEnvironmentDriver(
         const workerConfig = stripSandboxProviderEnvelope(parsed.config);
         const storedConfig = storedParsed.config;
         const providerConfigForLease = sandboxConfigForLeaseMetadata(storedConfig);
-        const supportsReusableLeases = pluginProvider.resolved.driver.supportsReusableLeases === true;
+        // Resolve the DECLARED reusable-lease capability through the contract, so
+        // the nested `sandboxCapabilities.reusableLeases` wins over the legacy
+        // `supportsReusableLeases` flag. A provider that declares the legacy flag
+        // `true` but the nested capability `false` must not resume a lease.
+        const supportsReusableLeases =
+          resolveDeclaredSandboxCapabilities(pluginProvider.resolved.driver).reusableLeases === true;
         const leaseFingerprint =
           supportsReusableLeases &&
           parsed.config.reuseLease &&
@@ -1240,7 +1245,12 @@ function createSandboxEnvironmentDriver(
       // heartbeat run that shares it. Filter to reusable policies and statuses
       // so non-reusable, cleanup-pending, or terminal rows can never be matched.
       const builtinSandboxProvider = getBuiltinSandboxProvider(parsed.config.provider);
-      const supportsReusableLeases = builtinSandboxProvider?.supportsReusableLeases === true;
+      // Resolve the DECLARED reusable-lease capability through the same contract
+      // as the plugin path, so the nested capability wins over the legacy flag.
+      const supportsReusableLeases =
+        resolveDeclaredSandboxCapabilities({
+          supportsReusableLeases: builtinSandboxProvider?.supportsReusableLeases,
+        }).reusableLeases === true;
       const providerConfigForLease = sandboxConfigForLeaseMetadata(parsed.config);
       const leaseFingerprint =
         supportsReusableLeases &&

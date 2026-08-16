@@ -1,14 +1,19 @@
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agentRuntimeState, agents, issues } from "@paperclipai/db";
+import { agentRuntimeState, agentTaskSessions, agents, issues } from "@paperclipai/db";
 import type {
   AgentRuntimeConfig,
+  AgentStatus,
   PullAgentLifecycle,
+  PullAgentLifecycleEvidence,
   PullAgentLifecycleReport,
+  PullAgentLifecycleState,
 } from "@paperclipai/shared";
 
 const DEFAULT_PULL_LEASE_TTL_SEC = 120;
 const REPORT_STATE_KEY = "pullLifecycleReport";
+const NATIVE_SESSION_LIMIT = 20;
+const MUTABLE_AGENT_STATUS = new Set<AgentStatus>(["idle", "running", "error", "active"]);
 
 interface StoredPullAgentLifecycleReport extends PullAgentLifecycleReport {
   observedAt: string;
@@ -30,11 +35,24 @@ function asStoredReport(value: unknown): StoredPullAgentLifecycleReport | null {
   return row as unknown as StoredPullAgentLifecycleReport;
 }
 
+export function agentStatusFromPullLifecycle(state: PullAgentLifecycleState): AgentStatus | null {
+  if (state === "running") return "running";
+  if (state === "idle" || state === "idle_queued") return "idle";
+  return null;
+}
+
+function isFreshLease(report: StoredPullAgentLifecycleReport | null, now: Date): boolean {
+  if (!report) return false;
+  const expiresAt = new Date(report.expiresAt);
+  return !Number.isNaN(expiresAt.getTime()) && expiresAt > now;
+}
+
 export function derivePullAgentLifecycle(input: {
   runtimeConfig: AgentRuntimeConfig;
   storedReport: StoredPullAgentLifecycleReport | null;
   queuedIssueCount: number;
   blockedIssueCount: number;
+  nativeEvidence?: PullAgentLifecycleEvidence[];
   now?: Date;
 }): PullAgentLifecycle {
   const executionModel = input.runtimeConfig.executionModel === "pull" ? "pull" : "push";
@@ -44,15 +62,22 @@ export function derivePullAgentLifecycle(input: {
   const observedAt = report ? new Date(report.observedAt) : null;
   const expiresAt = report ? new Date(report.expiresAt) : null;
   const now = input.now ?? new Date();
+  const nativeEvidence = input.nativeEvidence ?? [];
+  const reportFresh = isFreshLease(report, now);
+  const evidence = [...(reportFresh ? report?.evidence ?? [] : []), ...nativeEvidence];
+  const nativeActive = nativeEvidence.some((item) => item.active);
 
   let state: PullAgentLifecycle["state"];
   if (executionModel === "push") {
     state = "idle";
-  } else if (!report || !expiresAt || Number.isNaN(expiresAt.getTime()) || expiresAt <= now) {
+  } else if (!reportFresh && !nativeActive) {
     state = "unreachable";
-  } else if (report.state === "blocked") {
+  } else if (reportFresh && report?.state === "blocked") {
     state = "blocked";
-  } else if (report.state === "running" || report.evidence?.some((item) => item.active)) {
+  } else if (
+    nativeActive
+    || (reportFresh && (report?.state === "running" || evidence.some((item) => item.active)))
+  ) {
     state = "running";
   } else if (input.queuedIssueCount > 0) {
     state = "idle_queued";
@@ -65,8 +90,8 @@ export function derivePullAgentLifecycle(input: {
   return {
     executionModel,
     state,
-    source: report?.source ?? null,
-    evidence: report?.evidence ?? [],
+    source: reportFresh ? report?.source ?? null : nativeActive ? "task_session" : null,
+    evidence,
     observedAt: observedAt && !Number.isNaN(observedAt.getTime()) ? observedAt : null,
     expiresAt: expiresAt && !Number.isNaN(expiresAt.getTime()) ? expiresAt : null,
     queuedIssueCount: input.queuedIssueCount,
@@ -95,6 +120,36 @@ export function pullAgentLifecycleService(db: Db) {
     };
   }
 
+  async function nativeEvidence(agent: typeof agents.$inferSelect, now: Date) {
+    const runtimeConfig = agent.runtimeConfig as AgentRuntimeConfig;
+    const ttlSec = runtimeConfig.pull?.leaseTtlSec ?? DEFAULT_PULL_LEASE_TTL_SEC;
+    const rows = await db
+      .select({
+        id: agentTaskSessions.id,
+        taskKey: agentTaskSessions.taskKey,
+        sessionDisplayId: agentTaskSessions.sessionDisplayId,
+        updatedAt: agentTaskSessions.updatedAt,
+      })
+      .from(agentTaskSessions)
+      .where(and(
+        eq(agentTaskSessions.companyId, agent.companyId),
+        eq(agentTaskSessions.agentId, agent.id),
+      ))
+      .orderBy(desc(agentTaskSessions.updatedAt))
+      .limit(NATIVE_SESSION_LIMIT);
+    return rows.map((row): PullAgentLifecycleEvidence => {
+      const updatedAt = row.updatedAt instanceof Date ? row.updatedAt : new Date(row.updatedAt);
+      const ageMs = now.getTime() - updatedAt.getTime();
+      return {
+        kind: "task_session",
+        id: row.sessionDisplayId || row.taskKey || row.id,
+        active: Number.isFinite(ageMs) && ageMs >= 0 && ageMs < ttlSec * 1_000,
+        observedAt: Number.isNaN(updatedAt.getTime()) ? undefined : updatedAt.toISOString(),
+        detail: row.taskKey,
+      };
+    });
+  }
+
   async function get(agent: typeof agents.$inferSelect, now = new Date()) {
     const runtimeState = await db
       .select({ stateJson: agentRuntimeState.stateJson })
@@ -104,13 +159,29 @@ export function pullAgentLifecycleService(db: Db) {
         eq(agentRuntimeState.agentId, agent.id),
       ))
       .then((rows) => rows[0] ?? null);
-    const counts = await issueCounts(agent.companyId, agent.id);
+    const [counts, sessions] = await Promise.all([
+      issueCounts(agent.companyId, agent.id),
+      nativeEvidence(agent, now),
+    ]);
     return derivePullAgentLifecycle({
       runtimeConfig: agent.runtimeConfig as AgentRuntimeConfig,
       storedReport: asStoredReport(runtimeState?.stateJson?.[REPORT_STATE_KEY]),
+      nativeEvidence: sessions,
       ...counts,
       now,
     });
+  }
+
+  async function syncAgentStatus(
+    agent: typeof agents.$inferSelect,
+    lifecycle: PullAgentLifecycle,
+    now: Date,
+  ) {
+    const next = agentStatusFromPullLifecycle(lifecycle.state);
+    if (!next) return;
+    if (!MUTABLE_AGENT_STATUS.has(agent.status as AgentStatus)) return;
+    if (agent.status === next) return;
+    await db.update(agents).set({ status: next, updatedAt: now }).where(eq(agents.id, agent.id));
   }
 
   async function report(agent: typeof agents.$inferSelect, input: PullAgentLifecycleReport, now = new Date()) {
@@ -138,7 +209,9 @@ export function pullAgentLifecycleService(db: Db) {
       },
     });
 
-    return get(agent, now);
+    const lifecycle = await get(agent, now);
+    await syncAgentStatus(agent, lifecycle, now);
+    return lifecycle;
   }
 
   return { get, report };

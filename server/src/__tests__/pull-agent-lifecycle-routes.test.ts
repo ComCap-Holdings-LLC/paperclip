@@ -112,6 +112,9 @@ describeEmbeddedPostgres("pull agent lifecycle routes", () => {
     expect(got.body.evidence).toEqual([
       { kind: "external_lease", id: "vps-poller-5", active: true },
     ]);
+
+    const after = await ctx.db.select({ status: agents.status }).from(agents);
+    expect(after).toEqual([{ status: "running" }]);
   });
 
   it("rejects lifecycle reports for push agents", async () => {

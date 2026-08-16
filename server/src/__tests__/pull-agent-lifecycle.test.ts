@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { derivePullAgentLifecycle } from "../services/pull-agent-lifecycle.js";
+import {
+  agentStatusFromPullLifecycle,
+  derivePullAgentLifecycle,
+} from "../services/pull-agent-lifecycle.js";
 
 const now = new Date("2026-08-14T20:00:00.000Z");
 
@@ -86,5 +89,30 @@ describe("derivePullAgentLifecycle", () => {
     });
 
     expect(lifecycle).toMatchObject({ executionModel: "push", state: "idle", dispatchEnabled: true });
+  });
+
+  it("derives running from a fresh native task session when the posted lease is stale", () => {
+    const lifecycle = derivePullAgentLifecycle({
+      runtimeConfig: { executionModel: "pull" },
+      storedReport: report({ expiresAt: "2026-08-14T19:59:59.999Z", state: "idle" }),
+      nativeEvidence: [{ kind: "task_session", id: "sess-1", active: true }],
+      queuedIssueCount: 1,
+      blockedIssueCount: 0,
+      now,
+    });
+
+    expect(lifecycle.state).toBe("running");
+    expect(lifecycle.source).toBe("task_session");
+    expect(lifecycle.evidence).toEqual([
+      { kind: "task_session", id: "sess-1", active: true },
+    ]);
+  });
+
+  it("maps only running/idle pull states onto agent.status", () => {
+    expect(agentStatusFromPullLifecycle("running")).toBe("running");
+    expect(agentStatusFromPullLifecycle("idle")).toBe("idle");
+    expect(agentStatusFromPullLifecycle("idle_queued")).toBe("idle");
+    expect(agentStatusFromPullLifecycle("blocked")).toBeNull();
+    expect(agentStatusFromPullLifecycle("unreachable")).toBeNull();
   });
 });

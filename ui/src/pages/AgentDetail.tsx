@@ -885,6 +885,7 @@ export function AgentDetail() {
     queryFn: () => agentsApi.lifecycle(resolvedAgentId!, resolvedCompanyId ?? undefined),
     enabled: Boolean(resolvedAgentId) && needsDashboardData && isPullAgent,
     refetchInterval: isPullAgent ? 15_000 : false,
+    placeholderData: agent?.pullLifecycle,
   });
 
   const { data: heartbeats } = useQuery({

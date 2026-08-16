@@ -200,6 +200,42 @@ describeEmbeddedPostgres("pull agent lifecycle routes", () => {
     expect(runs).toEqual([]);
   });
 
+  it("GET /agents/:id embeds pullLifecycle from runtimeConfig when native state is empty", async () => {
+    const { actor, agentId } = await seedAgent({
+      executionModel: "pull",
+      pull: { dispatchEnabled: false },
+      pullLifecycle: {
+        source: "resident-seat",
+        state: "running",
+        observedAt: "2026-08-16T15:00:00.000Z",
+        expiresAt: "2026-08-16T16:00:00.000Z",
+        evidence: [{ kind: "external_lease", id: "vps-poller", active: true }],
+      },
+    });
+    const app = routeApp(ctx.db, actor, agentRoutes);
+    const res = await request(app).get(`/api/agents/${agentId}`);
+    expect(res.status).toBe(200);
+    expect(res.body.pullLifecycle).toMatchObject({
+      executionModel: "pull",
+      state: "running",
+      source: "resident-seat",
+      dispatchEnabled: false,
+    });
+    expect(res.body.pullLifecycle.evidence).toEqual([
+      { kind: "external_lease", id: "vps-poller", active: true },
+    ]);
+    const runs = await ctx.db.select({ id: heartbeatRuns.id }).from(heartbeatRuns);
+    expect(runs).toEqual([]);
+  });
+
+  it("GET /agents/:id does not embed pullLifecycle for push agents", async () => {
+    const { actor, agentId } = await seedAgent({});
+    const app = routeApp(ctx.db, actor, agentRoutes);
+    const res = await request(app).get(`/api/agents/${agentId}`);
+    expect(res.status).toBe(200);
+    expect(res.body.pullLifecycle).toBeUndefined();
+  });
+
   it("timer ticks reconcile pull agents and do not enqueue heartbeat runs", async () => {
     const { agentId } = await seedAgent({
       executionModel: "pull",

@@ -934,11 +934,15 @@ export function agentRoutes(
       buildAgentAccessState(agent),
     ]);
 
-    return {
+    const detail = {
       ...(options?.restricted ? redactForRestrictedAgentView(agent) : agent),
       chainOfCommand,
       access: accessState,
     };
+    if (asRecord(agent.runtimeConfig)?.executionModel === "pull") {
+      return { ...detail, pullLifecycle: await pullLifecycle.get(agent) };
+    }
+    return detail;
   }
 
   async function resolveAgentSelfTrustPreset(req: Request, agent: NonNullable<Awaited<ReturnType<typeof svc.getById>>>) {

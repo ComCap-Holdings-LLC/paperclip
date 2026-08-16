@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   agentStatusFromPullLifecycle,
   derivePullAgentLifecycle,
+  resolveStoredPullReport,
 } from "../services/pull-agent-lifecycle.js";
 
 const now = new Date("2026-08-14T20:00:00.000Z");
@@ -114,5 +115,30 @@ describe("derivePullAgentLifecycle", () => {
     expect(agentStatusFromPullLifecycle("idle_queued")).toBe("idle");
     expect(agentStatusFromPullLifecycle("blocked")).toBeNull();
     expect(agentStatusFromPullLifecycle("unreachable")).toBe("idle");
+  });
+});
+
+describe("resolveStoredPullReport", () => {
+  const lease = {
+    source: "resident-seat",
+    observedAt: "2026-08-16T15:00:00.000Z",
+    expiresAt: "2026-08-16T15:03:00.000Z",
+    state: "running",
+  };
+
+  it("prefers the native runtime-state lease over runtimeConfig", () => {
+    expect(resolveStoredPullReport(
+      { pullLifecycleReport: { ...lease, source: "runtime-state" } },
+      { pullLifecycle: { ...lease, source: "runtime-config" } },
+    )?.source).toBe("runtime-state");
+  });
+
+  it("falls back to runtimeConfig.pullLifecycle when runtime-state has no lease", () => {
+    expect(resolveStoredPullReport({ keepMe: true }, { pullLifecycle: lease })).toEqual(lease);
+  });
+
+  it("returns null when neither store has a well-formed lease", () => {
+    expect(resolveStoredPullReport({ pullLifecycleReport: { state: "running" } }, {})).toBeNull();
+    expect(resolveStoredPullReport(null, { pullLifecycle: { source: "missing-dates" } })).toBeNull();
   });
 });

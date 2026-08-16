@@ -12,6 +12,7 @@ import type {
 
 const DEFAULT_PULL_LEASE_TTL_SEC = 120;
 const REPORT_STATE_KEY = "pullLifecycleReport";
+const REPORT_RUNTIME_KEY = "pullLifecycle";
 const NATIVE_SESSION_LIMIT = 20;
 const MUTABLE_AGENT_STATUS = new Set<AgentStatus>(["idle", "running", "error", "active"]);
 
@@ -39,6 +40,18 @@ export function agentStatusFromPullLifecycle(state: PullAgentLifecycleState): Ag
   if (state === "running") return "running";
   if (state === "idle" || state === "idle_queued" || state === "unreachable") return "idle";
   return null;
+}
+
+/** Prefer the native runtime-state lease; fall back to runtimeConfig.pullLifecycle
+ *  so a host reporter can persist evidence through the existing agent PATCH before
+ *  /lifecycle-report is deployed. */
+export function resolveStoredPullReport(
+  runtimeStateJson: unknown,
+  runtimeConfig: unknown,
+): StoredPullAgentLifecycleReport | null {
+  const fromState = asStoredReport(asRecord(runtimeStateJson)[REPORT_STATE_KEY]);
+  if (fromState) return fromState;
+  return asStoredReport(asRecord(runtimeConfig)[REPORT_RUNTIME_KEY]);
 }
 
 function isFreshLease(report: StoredPullAgentLifecycleReport | null, now: Date): boolean {
@@ -165,7 +178,7 @@ export function pullAgentLifecycleService(db: Db) {
     ]);
     return derivePullAgentLifecycle({
       runtimeConfig: agent.runtimeConfig as AgentRuntimeConfig,
-      storedReport: asStoredReport(runtimeState?.stateJson?.[REPORT_STATE_KEY]),
+      storedReport: resolveStoredPullReport(runtimeState?.stateJson, agent.runtimeConfig),
       nativeEvidence: sessions,
       ...counts,
       now,

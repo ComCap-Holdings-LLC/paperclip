@@ -1055,12 +1055,23 @@ function createSandboxEnvironmentDriver(
         const workerConfig = stripSandboxProviderEnvelope(parsed.config);
         const storedConfig = storedParsed.config;
         const providerConfigForLease = sandboxConfigForLeaseMetadata(storedConfig);
-        // Resolve the DECLARED reusable-lease capability through the contract, so
+        // Require the reusable-lease capability AND a worker that verifies the
+        // reuse methods. The provider must first opt in through the declaration:
         // the nested `sandboxCapabilities.reusableLeases` wins over the legacy
-        // `supportsReusableLeases` flag. A provider that declares the legacy flag
-        // `true` but the nested capability `false` must not resume a lease.
-        const supportsReusableLeases =
+        // `supportsReusableLeases` flag. The worker must also verify both
+        // `environmentResumeLease` and `environmentReleaseLease` (the reuse
+        // prerequisite verbs) before the runtime resumes or releases a reusable
+        // lease. A provider that declares `reusableLeases` true but whose worker
+        // does not verify the two methods fails closed and uses an ephemeral
+        // lease, so the runtime never dispatches a resume or a release the worker
+        // cannot serve.
+        const declaredReusableLeases =
           resolveDeclaredSandboxCapabilities(pluginProvider.resolved.driver).reusableLeases === true;
+        const pluginVerifiedMethods = new Set(
+          pluginWorkerManager.getWorker(pluginProvider.resolved.plugin.id)?.supportedMethods ?? [],
+        );
+        const supportsReusableLeases =
+          declaredReusableLeases && capabilityIsVerified("reusableLeases", pluginVerifiedMethods);
         const leaseFingerprint =
           supportsReusableLeases &&
           parsed.config.reuseLease &&

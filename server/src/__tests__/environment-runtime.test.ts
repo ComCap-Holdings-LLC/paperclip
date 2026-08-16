@@ -673,6 +673,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         }
         throw new Error(`Unexpected plugin method: ${method}`);
       }),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease"] })),
     } as unknown as PluginWorkerManager;
     const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
 
@@ -799,6 +800,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         }
         throw new Error(`Unexpected plugin method: ${method}`);
       }),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease"] })),
     } as unknown as PluginWorkerManager;
     const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
 
@@ -871,6 +873,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         }
         throw new Error(`Unexpected plugin method: ${method}`);
       }),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease"] })),
     } as unknown as PluginWorkerManager;
     const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
 
@@ -919,6 +922,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         }
         throw new Error(`Unexpected plugin method: ${method}`);
       }),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease"] })),
     } as unknown as PluginWorkerManager;
     const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
 
@@ -994,6 +998,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         }
         throw new Error(`Unexpected plugin method: ${method}`);
       }),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease"] })),
     } as unknown as PluginWorkerManager;
     const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
 
@@ -1107,6 +1112,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         }
         throw new Error(`Unexpected plugin method: ${method}`);
       }),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease"] })),
     } as unknown as PluginWorkerManager;
     const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
 
@@ -1352,6 +1358,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         }
         throw new Error(`Unexpected plugin method: ${method}`);
       }),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease"] })),
     } as unknown as PluginWorkerManager;
     const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
 
@@ -1555,6 +1562,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         }
         throw new Error(`Unexpected plugin method: ${method}`);
       }),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease"] })),
     } as unknown as PluginWorkerManager;
     const runtimeWithPlugin = environmentRuntimeService(db, {
       pluginWorkerManager: workerManager,
@@ -1631,6 +1639,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       call: vi.fn(async (_pluginId: string, method: string) => {
         throw new Error(`Unexpected plugin method: ${method}`);
       }),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease"] })),
     } as unknown as PluginWorkerManager;
     const runtimeWithPlugin = environmentRuntimeService(db, {
       pluginWorkerManager: workerManager,
@@ -1730,6 +1739,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         }
         throw new Error(`Unexpected plugin method: ${method}`);
       }),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease"] })),
     } as unknown as PluginWorkerManager;
     const runtimeWithPlugin = environmentRuntimeService(db, {
       pluginWorkerManager: workerManager,
@@ -1818,6 +1828,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         }
         throw new Error(`Unexpected plugin method: ${method}`);
       }),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease"] })),
     } as unknown as PluginWorkerManager;
     const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
 
@@ -1984,6 +1995,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         }
         throw new Error(`Unexpected plugin method: ${method}`);
       }),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease"] })),
     } as unknown as PluginWorkerManager;
     const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
 
@@ -2126,6 +2138,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         }
         throw new Error(`Unexpected plugin method: ${method}`);
       }),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease"] })),
     } as unknown as PluginWorkerManager;
     const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
 
@@ -2315,6 +2328,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         }
         throw new Error(`Unexpected plugin method: ${method}`);
       }),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease"] })),
     } as unknown as PluginWorkerManager;
     const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
 
@@ -2404,6 +2418,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         }
         throw new Error(`Unexpected plugin method: ${method}`);
       }),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease"] })),
     } as unknown as PluginWorkerManager;
     const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
 
@@ -2552,6 +2567,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         }
         throw new Error(`Unexpected plugin method: ${method}`);
       }),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease"] })),
     } as unknown as PluginWorkerManager;
     const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
 
@@ -2706,6 +2722,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         }
         throw new Error(`Unexpected plugin method: ${method}`);
       }),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease"] })),
     } as unknown as PluginWorkerManager;
     const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
 
@@ -2733,6 +2750,175 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     );
   });
 
+  it("fails closed and does not resume when the worker does not verify the reuse methods", async () => {
+    // The provider declares `reusableLeases: true`, but its worker advertises
+    // neither `environmentResumeLease` nor `environmentReleaseLease`. The runtime
+    // must not resume or reuse the lease, because it cannot dispatch a resume or
+    // a release the worker does not serve. It acquires a fresh ephemeral lease
+    // and leaves the old reusable lease untouched.
+    const pluginId = randomUUID();
+    const { companyId, agentId, environment: baseEnvironment, runId } = await seedEnvironment();
+    const providerConfig = {
+      provider: "fake-plugin",
+      image: "fake:test",
+      timeoutMs: 1234,
+      reuseLease: true,
+    };
+    const environment = {
+      ...baseEnvironment,
+      name: "Unverified-worker Plugin Sandbox",
+      driver: "sandbox",
+      config: providerConfig,
+    };
+    await environmentService(db).update(environment.id, {
+      driver: "sandbox",
+      name: environment.name,
+      config: providerConfig,
+    });
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: "acme.unverified-worker-sandbox-provider",
+      packageName: "@acme/unverified-worker-sandbox-provider",
+      version: "1.0.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      manifestJson: {
+        id: "acme.unverified-worker-sandbox-provider",
+        apiVersion: 1,
+        version: "1.0.0",
+        displayName: "Unverified-worker Sandbox Provider",
+        description: "Test provider that declares reusable leases but whose worker lacks the reuse methods",
+        author: "Paperclip",
+        categories: ["automation"],
+        capabilities: ["environment.drivers.register"],
+        entrypoints: { worker: "dist/worker.js" },
+        environmentDrivers: [
+          {
+            driverKey: "fake-plugin",
+            kind: "sandbox_provider",
+            displayName: "Fake Plugin",
+            sandboxCapabilities: { reusableLeases: true },
+            configSchema: {
+              type: "object",
+              properties: {
+                image: { type: "string" },
+                timeoutMs: { type: "number" },
+                reuseLease: { type: "boolean" },
+              },
+            },
+          },
+        ],
+      },
+      status: "ready",
+      installOrder: 1,
+      updatedAt: new Date(),
+    } as any);
+    const executionWorkspaceId = randomUUID();
+    const projectId = randomUUID();
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: `Workspace ${projectId.slice(0, 8)}`,
+      status: "active",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      mode: "shared_workspace",
+      strategyType: "project_primary",
+      name: "Unverified-worker workspace",
+      status: "active",
+      providerType: "local_fs",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const existingLease = await environmentService(db).acquireLease({
+      companyId,
+      environmentId: environment.id,
+      executionWorkspaceId,
+      heartbeatRunId: runId,
+      leasePolicy: "reuse_by_environment",
+      provider: "fake-plugin",
+      providerLeaseId: "old-plugin-lease",
+      metadata: {
+        agentId,
+        provider: "fake-plugin",
+        image: "fake:test",
+        timeoutMs: 1234,
+        reuseLease: true,
+        reusableSandboxLease: {
+          version: 1,
+          companyId,
+          environmentId: environment.id,
+          executionWorkspaceId,
+          agentId,
+          adapterType: null,
+          provider: "fake-plugin",
+          runtimeFingerprint: reusableRuntimeFingerprint({
+            provider: "fake-plugin",
+            adapterType: null,
+            config: providerConfig,
+          }),
+        },
+      },
+    });
+
+    const workerManager = {
+      isRunning: vi.fn((id: string) => id === pluginId),
+      call: vi.fn(async (_pluginId: string, method: string) => {
+        if (method === "environmentAcquireLease") {
+          return {
+            providerLeaseId: "fresh-plugin-lease",
+            metadata: {
+              provider: "fake-plugin",
+              image: "fake:test",
+              timeoutMs: 1234,
+              reuseLease: true,
+              remoteCwd: "/workspace",
+            },
+          };
+        }
+        throw new Error(`Unexpected plugin method: ${method}`);
+      }),
+      // The worker verifies only `environmentExecute`. It advertises neither
+      // reuse verb, so the reusable-lease capability fails closed.
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentExecute"] })),
+    } as unknown as PluginWorkerManager;
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+
+    const acquired = await runtimeWithPlugin.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      agentId,
+      heartbeatRunId: runId,
+      persistedExecutionWorkspace: {
+        id: executionWorkspaceId,
+        mode: "shared_workspace",
+      },
+    });
+
+    expect(acquired.lease.providerLeaseId).toBe("fresh-plugin-lease");
+    expect(acquired.lease.leasePolicy).toBe("ephemeral");
+    expect(workerManager.call).toHaveBeenCalledTimes(1);
+    expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentAcquireLease", expect.anything(), 31234);
+    expect(workerManager.call).not.toHaveBeenCalledWith(
+      pluginId,
+      "environmentResumeLease",
+      expect.anything(),
+      expect.anything(),
+    );
+    // The runtime leaves the old reusable lease untouched: it neither resumes
+    // nor destroys a lease it cannot serve.
+    await expect(environmentService(db).getLeaseById(existingLease.id)).resolves.toMatchObject({
+      status: "active",
+      leasePolicy: "reuse_by_environment",
+    });
+  });
+
   it("destroys scoped reusable plugin-backed sandbox leases", async () => {
     const { pluginId, companyId, executionWorkspaceId, reusableLease } =
       await seedReusablePluginSandboxLease();
@@ -2745,6 +2931,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         }
         throw new Error(`Unexpected plugin method: ${method}`);
       }),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease"] })),
     } as unknown as PluginWorkerManager;
     const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
 
@@ -2780,6 +2967,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     const offlineWorkerManager = {
       isRunning: vi.fn(() => false),
       call: vi.fn(),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease"] })),
     } as unknown as PluginWorkerManager;
     const runtimeWithOfflinePlugin = environmentRuntimeService(db, {
       pluginWorkerManager: offlineWorkerManager,
@@ -2809,6 +2997,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         }
         throw new Error(`Unexpected plugin method: ${method}`);
       }),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease"] })),
     } as unknown as PluginWorkerManager;
     const runtimeWithRecoveredPlugin = environmentRuntimeService(db, {
       pluginWorkerManager: recoveredWorkerManager,
@@ -2970,6 +3159,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         }
         throw new Error(`Unexpected plugin method: ${method}`);
       }),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease"] })),
     } as unknown as PluginWorkerManager;
     const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
 
@@ -3016,6 +3206,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         }
         return undefined;
       }),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease"] })),
     } as unknown as PluginWorkerManager;
     const runtimeWithPlugin = environmentRuntimeService(db, {
       pluginWorkerManager: workerManager,
@@ -3171,6 +3362,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         }
         return undefined;
       }),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease"] })),
     } as unknown as PluginWorkerManager;
     const runtimeWithPlugin = environmentRuntimeService(db, {
       pluginWorkerManager: workerManager,

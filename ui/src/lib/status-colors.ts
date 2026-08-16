@@ -247,6 +247,9 @@ export const agentStatusVar: Record<string, string> = {
   running: "--status-agent-running",
   paused: "--status-agent-paused",
   error: "--status-agent-error",
+  idle_queued: "--status-agent-paused",
+  blocked: "--status-agent-error",
+  unreachable: "--status-agent-error",
 };
 export const agentStatusVarDefault = "--status-agent-idle";
 

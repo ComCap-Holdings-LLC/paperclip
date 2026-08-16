@@ -142,6 +142,7 @@ export interface Agent {
   orgChainHealth?: AgentOrgChainHealth;
   createdAt: Date;
   updatedAt: Date;
+  pullLifecycle?: PullAgentLifecycle;
 }
 
 export interface AgentDetail extends Agent {

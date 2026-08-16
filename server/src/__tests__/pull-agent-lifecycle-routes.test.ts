@@ -268,4 +268,109 @@ describeEmbeddedPostgres("pull agent lifecycle routes", () => {
     const runs = await ctx.db.select({ id: heartbeatRuns.id }).from(heartbeatRuns);
     expect(runs).toEqual([]);
   });
+
+  it("PATCH /agents/:id runtimeConfig.pullLifecycle becomes a native lease and running status", async () => {
+    const { actor, agentId } = await seedAgent({
+      executionModel: "pull",
+      pull: { dispatchEnabled: false },
+      heartbeat: { enabled: false },
+    });
+    const app = routeApp(ctx.db, actor, agentRoutes);
+    const patched = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({
+        runtimeConfig: {
+          executionModel: "pull",
+          pull: { dispatchEnabled: false },
+          heartbeat: { enabled: false },
+          pullLifecycle: {
+            source: "resident-seat",
+            state: "running",
+            observedAt: "2026-08-16T15:00:00.000Z",
+            expiresAt: "2026-08-16T16:00:00.000Z",
+            evidence: [{ kind: "external_lease", id: "vps-poller-4", active: true }],
+          },
+        },
+      });
+    expect(patched.status).toBe(200);
+    expect(patched.body.status).toBe("running");
+    expect(patched.body.pullLifecycle).toMatchObject({
+      executionModel: "pull",
+      state: "running",
+      source: "resident-seat",
+      dispatchEnabled: false,
+    });
+    const stored = await ctx.db
+      .select({ stateJson: agentRuntimeState.stateJson })
+      .from(agentRuntimeState)
+      .then((rows) => rows[0]?.stateJson);
+    expect(stored).toMatchObject({
+      pullLifecycleReport: {
+        source: "resident-seat",
+        state: "running",
+      },
+    });
+    const runs = await ctx.db.select({ id: heartbeatRuns.id }).from(heartbeatRuns);
+    expect(runs).toEqual([]);
+  });
+
+  it("GET /agents/:id expires a stale runtimeConfig lease onto idle without a heartbeat run", async () => {
+    const { actor, agentId } = await seedAgent({
+      executionModel: "pull",
+      pull: { dispatchEnabled: false },
+      pullLifecycle: {
+        source: "resident-seat",
+        state: "running",
+        observedAt: "2026-08-14T19:58:00.000Z",
+        expiresAt: "2026-08-14T19:59:59.000Z",
+        evidence: [{ kind: "external_lease", id: "vps-poller", active: true }],
+      },
+    });
+    await ctx.db.update(agents).set({ status: "running" });
+    const app = routeApp(ctx.db, actor, agentRoutes);
+    const res = await request(app).get(`/api/agents/${agentId}`);
+    expect(res.status).toBe(200);
+    expect(res.body.pullLifecycle.state).toBe("unreachable");
+    expect(res.body.status).toBe("idle");
+    const after = await ctx.db.select({ status: agents.status }).from(agents);
+    expect(after).toEqual([{ status: "idle" }]);
+    const runs = await ctx.db.select({ id: heartbeatRuns.id }).from(heartbeatRuns);
+    expect(runs).toEqual([]);
+  });
+
+  it("GET /companies/:companyId/agents embeds pullLifecycle only for pull agents", async () => {
+    const { actor, agentId, companyId } = await seedAgent({
+      executionModel: "pull",
+      pullLifecycle: {
+        source: "resident-seat",
+        state: "running",
+        observedAt: "2026-08-16T15:00:00.000Z",
+        expiresAt: "2026-08-16T16:00:00.000Z",
+        evidence: [{ kind: "claim", id: "issue:COM-10564", active: true }],
+      },
+    });
+    const pushId = randomUUID();
+    await ctx.db.insert(agents).values({
+      id: pushId,
+      companyId,
+      name: "Pushy",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const app = routeApp(ctx.db, actor, agentRoutes);
+    const res = await request(app).get(`/api/companies/${companyId}/agents`);
+    expect(res.status).toBe(200);
+    const pullRow = res.body.find((row: { id: string }) => row.id === agentId);
+    const pushRow = res.body.find((row: { id: string }) => row.id === pushId);
+    expect(pullRow.pullLifecycle).toMatchObject({
+      executionModel: "pull",
+      state: "running",
+      source: "resident-seat",
+    });
+    expect(pushRow.pullLifecycle).toBeUndefined();
+  });
 });

@@ -247,5 +247,25 @@ export function pullAgentLifecycleService(db: Db) {
     return reconciled;
   }
 
-  return { get, report, reconcile, reconcilePullAgents };
+  /** Promote a host-written runtimeConfig.pullLifecycle blob into the native
+   *  runtime-state lease and derive agents.status. Existing PATCH /agents/:id
+   *  is the production write path until POST /lifecycle-report is deployed. */
+  async function ingestRuntimeConfigLease(
+    agent: typeof agents.$inferSelect,
+    now = new Date(),
+  ) {
+    const stored = resolveStoredPullReport(null, agent.runtimeConfig);
+    if (!stored) return reconcile(agent, now);
+    const state = stored.state === "blocked" || stored.state === "idle" || stored.state === "running"
+      ? stored.state
+      : undefined;
+    return report(agent, {
+      source: stored.source,
+      state,
+      leaseTtlSec: stored.leaseTtlSec,
+      evidence: stored.evidence,
+    }, now);
+  }
+
+  return { get, report, reconcile, reconcilePullAgents, ingestRuntimeConfigLease };
 }

@@ -940,7 +940,14 @@ export function agentRoutes(
       access: accessState,
     };
     if (asRecord(agent.runtimeConfig)?.executionModel === "pull") {
-      return { ...detail, pullLifecycle: await pullLifecycle.get(agent) };
+      const lifecycle = await pullLifecycle.reconcile(agent);
+      const latest = await svc.getById(agent.id);
+      return {
+        ...detail,
+        status: latest?.status ?? detail.status,
+        updatedAt: latest?.updatedAt ?? detail.updatedAt,
+        pullLifecycle: lifecycle,
+      };
     }
     return detail;
   }
@@ -2615,11 +2622,15 @@ export function agentRoutes(
     }
     const result = await filterAgentsForActor(req, await svc.list(companyId));
     const canReadConfigs = await actorCanReadConfigurationsForCompany(req, companyId);
-    if (canReadConfigs) {
-      res.json(result);
+    if (!canReadConfigs) {
+      res.json(result.map((agent) => redactForRestrictedAgentView(agent)));
       return;
     }
-    res.json(result.map((agent) => redactForRestrictedAgentView(agent)));
+    const withLifecycle = await Promise.all(result.map(async (agent) => {
+      if (asRecord(agent.runtimeConfig)?.executionModel !== "pull") return agent;
+      return { ...agent, pullLifecycle: await pullLifecycle.get(agent) };
+    }));
+    res.json(withLifecycle);
   });
 
   router.get("/instance/scheduler-heartbeats", async (req, res) => {
@@ -3784,6 +3795,17 @@ export function agentRoutes(
       entityId: agent.id,
       details: summarizeAgentUpdateDetails(patchData),
     });
+
+    if (
+      asRecord(agent.runtimeConfig)?.executionModel === "pull"
+      && requestedRuntimeConfig
+      && Object.prototype.hasOwnProperty.call(requestedRuntimeConfig, "pullLifecycle")
+    ) {
+      const lifecycle = await pullLifecycle.ingestRuntimeConfigLease(agent);
+      const latest = await svc.getById(agent.id);
+      res.json({ ...(latest ?? agent), pullLifecycle: lifecycle });
+      return;
+    }
 
     res.json(agent);
   });

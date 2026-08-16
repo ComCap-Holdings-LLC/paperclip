@@ -46,6 +46,17 @@ describeEmbeddedPostgres("pull agent lifecycle routes", () => {
     };
   }
 
+  function freshLease(overrides: Record<string, unknown> = {}) {
+    return {
+      source: "resident-seat",
+      state: "running",
+      observedAt: new Date(Date.now() - 30_000).toISOString(),
+      expiresAt: "2027-08-16T16:00:00.000Z",
+      evidence: [{ kind: "external_lease", id: "vps-poller", active: true }],
+      ...overrides,
+    };
+  }
+
   async function seedAgent(runtimeConfig: Record<string, unknown> = { executionModel: "pull" }) {
     const seeded = await seedCompanyWithBoardAccess(ctx.db, "PullLifecycle");
     const agentId = randomUUID();
@@ -210,13 +221,7 @@ describeEmbeddedPostgres("pull agent lifecycle routes", () => {
     const { actor, agentId } = await seedAgent({
       executionModel: "pull",
       pull: { dispatchEnabled: false },
-      pullLifecycle: {
-        source: "resident-seat",
-        state: "running",
-        observedAt: "2026-08-16T15:00:00.000Z",
-        expiresAt: "2027-08-16T16:00:00.000Z",
-        evidence: [{ kind: "external_lease", id: "vps-poller", active: true }],
-      },
+      pullLifecycle: freshLease(),
     });
     const app = routeApp(ctx.db, actor, agentRoutes);
     const res = await request(app).get(`/api/agents/${agentId}`);
@@ -289,13 +294,9 @@ describeEmbeddedPostgres("pull agent lifecycle routes", () => {
           executionModel: "pull",
           pull: { dispatchEnabled: false },
           heartbeat: { enabled: false },
-          pullLifecycle: {
-            source: "resident-seat",
-            state: "running",
-            observedAt: "2026-08-16T15:00:00.000Z",
-            expiresAt: "2027-08-16T16:00:00.000Z",
+          pullLifecycle: freshLease({
             evidence: [{ kind: "external_lease", id: "vps-poller-4", active: true }],
-          },
+          }),
         },
       });
     expect(patched.status).toBe(200);
@@ -316,6 +317,11 @@ describeEmbeddedPostgres("pull agent lifecycle routes", () => {
         state: "running",
       },
     });
+    const persisted = (stored as { pullLifecycleReport: { observedAt: string; expiresAt: string } })
+      .pullLifecycleReport;
+    const persistedTtlMs = new Date(persisted.expiresAt).getTime() - new Date(persisted.observedAt).getTime();
+    expect(persistedTtlMs).toBeLessThanOrEqual(3600 * 1000);
+    expect(persisted.expiresAt).not.toBe("2027-08-16T16:00:00.000Z");
     const runs = await ctx.db.select({ id: heartbeatRuns.id }).from(heartbeatRuns);
     expect(runs).toEqual([]);
   });
@@ -347,13 +353,9 @@ describeEmbeddedPostgres("pull agent lifecycle routes", () => {
   it("GET /companies/:companyId/agents embeds pullLifecycle only for pull agents", async () => {
     const { actor, agentId, companyId } = await seedAgent({
       executionModel: "pull",
-      pullLifecycle: {
-        source: "resident-seat",
-        state: "running",
-        observedAt: "2026-08-16T15:00:00.000Z",
-        expiresAt: "2027-08-16T16:00:00.000Z",
+      pullLifecycle: freshLease({
         evidence: [{ kind: "claim", id: "issue:COM-10564", active: true }],
-      },
+      }),
     });
     const pushId = randomUUID();
     await ctx.db.insert(agents).values({
@@ -507,6 +509,55 @@ describeEmbeddedPostgres("pull agent lifecycle routes", () => {
     ]);
   });
 
+  it("derives running from a live heartbeat run even when lastRunId still points at a finalized run", async () => {
+    const { actor, agentId, companyId } = await seedAgent();
+    const finishedId = randomUUID();
+    const liveId = randomUUID();
+    await ctx.db.insert(heartbeatRuns).values([
+      {
+        id: finishedId,
+        companyId,
+        agentId,
+        status: "succeeded",
+        finishedAt: new Date("2026-08-16T16:00:00.000Z"),
+      },
+      {
+        id: liveId,
+        companyId,
+        agentId,
+        status: "running",
+      },
+    ]);
+    await ctx.db.insert(agentTaskSessions).values({
+      companyId,
+      agentId,
+      adapterType: "process",
+      taskKey: "issue:COM-10564",
+      sessionDisplayId: "sess-stale-last-run",
+      lastRunId: finishedId,
+      updatedAt: new Date(),
+    });
+    const app = routeApp(ctx.db, actor, agentRoutes);
+    const res = await request(app).get(`/api/agents/${agentId}/lifecycle`);
+    expect(res.status).toBe(200);
+    expect(res.body.state).toBe("running");
+    expect(res.body.source).toBe("task_session");
+    expect(res.body.evidence).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "task_session",
+        id: "sess-stale-last-run",
+        active: false,
+        status: "succeeded",
+      }),
+      expect.objectContaining({
+        kind: "task_session",
+        id: liveId,
+        active: true,
+        status: "running",
+      }),
+    ]));
+  });
+
   it("derives running from a live heartbeat run attached to a task session", async () => {
     const { actor, agentId, companyId } = await seedAgent();
     const runId = randomUUID();
@@ -543,13 +594,7 @@ describeEmbeddedPostgres("pull agent lifecycle routes", () => {
   it("does not overwrite a paused agent from a stale running snapshot", async () => {
     const { agentId } = await seedAgent({
       executionModel: "pull",
-      pullLifecycle: {
-        source: "resident-seat",
-        state: "running",
-        observedAt: "2026-08-16T15:00:00.000Z",
-        expiresAt: "2027-08-16T16:00:00.000Z",
-        evidence: [{ kind: "external_lease", id: "vps-poller", active: true }],
-      },
+      pullLifecycle: freshLease(),
     });
     const [snapshot] = await ctx.db.select().from(agents).where(eq(agents.id, agentId));
     expect(snapshot?.status).toBe("idle");

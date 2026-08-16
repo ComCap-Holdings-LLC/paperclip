@@ -22,15 +22,16 @@ function lifecycle(state: PullAgentLifecycle["state"]): PullAgentLifecycle {
   };
 }
 
-const pushAgent = { status: "running", runtimeConfig: {} } as Pick<Agent, "status" | "runtimeConfig" | "pullLifecycle">;
-const pullRunning = {
+type RosterAgent = Pick<Agent, "status" | "runtimeConfig" | "pullLifecycle">;
+const pushAgent: RosterAgent = { status: "running", runtimeConfig: {} };
+const pullRunning: RosterAgent = {
   status: "idle",
-  runtimeConfig: { executionModel: "pull" as const },
+  runtimeConfig: { executionModel: "pull" },
   pullLifecycle: lifecycle("running"),
 };
-const pullStale = {
+const pullStale: RosterAgent = {
   status: "running",
-  runtimeConfig: { executionModel: "pull" as const, pull: { dispatchEnabled: false } },
+  runtimeConfig: { executionModel: "pull", pull: { dispatchEnabled: false } },
   pullLifecycle: lifecycle("unreachable"),
 };
 

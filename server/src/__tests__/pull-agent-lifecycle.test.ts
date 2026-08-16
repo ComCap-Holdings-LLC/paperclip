@@ -68,6 +68,38 @@ describe("derivePullAgentLifecycle", () => {
     expect(lifecycle.state).toBe("blocked");
   });
 
+  it("does not treat a far-future expiresAt as fresh past the lease cap", () => {
+    const lifecycle = derivePullAgentLifecycle({
+      runtimeConfig: { executionModel: "pull" },
+      storedReport: report({
+        observedAt: "2026-08-14T18:00:00.000Z",
+        expiresAt: "2027-08-14T20:00:00.000Z",
+        state: "running",
+      }),
+      queuedIssueCount: 0,
+      blockedIssueCount: 0,
+      now,
+    });
+
+    expect(lifecycle.state).toBe("unreachable");
+  });
+
+  it("still honors a far-future expiresAt until the observedAt plus max TTL", () => {
+    const lifecycle = derivePullAgentLifecycle({
+      runtimeConfig: { executionModel: "pull" },
+      storedReport: report({
+        observedAt: "2026-08-14T19:59:30.000Z",
+        expiresAt: "2027-08-14T20:00:00.000Z",
+        state: "running",
+      }),
+      queuedIssueCount: 0,
+      blockedIssueCount: 0,
+      now,
+    });
+
+    expect(lifecycle.state).toBe("running");
+  });
+
   it("marks an expired report unreachable", () => {
     const lifecycle = derivePullAgentLifecycle({
       runtimeConfig: { executionModel: "pull" },

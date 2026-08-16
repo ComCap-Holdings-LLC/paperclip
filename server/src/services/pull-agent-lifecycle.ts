@@ -11,11 +11,12 @@ import type {
 } from "@paperclipai/shared";
 
 const DEFAULT_PULL_LEASE_TTL_SEC = 120;
+const MAX_PULL_LEASE_TTL_SEC = 3600;
 const REPORT_STATE_KEY = "pullLifecycleReport";
 const REPORT_RUNTIME_KEY = "pullLifecycle";
 const NATIVE_SESSION_LIMIT = 20;
 const MUTABLE_AGENT_STATUS = new Set<AgentStatus>(["idle", "running", "error", "active"]);
-const LIVE_HEARTBEAT_RUN_STATUSES = new Set(["queued", "scheduled_retry", "running"]);
+const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "scheduled_retry", "running"] as const;
 
 interface StoredPullAgentLifecycleReport extends PullAgentLifecycleReport {
   observedAt: string;
@@ -55,10 +56,46 @@ export function resolveStoredPullReport(
   return asStoredReport(asRecord(runtimeConfig)[REPORT_RUNTIME_KEY]);
 }
 
-function isFreshLease(report: StoredPullAgentLifecycleReport | null, now: Date): boolean {
+function clampLeaseTtlSec(value: unknown): number {
+  const n = typeof value === "number" && Number.isFinite(value) ? Math.trunc(value) : DEFAULT_PULL_LEASE_TTL_SEC;
+  return Math.min(MAX_PULL_LEASE_TTL_SEC, Math.max(15, n));
+}
+
+function leaseTtlSecFor(runtimeConfig: AgentRuntimeConfig | undefined, override?: number): number {
+  return clampLeaseTtlSec(override ?? runtimeConfig?.pull?.leaseTtlSec ?? DEFAULT_PULL_LEASE_TTL_SEC);
+}
+
+function isFreshLease(
+  report: StoredPullAgentLifecycleReport | null,
+  now: Date,
+  maxTtlSec = MAX_PULL_LEASE_TTL_SEC,
+): boolean {
   if (!report) return false;
   const expiresAt = new Date(report.expiresAt);
-  return !Number.isNaN(expiresAt.getTime()) && expiresAt > now;
+  const observedAt = new Date(report.observedAt);
+  if (Number.isNaN(expiresAt.getTime()) || Number.isNaN(observedAt.getTime())) return false;
+  if (expiresAt <= now) return false;
+  const cap = new Date(observedAt.getTime() + clampLeaseTtlSec(maxTtlSec) * 1_000);
+  return now < cap;
+}
+
+function clampStoredLease(
+  report: StoredPullAgentLifecycleReport,
+  now: Date,
+  maxTtlSec: number,
+): StoredPullAgentLifecycleReport {
+  const observedAt = new Date(report.observedAt);
+  const expiresAt = new Date(report.expiresAt);
+  const observedMs = Number.isNaN(observedAt.getTime()) ? now.getTime() : observedAt.getTime();
+  const requestedExpiry = Number.isNaN(expiresAt.getTime())
+    ? observedMs + maxTtlSec * 1_000
+    : expiresAt.getTime();
+  const cappedExpiry = Math.min(requestedExpiry, observedMs + maxTtlSec * 1_000);
+  return {
+    ...report,
+    observedAt: new Date(observedMs).toISOString(),
+    expiresAt: new Date(cappedExpiry).toISOString(),
+  };
 }
 
 export function derivePullAgentLifecycle(input: {
@@ -77,7 +114,7 @@ export function derivePullAgentLifecycle(input: {
   const expiresAt = report ? new Date(report.expiresAt) : null;
   const now = input.now ?? new Date();
   const nativeEvidence = input.nativeEvidence ?? [];
-  const reportFresh = isFreshLease(report, now);
+  const reportFresh = isFreshLease(report, now, leaseTtlSecFor(input.runtimeConfig));
   const evidence = [...(reportFresh ? report?.evidence ?? [] : []), ...nativeEvidence];
   const nativeActive = nativeEvidence.some((item) => item.active);
 
@@ -135,40 +172,78 @@ export function pullAgentLifecycleService(db: Db) {
   }
 
   async function nativeEvidence(agent: typeof agents.$inferSelect, _now: Date) {
-    const rows = await db
-      .select({
-        id: agentTaskSessions.id,
-        taskKey: agentTaskSessions.taskKey,
-        sessionDisplayId: agentTaskSessions.sessionDisplayId,
-        updatedAt: agentTaskSessions.updatedAt,
-        lastError: agentTaskSessions.lastError,
-        runStatus: heartbeatRuns.status,
-        runFinishedAt: heartbeatRuns.finishedAt,
-      })
-      .from(agentTaskSessions)
-      .leftJoin(heartbeatRuns, eq(agentTaskSessions.lastRunId, heartbeatRuns.id))
-      .where(and(
-        eq(agentTaskSessions.companyId, agent.companyId),
-        eq(agentTaskSessions.agentId, agent.id),
-      ))
-      .orderBy(desc(agentTaskSessions.updatedAt))
-      .limit(NATIVE_SESSION_LIMIT);
-    return rows.map((row): PullAgentLifecycleEvidence => {
+    const [liveRuns, rows] = await Promise.all([
+      db
+        .select({
+          id: heartbeatRuns.id,
+          status: heartbeatRuns.status,
+          finishedAt: heartbeatRuns.finishedAt,
+          startedAt: heartbeatRuns.startedAt,
+          createdAt: heartbeatRuns.createdAt,
+        })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.companyId, agent.companyId),
+          eq(heartbeatRuns.agentId, agent.id),
+          inArray(heartbeatRuns.status, [...LIVE_HEARTBEAT_RUN_STATUSES]),
+        ))
+        .orderBy(desc(heartbeatRuns.createdAt))
+        .limit(NATIVE_SESSION_LIMIT),
+      db
+        .select({
+          id: agentTaskSessions.id,
+          taskKey: agentTaskSessions.taskKey,
+          sessionDisplayId: agentTaskSessions.sessionDisplayId,
+          lastRunId: agentTaskSessions.lastRunId,
+          updatedAt: agentTaskSessions.updatedAt,
+          lastError: agentTaskSessions.lastError,
+          runStatus: heartbeatRuns.status,
+          runFinishedAt: heartbeatRuns.finishedAt,
+        })
+        .from(agentTaskSessions)
+        .leftJoin(heartbeatRuns, eq(agentTaskSessions.lastRunId, heartbeatRuns.id))
+        .where(and(
+          eq(agentTaskSessions.companyId, agent.companyId),
+          eq(agentTaskSessions.agentId, agent.id),
+        ))
+        .orderBy(desc(agentTaskSessions.updatedAt))
+        .limit(NATIVE_SESSION_LIMIT),
+    ]);
+    const liveById = new Map(
+      liveRuns
+        .filter((run) => !run.finishedAt)
+        .map((run) => [run.id, run] as const),
+    );
+    const sessionEvidence = rows.map((row): PullAgentLifecycleEvidence => {
       const updatedAt = row.updatedAt instanceof Date ? row.updatedAt : new Date(row.updatedAt);
-      const liveRun = Boolean(
-        row.runStatus
-        && LIVE_HEARTBEAT_RUN_STATUSES.has(row.runStatus)
-        && !row.runFinishedAt,
-      );
+      const liveRun = Boolean(row.lastRunId && liveById.has(row.lastRunId));
       return {
         kind: "task_session",
         id: row.sessionDisplayId || row.taskKey || row.id,
         active: liveRun,
-        status: row.runStatus ?? (row.lastError ? "error" : "idle"),
+        status: liveRun
+          ? liveById.get(row.lastRunId!)?.status
+          : (row.runStatus ?? (row.lastError ? "error" : "idle")),
         observedAt: Number.isNaN(updatedAt.getTime()) ? undefined : updatedAt.toISOString(),
         detail: row.taskKey,
       };
     });
+    const covered = new Set(rows.map((row) => row.lastRunId).filter((id): id is string => Boolean(id)));
+    const liveRunEvidence = [...liveById.values()]
+      .filter((run) => !covered.has(run.id))
+      .map((run): PullAgentLifecycleEvidence => {
+        const observed = run.startedAt ?? run.createdAt;
+        const observedAt = observed instanceof Date ? observed : new Date(observed);
+        return {
+          kind: "task_session",
+          id: run.id,
+          active: true,
+          status: run.status,
+          observedAt: Number.isNaN(observedAt.getTime()) ? undefined : observedAt.toISOString(),
+          detail: "heartbeat_run",
+        };
+      });
+    return [...sessionEvidence, ...liveRunEvidence];
   }
 
   async function get(agent: typeof agents.$inferSelect, now = new Date()) {
@@ -210,9 +285,7 @@ export function pullAgentLifecycleService(db: Db) {
 
   async function report(agent: typeof agents.$inferSelect, input: PullAgentLifecycleReport, now = new Date()) {
     const runtimeConfig = agent.runtimeConfig as AgentRuntimeConfig;
-    const ttlSec = input.leaseTtlSec
-      ?? runtimeConfig.pull?.leaseTtlSec
-      ?? DEFAULT_PULL_LEASE_TTL_SEC;
+    const ttlSec = leaseTtlSecFor(runtimeConfig, input.leaseTtlSec);
     const stored: StoredPullAgentLifecycleReport = {
       ...input,
       observedAt: now.toISOString(),
@@ -267,9 +340,10 @@ export function pullAgentLifecycleService(db: Db) {
     now = new Date(),
   ) {
     const stored = resolveStoredPullReport(null, agent.runtimeConfig);
-    if (!stored || !isFreshLease(stored, now)) return reconcile(agent, now);
+    const ttlSec = leaseTtlSecFor(agent.runtimeConfig as AgentRuntimeConfig);
+    if (!stored || !isFreshLease(stored, now, ttlSec)) return reconcile(agent, now);
 
-    const patch = { [REPORT_STATE_KEY]: stored };
+    const patch = { [REPORT_STATE_KEY]: clampStoredLease(stored, now, ttlSec) };
     await db.insert(agentRuntimeState).values({
       agentId: agent.id,
       companyId: agent.companyId,

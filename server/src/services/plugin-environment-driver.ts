@@ -44,6 +44,7 @@ export interface ReadyPluginEnvironmentDriver {
   description?: string;
   configSchema: PluginEnvironmentDriverDeclaration["configSchema"];
   supportsReusableLeases?: PluginEnvironmentDriverDeclaration["supportsReusableLeases"];
+  sandboxCapabilities?: PluginEnvironmentDriverDeclaration["sandboxCapabilities"];
   supportsInteractiveSetup?: PluginEnvironmentDriverDeclaration["supportsInteractiveSetup"];
   interactiveSetupConnectionTypes?: PluginEnvironmentDriverDeclaration["interactiveSetupConnectionTypes"];
   supportsTemplateCapture?: PluginEnvironmentDriverDeclaration["supportsTemplateCapture"];
@@ -184,6 +185,7 @@ export async function listReadyPluginEnvironmentDrivers(input: {
           description: driver.description,
           configSchema: driver.configSchema,
           supportsReusableLeases: driver.supportsReusableLeases,
+          sandboxCapabilities: driver.sandboxCapabilities,
           supportsInteractiveSetup: driver.supportsInteractiveSetup,
           interactiveSetupConnectionTypes: driver.interactiveSetupConnectionTypes,
           supportsTemplateCapture: driver.supportsTemplateCapture,

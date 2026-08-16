@@ -1710,6 +1710,21 @@ function createSandboxEnvironmentDriver(
     },
   };
 
+  /**
+   * Verify that the live plugin worker still advertises a reusable-lease
+   * lifecycle method before the runtime dispatches that RPC. The worker reports
+   * `supportedMethods` from its discovery list on every start. A worker restart
+   * can drop a lifecycle method a reusable lease was created under. The runtime
+   * must not dispatch a lifecycle RPC the live worker does not advertise. It
+   * fails closed when the worker is absent or the method is stale, so a lease
+   * that a worker can no longer clean up goes to the cleanup reaper instead of
+   * a doomed RPC.
+   */
+  function pluginWorkerVerifiesLifecycleMethod(pluginId: string, method: string): boolean {
+    const advertised = pluginWorkerManager?.getWorker(pluginId)?.supportedMethods ?? [];
+    return advertised.includes(method);
+  }
+
   async function releasePluginBackedSandboxLease(
     input: EnvironmentDriverReleaseInput,
   ): Promise<EnvironmentLease | null> {
@@ -1718,7 +1733,12 @@ function createSandboxEnvironmentDriver(
     const providerKey = readString(metadata.provider);
 
     let cleanupStatus: "success" | "failed" = "success";
-    if (pluginId && providerKey && pluginWorkerManager?.isRunning(pluginId)) {
+    if (
+      pluginId &&
+      providerKey &&
+      pluginWorkerManager?.isRunning(pluginId) &&
+      pluginWorkerVerifiesLifecycleMethod(pluginId, "environmentReleaseLease")
+    ) {
       try {
         const config = await resolvePluginSandboxRuntimeConfig({
           environment: input.environment,
@@ -1765,7 +1785,12 @@ function createSandboxEnvironmentDriver(
       if (metadata.sandboxProviderPlugin) {
         const pluginId = readString(metadata.pluginId);
         const providerKey = readString(metadata.provider);
-        if (!pluginId || !providerKey || !pluginWorkerManager?.isRunning(pluginId)) {
+        if (
+          !pluginId ||
+          !providerKey ||
+          !pluginWorkerManager?.isRunning(pluginId) ||
+          !pluginWorkerVerifiesLifecycleMethod(pluginId, "environmentDestroyLease")
+        ) {
           cleanupStatus = "failed";
         } else {
           const config = await resolvePluginSandboxRuntimeConfig({

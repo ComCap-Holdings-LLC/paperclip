@@ -285,4 +285,17 @@ describe("a rejected capability resolution fails closed for persistent-session b
     const call = execute.mock.calls[0]![0] as { forceSession?: boolean };
     expect(call.forceSession).toBe(false);
   });
+
+  it("omits the native sync hooks when the resolution rejects", async () => {
+    // The worker advertises both sync verbs, but a rejected resolution must not
+    // read as an open grant. Fail closed and keep the base64 fallback, so an
+    // unverified provider never gets the native sync path.
+    const { target } = await buildSandboxTarget({
+      snapshot: null,
+      supportsSync: true,
+      rejectResolution: true,
+    });
+    expect(target.runner?.syncIn).toBeUndefined();
+    expect(target.runner?.syncOut).toBeUndefined();
+  });
 });

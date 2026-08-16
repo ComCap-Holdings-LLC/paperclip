@@ -275,11 +275,14 @@ export async function resolveEnvironmentExecutionTarget(input: {
     // Native file sync needs BOTH sync verbs: the runner exposes syncIn and
     // syncOut both-or-neither, so a consumer either uses the native path for
     // both directions or keeps the base64 fallback for both. When the snapshot
-    // removes either verb, keep the byte-identical base64 fallback. This
-    // preserves the existing reusable-lease sync enforcement unchanged.
+    // removes either verb, keep the byte-identical base64 fallback. When the
+    // resolution failed, fail closed and keep the base64 fallback too: an
+    // unverified provider never gets the native sync path. This preserves the
+    // existing reusable-lease sync enforcement unchanged.
     const nativeSyncAllowed =
-      !effectiveCapabilities ||
-      (effectiveCapabilities.nativeSyncIn && effectiveCapabilities.nativeSyncOut);
+      !capabilityResolutionFailed &&
+      (!effectiveCapabilities ||
+        (effectiveCapabilities.nativeSyncIn && effectiveCapabilities.nativeSyncOut));
     // The persistent-session output-streaming path needs the provider to keep a
     // persistent process session AND to run independent one-shot control
     // commands beside the long-lived agent command. When the snapshot removes

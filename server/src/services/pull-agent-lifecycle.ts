@@ -37,7 +37,7 @@ function asStoredReport(value: unknown): StoredPullAgentLifecycleReport | null {
 
 export function agentStatusFromPullLifecycle(state: PullAgentLifecycleState): AgentStatus | null {
   if (state === "running") return "running";
-  if (state === "idle" || state === "idle_queued") return "idle";
+  if (state === "idle" || state === "idle_queued" || state === "unreachable") return "idle";
   return null;
 }
 
@@ -214,5 +214,25 @@ export function pullAgentLifecycleService(db: Db) {
     return lifecycle;
   }
 
-  return { get, report };
+  async function reconcile(agent: typeof agents.$inferSelect, now = new Date()) {
+    const lifecycle = await get(agent, now);
+    await syncAgentStatus(agent, lifecycle, now);
+    return lifecycle;
+  }
+
+  async function reconcilePullAgents(
+    candidates: Array<typeof agents.$inferSelect>,
+    now = new Date(),
+  ) {
+    let reconciled = 0;
+    for (const agent of candidates) {
+      const runtimeConfig = agent.runtimeConfig as AgentRuntimeConfig;
+      if (runtimeConfig.executionModel !== "pull") continue;
+      await reconcile(agent, now);
+      reconciled += 1;
+    }
+    return reconciled;
+  }
+
+  return { get, report, reconcile, reconcilePullAgents };
 }

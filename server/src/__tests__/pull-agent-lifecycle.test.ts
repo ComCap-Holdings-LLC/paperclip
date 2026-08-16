@@ -113,6 +113,6 @@ describe("derivePullAgentLifecycle", () => {
     expect(agentStatusFromPullLifecycle("idle")).toBe("idle");
     expect(agentStatusFromPullLifecycle("idle_queued")).toBe("idle");
     expect(agentStatusFromPullLifecycle("blocked")).toBeNull();
-    expect(agentStatusFromPullLifecycle("unreachable")).toBeNull();
+    expect(agentStatusFromPullLifecycle("unreachable")).toBe("idle");
   });
 });

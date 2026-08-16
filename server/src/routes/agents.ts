@@ -2642,6 +2642,11 @@ export function agentRoutes(
     const items: InstanceSchedulerHeartbeatAgent[] = rows
       .map((row) => {
         const policy = parseSchedulerHeartbeatPolicy(row.runtimeConfig);
+        const runtime = asRecord(row.runtimeConfig) ?? {};
+        const pull = asRecord(runtime.pull) ?? {};
+        const executionModel = runtime.executionModel === "pull" ? "pull" : "push";
+        const pullDispatchEnabled = executionModel === "push"
+          || (parseBooleanLike(pull.dispatchEnabled) ?? false) === true;
         const statusEligible =
           row.status !== "paused" &&
           row.status !== "terminated" &&
@@ -2662,6 +2667,8 @@ export function agentRoutes(
           heartbeatEnabled: policy.enabled,
           schedulerActive: statusEligible && policy.enabled && policy.intervalSec > 0,
           lastHeartbeatAt: row.lastHeartbeatAt,
+          executionModel,
+          pullDispatchEnabled,
         };
       })
       .filter((item) =>
@@ -2938,7 +2945,7 @@ export function agentRoutes(
     if (!agent) return;
     if (!(await assertAgentReadAllowed(req, res, agent))) return;
 
-    res.json(await pullLifecycle.get(agent));
+    res.json(await pullLifecycle.reconcile(agent));
   });
 
   router.post(

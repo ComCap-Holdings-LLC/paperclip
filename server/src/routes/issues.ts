@@ -1847,16 +1847,27 @@ function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   // in the same request.
   if (input.requestAddsExplicitBlockers) return false;
   // Local-CLI agents post comments under user auth, so the actor.type is "user"
-  // even though the comment originates from the same heartbeat run that owns
-  // the issue lock. Without this guard, an agent that closes its own issue and
-  // then posts a follow-up comment in the same run silently reopens it.
-  // Suppress the implicit move whenever the comment's source run matches the
-  // issue's checkout/execution run.
-  if (
-    typeof input.actorRunId === "string"
-    && input.actorRunId.length > 0
-    && (input.actorRunId === input.checkoutRunId || input.actorRunId === input.executionRunId)
-  ) {
+  // even though the comment originates from a heartbeat run rather than a
+  // person. A run id on the comment is therefore the reliable machine-origin
+  // signal: genuine human comments are posted from a UI/API session with no
+  // run attached, automation always carries one.
+  //
+  // This guard used to only suppress the reopen when the comment's run MATCHED
+  // the issue's current checkout/execution run. That match is empty exactly
+  // when it matters most: `checkoutRunId`/`executionRunId` are cleared once a
+  // run finishes, and an issue sitting in `blocked` holds no checkout at all.
+  // So every post-run closeout comment compared against `null`, failed the
+  // match, was classified as human, and flipped the issue back to `todo` —
+  // which re-woke the assignee, which posted the next closeout comment. That
+  // self-feeding loop produced the COM-6073 churn (COM-11514): 286 comments,
+  // 148 of them explicitly restating an unchanged blocker, and 193 of the 208
+  // "user"-typed ones carrying a run id across 147 distinct runs, while the
+  // two real blockers went untouched.
+  //
+  // Suppress the implicit move for ANY run-attributed comment, whether or not
+  // that run still owns the issue. A machine closeout is never the "please
+  // continue" signal this path exists to honour.
+  if (typeof input.actorRunId === "string" && input.actorRunId.length > 0) {
     return false;
   }
   // Only human comments should implicitly reopen finished work.

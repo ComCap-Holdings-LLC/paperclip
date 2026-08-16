@@ -1365,7 +1365,13 @@ describe.sequential("issue comment reopen routes", () => {
     );
   });
 
-  it("still implicitly reopens done issues via POST comments when the comment runId differs from the issue's owning run", async () => {
+  // COM-11514 regression. Previously this asserted the opposite: a comment
+  // whose runId differed from the issue's owning run was treated as human and
+  // reopened the issue. That is exactly the COM-6073 churn loop — a finished
+  // run has its checkoutRunId/executionRunId cleared, so every machine
+  // closeout "differed" and re-woke the assignee, which posted the next
+  // closeout. Run-attributed comments must never implicitly reopen.
+  it("does not implicitly reopen done issues via POST comments when the comment carries any runId, even one that does not own the issue", async () => {
     mockIssueService.getById.mockResolvedValue({
       ...makeIssue("done"),
       checkoutRunId: "run-owning",
@@ -1385,12 +1391,74 @@ describe.sequential("issue comment reopen routes", () => {
       runId: "run-different",
     }))
       .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "Heartbeat closeout from a run that no longer owns the issue" });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.update).not.toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      expect.objectContaining({ status: "todo" }),
+    );
+  });
+
+  // The other half of the contract: a genuine human comment carries no run id
+  // at all, and must still reopen finished work.
+  it("still implicitly reopens done issues via POST comments when the comment carries no runId at all", async () => {
+    mockIssueService.getById.mockResolvedValue({
+      ...makeIssue("done"),
+      checkoutRunId: "run-owning",
+      executionRunId: "run-owning",
+    });
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue("done"),
+      ...patch,
+    }));
+
+    const res = await request(await installActor(createApp(), {
+      type: "board",
+      userId: "local-board",
+      companyIds: ["company-1"],
+      source: "local_implicit",
+      isInstanceAdmin: false,
+      runId: null,
+    }))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
       .send({ body: "Real human follow-up — please reopen" });
 
     expect(res.status).toBe(201);
     expect(mockIssueService.update).toHaveBeenCalledWith(
       "11111111-1111-4111-8111-111111111111",
       { status: "todo" },
+    );
+  });
+
+  // COM-11514: the churn happened on a `blocked` issue, which never holds a
+  // checkout run, so the old match-based guard could not fire at all there.
+  it("does not implicitly reopen blocked issues via POST comments when the comment carries a runId and the issue holds no checkout", async () => {
+    mockIssueService.getById.mockResolvedValue({
+      ...makeIssue("blocked"),
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue("blocked"),
+      ...patch,
+    }));
+
+    const res = await request(await installActor(createApp(), {
+      type: "board",
+      userId: "local-board",
+      companyIds: ["company-1"],
+      source: "local_implicit",
+      isInstanceAdmin: false,
+      runId: "run-heartbeat-closeout",
+    }))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "preservation only, still blocked — no new facts this run" });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.update).not.toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      expect.objectContaining({ status: "todo" }),
     );
   });
 

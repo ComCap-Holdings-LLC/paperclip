@@ -243,12 +243,27 @@ export async function resolveEnvironmentExecutionTarget(input: {
     // a recording tracer.
     const tracer = input.tracer ?? getStartupTracer();
 
+    // Resolve the read-only effective capability snapshot for this lease. The
+    // runtime resolves it as the provider declaration ∩ the verified worker
+    // methods ∩ narrowing. Freeze it so a consumer reads it but never changes
+    // it. A resolution failure leaves the snapshot absent, never a wrong grant.
+    const effectiveCapabilities =
+      input.environmentRuntime?.effectiveSandboxCapabilities && input.lease
+        ? await input.environmentRuntime
+            .effectiveSandboxCapabilities({
+              environment: input.environment as Environment,
+              lease: input.lease,
+            })
+            .catch(() => null)
+        : null;
+
     return {
       kind: "remote",
       transport: "sandbox",
       providerKey: parsed.config.provider,
       shellCommand,
       remoteCwd,
+      ...(effectiveCapabilities ? { effectiveCapabilities: Object.freeze({ ...effectiveCapabilities }) } : {}),
       environmentId: input.environment.id ?? null,
       leaseId: input.leaseId ?? null,
       timeoutMs,

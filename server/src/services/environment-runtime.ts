@@ -10,7 +10,10 @@ import type {
   IssueExecutionWorkspaceSettings,
   PluginEnvironmentConfig,
   SandboxEnvironmentConfig,
+  SandboxProviderCapabilities,
 } from "@paperclipai/shared";
+import { resolveDeclaredSandboxCapabilities } from "@paperclipai/shared";
+import type { EffectiveSandboxCapabilities } from "@paperclipai/adapter-utils/execution-target";
 import type {
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentExecuteResult,
@@ -59,6 +62,171 @@ import {
 } from "./plugin-environment-driver.js";
 import { collectSecretRefPaths } from "./json-schema-secret-refs.js";
 import { buildWorkspaceRealizationRecordFromDriverInput } from "./workspace-realization.js";
+
+// ---------------------------------------------------------------------------
+// Sandbox capability contract — one normalizer for both branches
+// ---------------------------------------------------------------------------
+
+export const SANDBOX_CAPABILITY_KEYS = [
+  "reusableLeases",
+  "nativeSyncIn",
+  "nativeSyncOut",
+  "concurrentSyncAndExec",
+  "concurrentSyncOperations",
+  "persistentProcessSessions",
+  "independentControlCommands",
+] as const;
+
+export type SandboxCapabilityKey = (typeof SANDBOX_CAPABILITY_KEYS)[number];
+
+/**
+ * Verified prerequisite mapping: the worker methods each capability requires.
+ *
+ * Each capability maps to a list of requirement groups. A group holds one or
+ * more verbs; the group is met when the runtime verified AT LEAST ONE verb in
+ * it. A capability verifies only when EVERY group is met.
+ *
+ * The verbs are the worker method names from the worker discovery list (the
+ * plugin worker reports them from `handleInitialize`). A built-in provider maps
+ * its own methods to the same verb names through
+ * {@link builtinSandboxProviderVerifiedMethods}, so both branches share this
+ * mapping and the one normalizer below.
+ *
+ * The mapping was audited against the worker discovery list and the runtime
+ * execution guards:
+ * - `nativeSyncIn`/`nativeSyncOut` require the matching sync verb; the native
+ *   sync guard checks both verbs before it routes a lease to the native hook.
+ * - `reusableLeases` requires `environmentResumeLease` (reattach) and
+ *   `environmentReleaseLease` (end-of-run release); both run on the reuse path.
+ * - `persistentProcessSessions` and `independentControlCommands` require
+ *   `environmentExecute`; both run commands through it.
+ * - `concurrentSyncOperations` requires both sync verbs.
+ * - `concurrentSyncAndExec` requires `environmentExecute` and at least one sync
+ *   verb.
+ */
+const SANDBOX_CAPABILITY_PREREQUISITE_METHODS: Record<SandboxCapabilityKey, readonly (readonly string[])[]> = {
+  reusableLeases: [["environmentResumeLease"], ["environmentReleaseLease"]],
+  nativeSyncIn: [["environmentSyncIn"]],
+  nativeSyncOut: [["environmentSyncOut"]],
+  concurrentSyncAndExec: [["environmentExecute"], ["environmentSyncIn", "environmentSyncOut"]],
+  concurrentSyncOperations: [["environmentSyncIn"], ["environmentSyncOut"]],
+  persistentProcessSessions: [["environmentExecute"]],
+  independentControlCommands: [["environmentExecute"]],
+};
+
+function capabilityIsVerified(
+  key: SandboxCapabilityKey,
+  verifiedMethods: ReadonlySet<string>,
+): boolean {
+  return SANDBOX_CAPABILITY_PREREQUISITE_METHODS[key].every((group) =>
+    group.some((verb) => verifiedMethods.has(verb)),
+  );
+}
+
+/**
+ * Map a built-in sandbox provider's own methods to the worker verb names the
+ * prerequisite mapping uses, so the built-in branch and the plug-in branch feed
+ * the SAME normalizer. A built-in provider has no native sync hooks, so it never
+ * verifies a sync verb. It verifies `environmentExecute` when it implements
+ * `execute`, and the reuse verbs only when it declares `supportsReusableLeases`.
+ */
+export function builtinSandboxProviderVerifiedMethods(
+  provider: { supportsReusableLeases?: boolean; execute?: unknown } | null | undefined,
+): string[] {
+  if (!provider) return [];
+  const methods: string[] = [];
+  if (typeof provider.execute === "function") {
+    methods.push("environmentExecute");
+  }
+  if (provider.supportsReusableLeases === true) {
+    methods.push("environmentResumeLease", "environmentReleaseLease");
+  }
+  return methods;
+}
+
+/**
+ * The one normalizer for the sandbox capability contract. It resolves the
+ * effective capability as verified ∩ declared ∩ narrowing.
+ *
+ * - `verifiedMethods` is the runtime's verified worker verb list (the plug-in
+ *   worker's `supportedMethods`, or a built-in provider mapped through
+ *   {@link builtinSandboxProviderVerifiedMethods}). A missing or empty list
+ *   verifies nothing, so every capability resolves `false` (fail closed).
+ * - `declared` is the provider's declaration. An absent flag defers to the
+ *   verified discovery baseline; it never grants a capability. A present flag
+ *   can only remove a verified capability, never add one.
+ * - `narrowing` is the per-target restriction from the config or lease. An
+ *   absent key applies no restriction; a `false` value removes the capability.
+ *
+ * A declaration never grants a capability the runtime did not verify, so a
+ * declared capability whose worker lacks a prerequisite verb resolves `false`.
+ */
+export function resolveEffectiveSandboxCapabilities(input: {
+  verifiedMethods?: readonly string[] | null;
+  declared?: Partial<SandboxProviderCapabilities> | null;
+  narrowing?: Partial<Record<SandboxCapabilityKey, boolean>> | null;
+}): EffectiveSandboxCapabilities {
+  const verifiedMethods = new Set(input.verifiedMethods ?? []);
+  const declared = input.declared ?? {};
+  const narrowing = input.narrowing ?? {};
+
+  const resolve = (key: SandboxCapabilityKey): boolean => {
+    const verified = capabilityIsVerified(key, verifiedMethods);
+    // An absent declaration defers to the verified baseline (true = no extra
+    // restriction). A present declaration can only narrow.
+    const declaredAllows = declared[key] ?? true;
+    // An absent narrowing applies no restriction.
+    const narrowingAllows = narrowing[key] ?? true;
+    return verified && declaredAllows && narrowingAllows;
+  };
+
+  return {
+    reusableLeases: resolve("reusableLeases"),
+    nativeSyncIn: resolve("nativeSyncIn"),
+    nativeSyncOut: resolve("nativeSyncOut"),
+    concurrentSyncAndExec: resolve("concurrentSyncAndExec"),
+    concurrentSyncOperations: resolve("concurrentSyncOperations"),
+    persistentProcessSessions: resolve("persistentProcessSessions"),
+    independentControlCommands: resolve("independentControlCommands"),
+  };
+}
+
+/**
+ * Build the per-target narrowing for a sandbox lease. Narrowing removes a
+ * capability that the provider verified and declared but that this specific
+ * lease or config cannot use. Each source is grounded in existing runtime
+ * behavior:
+ * - `reusableLeases` follows this lease's resolved policy (an ephemeral lease
+ *   never reuses).
+ * - a Kubernetes Job lease disables native sync (mirrors the native sync guard,
+ *   which falls back for a `job` backend or a `nativeFileSyncUnsupported` lease).
+ * - a session-based provider follows its `useSessions` config for persistent
+ *   process sessions (default off); a config without the key adds no narrowing.
+ */
+export function buildSandboxCapabilityNarrowing(input: {
+  leasePolicy?: EnvironmentLease["leasePolicy"] | null;
+  leaseMetadata?: Record<string, unknown> | null;
+  config?: Record<string, unknown> | null;
+}): Partial<Record<SandboxCapabilityKey, boolean>> {
+  const narrowing: Partial<Record<SandboxCapabilityKey, boolean>> = {};
+  const metadata = input.leaseMetadata ?? {};
+  const config = input.config ?? {};
+
+  narrowing.reusableLeases = input.leasePolicy === "reuse_by_environment";
+
+  if (metadata.backend === "job" || metadata.nativeFileSyncUnsupported === true) {
+    narrowing.nativeSyncIn = false;
+    narrowing.nativeSyncOut = false;
+    narrowing.concurrentSyncOperations = false;
+    narrowing.concurrentSyncAndExec = false;
+  }
+
+  if ("useSessions" in config) {
+    narrowing.persistentProcessSessions = config.useSessions === true;
+  }
+
+  return narrowing;
+}
 
 export function buildEnvironmentLeaseContext(input: {
   persistedExecutionWorkspace: Pick<ExecutionWorkspace, "id" | "mode"> | null;
@@ -243,6 +411,11 @@ export interface EnvironmentRuntimeDriver {
   syncOut?(input: EnvironmentDriverSyncInput): Promise<PluginEnvironmentSyncResult>;
   /** True when the lease's plugin worker advertises both sync verbs. */
   supportsSync?(input: EnvironmentDriverLeaseInput): boolean;
+  /**
+   * Resolve the read-only effective sandbox capability snapshot for a lease.
+   * Only the sandbox driver implements it; other drivers omit it.
+   */
+  effectiveSandboxCapabilities?(input: EnvironmentDriverLeaseInput): Promise<EffectiveSandboxCapabilities>;
 }
 
 export interface EnvironmentRuntimeLeaseRecord {
@@ -1437,6 +1610,62 @@ function createSandboxEnvironmentDriver(
       return await callPluginEnvironmentSync("environmentSyncOut", input);
     },
 
+    async effectiveSandboxCapabilities(input) {
+      const metadata = input.lease.metadata ?? {};
+      const providerKey =
+        readString(metadata.provider) ??
+        (input.environment.driver === "sandbox"
+          ? readString((parseEnvironmentDriverConfig(input.environment).config as SandboxEnvironmentConfig).provider)
+          : null);
+      if (!providerKey) {
+        return resolveEffectiveSandboxCapabilities({ verifiedMethods: [], declared: null, narrowing: null });
+      }
+
+      let declared: SandboxProviderCapabilities | null = null;
+      let verifiedMethods: readonly string[] = [];
+      let config: Record<string, unknown> = {};
+
+      if (metadata.sandboxProviderPlugin) {
+        const pluginId = readString(metadata.pluginId);
+        verifiedMethods =
+          (pluginId ? pluginWorkerManager?.getWorker(pluginId)?.supportedMethods : undefined) ?? [];
+        // Read the manifest declaration even when the worker is not running: an
+        // unverified declaration still resolves to false through the normalizer.
+        const resolvedDriver = await resolvePluginSandboxProviderDriverByKey({
+          db,
+          driverKey: providerKey,
+          workerManager: pluginWorkerManager,
+          requireRunning: false,
+        });
+        if (resolvedDriver) {
+          declared = resolveDeclaredSandboxCapabilities(resolvedDriver.driver);
+        }
+        try {
+          config = (await resolvePluginSandboxRuntimeConfig({
+            environment: input.environment,
+            lease: input.lease,
+            provider: providerKey,
+          })) as unknown as Record<string, unknown>;
+        } catch {
+          // Config resolution is best-effort narrowing input; leave it empty.
+        }
+      } else {
+        const builtin = getBuiltinSandboxProvider(providerKey);
+        verifiedMethods = builtinSandboxProviderVerifiedMethods(builtin);
+        declared = resolveDeclaredSandboxCapabilities({
+          supportsReusableLeases: builtin?.supportsReusableLeases,
+        });
+      }
+
+      const narrowing = buildSandboxCapabilityNarrowing({
+        leasePolicy: input.lease.leasePolicy,
+        leaseMetadata: metadata,
+        config,
+      });
+
+      return resolveEffectiveSandboxCapabilities({ verifiedMethods, declared, narrowing });
+    },
+
     async destroyRunLease(input) {
       return await destroyReusableSandboxLease({
         environment: input.environment,
@@ -2112,6 +2341,13 @@ export function environmentRuntimeService(
     supportsSync(input: EnvironmentDriverLeaseInput): boolean {
       const driver = getDriver(getLeaseDriverKey(input.lease, input.environment));
       return driver?.supportsSync?.(input) ?? false;
+    },
+
+    async effectiveSandboxCapabilities(
+      input: EnvironmentDriverLeaseInput,
+    ): Promise<EffectiveSandboxCapabilities | null> {
+      const driver = getDriver(getLeaseDriverKey(input.lease, input.environment));
+      return (await driver?.effectiveSandboxCapabilities?.(input)) ?? null;
     },
 
     async syncIn(input: EnvironmentDriverSyncInput): Promise<PluginEnvironmentSyncResult> {

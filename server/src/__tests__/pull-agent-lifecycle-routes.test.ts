@@ -208,7 +208,7 @@ describeEmbeddedPostgres("pull agent lifecycle routes", () => {
         source: "resident-seat",
         state: "running",
         observedAt: "2026-08-16T15:00:00.000Z",
-        expiresAt: "2026-08-16T16:00:00.000Z",
+        expiresAt: "2027-08-16T16:00:00.000Z",
         evidence: [{ kind: "external_lease", id: "vps-poller", active: true }],
       },
     });
@@ -287,7 +287,7 @@ describeEmbeddedPostgres("pull agent lifecycle routes", () => {
             source: "resident-seat",
             state: "running",
             observedAt: "2026-08-16T15:00:00.000Z",
-            expiresAt: "2026-08-16T16:00:00.000Z",
+            expiresAt: "2027-08-16T16:00:00.000Z",
             evidence: [{ kind: "external_lease", id: "vps-poller-4", active: true }],
           },
         },
@@ -345,7 +345,7 @@ describeEmbeddedPostgres("pull agent lifecycle routes", () => {
         source: "resident-seat",
         state: "running",
         observedAt: "2026-08-16T15:00:00.000Z",
-        expiresAt: "2026-08-16T16:00:00.000Z",
+        expiresAt: "2027-08-16T16:00:00.000Z",
         evidence: [{ kind: "claim", id: "issue:COM-10564", active: true }],
       },
     });
@@ -372,6 +372,8 @@ describeEmbeddedPostgres("pull agent lifecycle routes", () => {
       source: "resident-seat",
     });
     expect(pushRow.pullLifecycle).toBeUndefined();
+    const runs = await ctx.db.select({ id: heartbeatRuns.id }).from(heartbeatRuns);
+    expect(runs).toEqual([]);
   });
 
   it("PATCH /agents/:id cannot enable heartbeat on a pull agent without dispatchEnabled", async () => {

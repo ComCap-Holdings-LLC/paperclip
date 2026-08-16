@@ -150,6 +150,9 @@ export const agentStatusColor: Record<string, AgentBadgeColor> = {
   running: "blue",
   paused: "amber",
   error: "red",
+  idle_queued: "amber",
+  blocked: "red",
+  unreachable: "red",
 };
 
 export const agentStatusColorDefault: AgentBadgeColor = "gray";

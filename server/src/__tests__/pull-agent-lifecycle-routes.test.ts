@@ -373,4 +373,37 @@ describeEmbeddedPostgres("pull agent lifecycle routes", () => {
     });
     expect(pushRow.pullLifecycle).toBeUndefined();
   });
+
+  it("PATCH /agents/:id cannot enable heartbeat on a pull agent without dispatchEnabled", async () => {
+    const { actor, agentId } = await seedAgent({
+      executionModel: "pull",
+      pull: { dispatchEnabled: false },
+      heartbeat: { enabled: false },
+    });
+    const app = routeApp(ctx.db, actor, agentRoutes);
+    const patched = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({
+        runtimeConfig: {
+          executionModel: "pull",
+          pull: { dispatchEnabled: false },
+          heartbeat: { enabled: true, intervalSec: 120 },
+        },
+      });
+    expect(patched.status).toBe(200);
+    expect(patched.body.runtimeConfig).toMatchObject({
+      executionModel: "pull",
+      heartbeat: { enabled: false, intervalSec: 120 },
+    });
+    const stored = await ctx.db
+      .select({ runtimeConfig: agents.runtimeConfig })
+      .from(agents)
+      .then((rows) => rows[0]?.runtimeConfig as Record<string, unknown>);
+    expect(stored).toMatchObject({
+      executionModel: "pull",
+      heartbeat: { enabled: false },
+    });
+    const runs = await ctx.db.select({ id: heartbeatRuns.id }).from(heartbeatRuns);
+    expect(runs).toEqual([]);
+  });
 });

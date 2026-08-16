@@ -49,6 +49,7 @@ import {
   companySkillService,
   budgetService,
   heartbeatService,
+  applyPullHeartbeatWriteGuard,
   ISSUE_LIST_DEFAULT_LIMIT,
   issueApprovalService,
   issueRecoveryActionService,
@@ -1530,6 +1531,7 @@ export function agentRoutes(
     }
 
     normalizedRuntimeConfig.heartbeat = heartbeat;
+    Object.assign(normalizedRuntimeConfig, applyPullHeartbeatWriteGuard(normalizedRuntimeConfig));
 
     const parsedModelProfiles = asRecord(normalizedRuntimeConfig.modelProfiles);
     const modelProfiles = parsedModelProfiles ? { ...parsedModelProfiles } : {};
@@ -3741,12 +3743,13 @@ export function agentRoutes(
     }
     if (requestedRuntimeConfig) {
       const baseAdapterConfig = asRecord(patchData.adapterConfig) ?? asRecord(existing.adapterConfig) ?? {};
-      patchData.runtimeConfig = await normalizeRuntimeConfigAdapterConfigsForPersistence(
+      const normalized = await normalizeRuntimeConfigAdapterConfigsForPersistence(
         existing.companyId,
         requestedAdapterType,
         requestedRuntimeConfig,
         baseAdapterConfig,
       );
+      patchData.runtimeConfig = applyPullHeartbeatWriteGuard(normalized);
     }
     if (touchesAdapterConfiguration || Object.prototype.hasOwnProperty.call(patchData, "defaultEnvironmentId")) {
       await assertAgentDefaultEnvironmentSelection(

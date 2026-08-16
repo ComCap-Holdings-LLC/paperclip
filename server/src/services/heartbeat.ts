@@ -137,6 +137,17 @@ export function resolveAgentHeartbeatDispatchPolicy(runtimeConfig: unknown): {
     dispatchEnabled: pull.dispatchEnabled === true,
   };
 }
+
+/** Persist the pull default: heartbeat.enabled stays false unless dispatch is explicit. */
+export function applyPullHeartbeatWriteGuard(runtimeConfig: unknown): Record<string, unknown> {
+  const config = { ...parseObject(runtimeConfig) };
+  const policy = resolveAgentHeartbeatDispatchPolicy(config);
+  if (policy.executionModel !== "pull" || policy.dispatchEnabled) return config;
+  const heartbeat = { ...parseObject(config.heartbeat) };
+  heartbeat.enabled = false;
+  config.heartbeat = heartbeat;
+  return config;
+}
 import {
   ISSUE_NEW_INPUT_ACTIVITY_ACTIONS,
   ISSUE_PROGRESS_ACTIVITY_ACTIONS,

@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { resolveAgentHeartbeatDispatchPolicy } from "../services/heartbeat.js";
+import {
+  applyPullHeartbeatWriteGuard,
+  resolveAgentHeartbeatDispatchPolicy,
+} from "../services/heartbeat.js";
 
 describe("pull-agent heartbeat dispatch policy", () => {
   it("keeps existing push agents dispatchable", () => {
@@ -34,6 +37,29 @@ describe("pull-agent heartbeat dispatch policy", () => {
     })).toEqual({
       executionModel: "pull",
       dispatchEnabled: true,
+    });
+  });
+
+  it("clears heartbeat.enabled on pull writes unless dispatch is explicit", () => {
+    expect(applyPullHeartbeatWriteGuard({
+      executionModel: "pull",
+      heartbeat: { enabled: true, intervalSec: 300 },
+    })).toMatchObject({
+      executionModel: "pull",
+      heartbeat: { enabled: false, intervalSec: 300 },
+    });
+    expect(applyPullHeartbeatWriteGuard({
+      executionModel: "pull",
+      pull: { dispatchEnabled: true },
+      heartbeat: { enabled: true },
+    })).toMatchObject({
+      heartbeat: { enabled: true },
+    });
+    expect(applyPullHeartbeatWriteGuard({
+      executionModel: "push",
+      heartbeat: { enabled: true },
+    })).toMatchObject({
+      heartbeat: { enabled: true },
     });
   });
 });

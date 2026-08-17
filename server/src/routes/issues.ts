@@ -1979,6 +1979,47 @@ export async function findRedundantSelfDispositionComment(
   return { id: lastComment.id, body: lastComment.body };
 }
 
+// Entering `blocked` accepts four independent justifications (see the
+// "Entering blocked requires unresolved blockers, a pending
+// interaction/approval, or unblockDescriptor" gate). Leaving `blocked` via an
+// *implicit* comment reopen historically re-checked only the first of those
+// (`hasUnresolvedFirstClassBlockers`), so an issue blocked solely on an
+// unblockDescriptor, a pending interaction, or a pending approval was silently
+// moved to `todo` by a plain conversational comment. The blocked -> non-blocked
+// branch in the issue service then nulls `unblockDescriptor`,
+// `blockedTransitionAt`, and `blockedOwnerNotifiedAt`, so the provenance of the
+// block is destroyed with no way to recover who owed what. Mirror the entry
+// gate on the way out so the exit condition is as strict as the entry.
+//
+// This suppresses only the IMPLICIT move. An explicit `reopen: true` /
+// move-to-todo is a deliberate decision by the caller to discharge the block
+// and is still honoured.
+async function listLiveBlockedJustifications(input: {
+  db: Db;
+  companyId: string;
+  issueId: string;
+  unblockDescriptor: unknown;
+}): Promise<string[]> {
+  const [pendingInteraction, pendingApproval] = await Promise.all([
+    input.db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
+      eq(issueThreadInteractions.companyId, input.companyId),
+      eq(issueThreadInteractions.issueId, input.issueId),
+      eq(issueThreadInteractions.status, "pending"),
+    )).limit(1).then((rows: Array<{ id: string }>) => rows[0] ?? null),
+    input.db.select({ id: approvals.id }).from(issueApprovals)
+      .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id)).where(and(
+        eq(issueApprovals.companyId, input.companyId),
+        eq(issueApprovals.issueId, input.issueId),
+        eq(approvals.status, "pending"),
+      )).limit(1).then((rows: Array<{ id: string }>) => rows[0] ?? null),
+  ]);
+  const reasons: string[] = [];
+  if (input.unblockDescriptor) reasons.push("unblockDescriptor");
+  if (pendingInteraction) reasons.push("pendingInteraction");
+  if (pendingApproval) reasons.push("pendingApproval");
+  return reasons;
+}
+
 function shouldHumanCommentResumeInProgressScheduledRetry(input: {
   hasComment: boolean;
   issueStatus: string | null | undefined;
@@ -9018,6 +9059,18 @@ export function issueRoutes(
       isBlocked && effectiveMoveToTodoRequested
         ? (await svc.getDependencyReadiness(existing.id)).unresolvedBlockerCount > 0
         : false;
+    // Mirror the entering-blocked gate: an implicit comment reopen must not
+    // discharge a block that rests on a descriptor/interaction/approval.
+    const liveBlockedJustifications =
+      isBlocked && effectiveMoveToTodoRequested && !explicitMoveToTodoRequested && resumeRequested !== true
+        ? await listLiveBlockedJustifications({
+            db,
+            companyId: existing.companyId,
+            issueId: existing.id,
+            unblockDescriptor: existing.unblockDescriptor,
+          })
+        : [];
+    const blockedRetainedByJustification = liveBlockedJustifications.length > 0;
     if (resumeRequested === true && isBlocked && hasUnresolvedFirstClassBlockers) {
       res.status(409).json({ error: "Issue follow-up blocked by unresolved blockers" });
       return;
@@ -9089,6 +9142,7 @@ export function issueRoutes(
     if (
       commentBody &&
       effectiveMoveToTodoRequested &&
+      !blockedRetainedByJustification &&
       (isClosed || (isBlocked && !hasUnresolvedFirstClassBlockers) || shouldResumeInProgressScheduledRetry) &&
       updateFields.status === undefined
     ) {
@@ -9606,6 +9660,7 @@ export function issueRoutes(
     const reopened =
       commentBody &&
       effectiveMoveToTodoRequested &&
+      !blockedRetainedByJustification &&
       (isClosed || (isBlocked && !hasUnresolvedFirstClassBlockers)) &&
       previous.status !== undefined &&
       issue.status === "todo";
@@ -11603,6 +11658,18 @@ export function issueRoutes(
       isBlocked && effectiveMoveToTodoRequested
         ? (await svc.getDependencyReadiness(issue.id)).unresolvedBlockerCount > 0
         : false;
+    // Mirror the entering-blocked gate: an implicit comment reopen must not
+    // discharge a block that rests on a descriptor/interaction/approval.
+    const liveBlockedJustifications =
+      isBlocked && effectiveMoveToTodoRequested && !explicitMoveToTodoRequested && resumeRequested !== true
+        ? await listLiveBlockedJustifications({
+            db,
+            companyId: issue.companyId,
+            issueId: issue.id,
+            unblockDescriptor: issue.unblockDescriptor,
+          })
+        : [];
+    const blockedRetainedByJustification = liveBlockedJustifications.length > 0;
     if (resumeRequested === true && isBlocked && hasUnresolvedFirstClassBlockers) {
       res.status(409).json({ error: "Issue follow-up blocked by unresolved blockers" });
       return;
@@ -11658,6 +11725,7 @@ export function issueRoutes(
     let cancelledScheduledRetryRunId: string | null = null;
     if (
       effectiveMoveToTodoRequested &&
+      !blockedRetainedByJustification &&
       (isClosed || (isBlocked && !hasUnresolvedFirstClassBlockers) || shouldResumeInProgressScheduledRetry)
     ) {
       scheduledRetrySupersededByComment = shouldResumeInProgressScheduledRetry && issue.status === "in_progress";

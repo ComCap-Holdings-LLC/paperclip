@@ -1,0 +1,1 @@
+ALTER TABLE "agents" ADD COLUMN "execution_model" text DEFAULT 'dispatch' NOT NULL;

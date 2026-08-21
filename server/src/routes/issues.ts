@@ -1867,6 +1867,118 @@ function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   return true;
 }
 
+// Statuses where an actor re-asserting the same disposition on every wake is a
+// known churn pattern (an agent posting "still blocked" repeatedly with no new
+// blocker information). Scoped narrowly to the statuses where that pattern has
+// actually been observed, not every status a comment can land on.
+const REDUNDANT_DISPOSITION_COMMENT_STATUSES = new Set(["blocked", "done", "cancelled"]);
+const REDUNDANT_DISPOSITION_COMMENT_MIN_JACCARD = 0.92;
+const REDUNDANT_DISPOSITION_COMMENT_MAX_COMPARE_LENGTH = 4000;
+// Pure Jaccard-over-unique-tokens is diluted by shared boilerplate in a long,
+// template-shaped status comment: a single changed word (a named blocker, a
+// resource id, a person) can sit above the similarity threshold when it's
+// surrounded by 80+ unchanged tokens. A token *substitution* (one token
+// removed, a different one added) always has a symmetric-difference
+// footprint of at least 2, so capping the allowed symmetric difference at 1
+// blocks every substitution categorically — independent of overall
+// similarity — while still tolerating a single purely additive/subtractive
+// wording tweak (e.g. "No new blockers." -> "No new blockers found.").
+const REDUNDANT_DISPOSITION_COMMENT_MAX_DIFFERING_TOKENS = 1;
+
+function normalizeDispositionCommentText(body: string): string {
+  return body
+    .toLowerCase()
+    .replace(/```[\s\S]*?```/g, " ")
+    // Markdown decoration and general punctuation, including curly/em/en
+    // dashes and quotes, is stripped so wording that differs only in
+    // formatting (headings, bullets, a comma vs. an em dash, a trailing
+    // period) still normalizes to the same token stream.
+    .replace(/[`*_#>~"'“”‘’.,:;!?()[\]{}|/\\+=]/g, " ")
+    .replace(/[-–—]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Two comments are treated as "the same disposition, no new fact" when their
+// normalized text overlaps almost completely. This is a text-similarity
+// heuristic, not a semantic diff of blocker state — it exists specifically to
+// stop an actor from re-posting a near-identical "still blocked" comment on
+// every wake. Callers additionally require same-author and an unchanged
+// issue status before treating a match as redundant, which keeps the
+// heuristic's false-positive risk low.
+export function isNearDuplicateDispositionComment(a: string, b: string): boolean {
+  const normalizedA = normalizeDispositionCommentText(a).slice(0, REDUNDANT_DISPOSITION_COMMENT_MAX_COMPARE_LENGTH);
+  const normalizedB = normalizeDispositionCommentText(b).slice(0, REDUNDANT_DISPOSITION_COMMENT_MAX_COMPARE_LENGTH);
+  if (!normalizedA || !normalizedB) return false;
+  if (normalizedA === normalizedB) return true;
+  const tokensA = new Set(normalizedA.split(" ").filter((token) => token.length > 0));
+  const tokensB = new Set(normalizedB.split(" ").filter((token) => token.length > 0));
+  if (tokensA.size === 0 || tokensB.size === 0) return false;
+  let intersection = 0;
+  for (const token of tokensA) {
+    if (tokensB.has(token)) intersection += 1;
+  }
+  const union = tokensA.size + tokensB.size - intersection;
+  if (union === 0) return false;
+  // Symmetric difference = tokens unique to A + tokens unique to B. Checked
+  // in addition to the Jaccard ratio (not instead of it) so a short comment
+  // that changes most of its own words still fails on the ratio, while a
+  // long comment that changes only a couple of words still fails here even
+  // though its ratio clears the threshold.
+  const symmetricDifference = union - intersection;
+  if (symmetricDifference > REDUNDANT_DISPOSITION_COMMENT_MAX_DIFFERING_TOKENS) return false;
+  return intersection / union >= REDUNDANT_DISPOSITION_COMMENT_MIN_JACCARD;
+}
+
+// Finds the issue's most recent comment when it was authored by the same
+// actor now posting `commentBody`, the issue status has not moved off a
+// "closeout" status since, and the new text is a near-duplicate of that
+// prior comment. Callers use a match to skip creating a redundant comment
+// (and the wake it would otherwise trigger) instead of piling up
+// near-identical "still blocked" comments on every wake.
+export async function findRedundantSelfDispositionComment(
+  db: Db,
+  input: {
+    companyId: string;
+    issueId: string;
+    actorType: "agent" | "user";
+    actorId: string;
+    issueStatus: string | null | undefined;
+    commentBody: string;
+  },
+  // `body` is returned alongside `id` so a caller that suppresses on this
+  // match can log both the prior and new text without a second query — the
+  // suppression is otherwise silent and unauditable. See callers.
+): Promise<{ id: string; body: string } | null> {
+  if (!REDUNDANT_DISPOSITION_COMMENT_STATUSES.has(String(input.issueStatus ?? ""))) return null;
+
+  const lastComment = await db
+    .select({
+      id: issueComments.id,
+      body: issueComments.body,
+      authorUserId: issueComments.authorUserId,
+      authorAgentId: issueComments.authorAgentId,
+      deletedAt: issueComments.deletedAt,
+    })
+    .from(issueComments)
+    .where(and(eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId)))
+    .orderBy(desc(issueComments.createdAt))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+
+  if (!lastComment || lastComment.deletedAt) return null;
+
+  const sameActor =
+    input.actorType === "user"
+      ? Boolean(lastComment.authorUserId) && lastComment.authorUserId === input.actorId
+      : Boolean(lastComment.authorAgentId) && lastComment.authorAgentId === input.actorId;
+  if (!sameActor) return null;
+
+  if (!isNearDuplicateDispositionComment(lastComment.body, input.commentBody)) return null;
+
+  return { id: lastComment.id, body: lastComment.body };
+}
+
 function shouldHumanCommentResumeInProgressScheduledRetry(input: {
   hasComment: boolean;
   issueStatus: string | null | undefined;
@@ -9774,7 +9886,44 @@ export function issueRoutes(
 
     let comment = null;
     let lostReviewPathRef: string | null = null;
-    if (commentBody) {
+    const redundantSelfDispositionComment = commentBody
+      ? await findRedundantSelfDispositionComment(db, {
+        companyId: issue.companyId,
+        issueId: issue.id,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        issueStatus: existing.status,
+        commentBody,
+      })
+      : null;
+    if (redundantSelfDispositionComment) {
+      // The heuristic in isNearDuplicateDispositionComment is imperfect by
+      // nature (text similarity, not a semantic diff of blocker state), so a
+      // suppression is recorded here even though nothing else observes it —
+      // this is the only trace that a comment was dropped instead of
+      // posted, and it's what makes an incorrect suppression auditable
+      // after the fact rather than permanently invisible.
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.redundant_disposition_comment_suppressed",
+        entityType: "issue",
+        entityId: issue.id,
+        issueId: issue.id,
+        details: {
+          identifier: issue.identifier,
+          issueStatus: existing.status,
+          priorCommentId: redundantSelfDispositionComment.id,
+          priorCommentSnippet: redundantSelfDispositionComment.body.slice(0, 300),
+          suppressedCommentSnippet: commentBody.slice(0, 300),
+        },
+      });
+    }
+    if (commentBody && !redundantSelfDispositionComment) {
       const commentReferenceSummaryBefore = updateReferenceSummaryAfter
         ?? await issueReferencesSvc.listIssueReferenceSummary(issue.id);
       comment = await svc.addComment(id, commentBody, {

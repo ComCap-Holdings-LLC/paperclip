@@ -1874,6 +1874,16 @@ function shouldImplicitlyMoveCommentedIssueToTodo(input: {
 const REDUNDANT_DISPOSITION_COMMENT_STATUSES = new Set(["blocked", "done", "cancelled"]);
 const REDUNDANT_DISPOSITION_COMMENT_MIN_JACCARD = 0.92;
 const REDUNDANT_DISPOSITION_COMMENT_MAX_COMPARE_LENGTH = 4000;
+// Pure Jaccard-over-unique-tokens is diluted by shared boilerplate in a long,
+// template-shaped status comment: a single changed word (a named blocker, a
+// resource id, a person) can sit above the similarity threshold when it's
+// surrounded by 80+ unchanged tokens. A token *substitution* (one token
+// removed, a different one added) always has a symmetric-difference
+// footprint of at least 2, so capping the allowed symmetric difference at 1
+// blocks every substitution categorically — independent of overall
+// similarity — while still tolerating a single purely additive/subtractive
+// wording tweak (e.g. "No new blockers." -> "No new blockers found.").
+const REDUNDANT_DISPOSITION_COMMENT_MAX_DIFFERING_TOKENS = 1;
 
 function normalizeDispositionCommentText(body: string): string {
   return body
@@ -1910,6 +1920,13 @@ export function isNearDuplicateDispositionComment(a: string, b: string): boolean
   }
   const union = tokensA.size + tokensB.size - intersection;
   if (union === 0) return false;
+  // Symmetric difference = tokens unique to A + tokens unique to B. Checked
+  // in addition to the Jaccard ratio (not instead of it) so a short comment
+  // that changes most of its own words still fails on the ratio, while a
+  // long comment that changes only a couple of words still fails here even
+  // though its ratio clears the threshold.
+  const symmetricDifference = union - intersection;
+  if (symmetricDifference > REDUNDANT_DISPOSITION_COMMENT_MAX_DIFFERING_TOKENS) return false;
   return intersection / union >= REDUNDANT_DISPOSITION_COMMENT_MIN_JACCARD;
 }
 
@@ -1929,7 +1946,10 @@ export async function findRedundantSelfDispositionComment(
     issueStatus: string | null | undefined;
     commentBody: string;
   },
-): Promise<{ id: string } | null> {
+  // `body` is returned alongside `id` so a caller that suppresses on this
+  // match can log both the prior and new text without a second query — the
+  // suppression is otherwise silent and unauditable. See callers.
+): Promise<{ id: string; body: string } | null> {
   if (!REDUNDANT_DISPOSITION_COMMENT_STATUSES.has(String(input.issueStatus ?? ""))) return null;
 
   const lastComment = await db
@@ -1956,7 +1976,7 @@ export async function findRedundantSelfDispositionComment(
 
   if (!isNearDuplicateDispositionComment(lastComment.body, input.commentBody)) return null;
 
-  return { id: lastComment.id };
+  return { id: lastComment.id, body: lastComment.body };
 }
 
 function shouldHumanCommentResumeInProgressScheduledRetry(input: {
@@ -9876,6 +9896,33 @@ export function issueRoutes(
         commentBody,
       })
       : null;
+    if (redundantSelfDispositionComment) {
+      // The heuristic in isNearDuplicateDispositionComment is imperfect by
+      // nature (text similarity, not a semantic diff of blocker state), so a
+      // suppression is recorded here even though nothing else observes it —
+      // this is the only trace that a comment was dropped instead of
+      // posted, and it's what makes an incorrect suppression auditable
+      // after the fact rather than permanently invisible.
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.redundant_disposition_comment_suppressed",
+        entityType: "issue",
+        entityId: issue.id,
+        issueId: issue.id,
+        details: {
+          identifier: issue.identifier,
+          issueStatus: existing.status,
+          priorCommentId: redundantSelfDispositionComment.id,
+          priorCommentSnippet: redundantSelfDispositionComment.body.slice(0, 300),
+          suppressedCommentSnippet: commentBody.slice(0, 300),
+        },
+      });
+    }
     if (commentBody && !redundantSelfDispositionComment) {
       const commentReferenceSummaryBefore = updateReferenceSummaryAfter
         ?? await issueReferencesSvc.listIssueReferenceSummary(issue.id);

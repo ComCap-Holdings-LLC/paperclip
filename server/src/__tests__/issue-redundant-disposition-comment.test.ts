@@ -87,7 +87,10 @@ describe("findRedundantSelfDispositionComment", () => {
       commentBody: "Preservation only, still blocked on open review verdict.",
     });
 
-    expect(result).toEqual({ id: "comment-1" });
+    expect(result).toEqual({
+      id: "comment-1",
+      body: "Preservation only, still blocked on open review verdict.",
+    });
   });
 
   it("(b) negative control: returns null when the disposition/comment text changed", async () => {
@@ -196,6 +199,60 @@ describe("findRedundantSelfDispositionComment", () => {
       commentBody: "Preservation only, still blocked on open review verdict.",
     });
 
-    expect(result).toEqual({ id: "comment-1" });
+    expect(result).toEqual({
+      id: "comment-1",
+      body: "Preservation only, still blocked on open review verdict.",
+    });
+  });
+
+  // Sol's reproduced finding (adversarial review of the original PR): a
+  // long, information-dense status template where only the named blocking
+  // resource changes computed Jaccard = 0.935+ — above the 0.92 threshold —
+  // and was silently swallowed. Pure Jaccard-over-unique-tokens is diluted
+  // by shared boilerplate vocabulary in a long comment, so a few genuinely
+  // new content words (here: which system is actually blocking) get
+  // buried. This must never be suppressed, however similar the rest of the
+  // template reads.
+  it("does NOT suppress a long status comment when only the named blocker changes (Sol repro)", async () => {
+    const priorBody =
+      "Status update: this issue remains blocked pending an external approval that is outside our control. " +
+      "The deployment pipeline, the staging environment, and the automated test suite are all green and ready " +
+      "to proceed the moment the approval lands. We have escalated through the standard channel and pinged the " +
+      "owning team twice this week with no response yet. No code changes are needed on our side once the " +
+      "approval clears — the merge, deploy, and verification steps are all pre-staged and can run within " +
+      "minutes. We are specifically blocked on cloudflare token approval, which is required before the DNS " +
+      "record can be rotated safely. Will keep monitoring and post again once we hear back or after the next " +
+      "scheduled check-in.";
+    const newBody =
+      "Status update: this issue remains blocked pending an external approval that is outside our control. " +
+      "The deployment pipeline, the staging environment, and the automated test suite are all green and ready " +
+      "to proceed the moment the approval lands. We have escalated through the standard channel and pinged the " +
+      "owning team twice this week with no response yet. No code changes are needed on our side once the " +
+      "approval clears — the merge, deploy, and verification steps are all pre-staged and can run within " +
+      "minutes. We are specifically blocked on dwd scope approval, which is required before the DNS " +
+      "record can be rotated safely. Will keep monitoring and post again once we hear back or after the next " +
+      "scheduled check-in.";
+
+    // Confirm this pair is exactly the shape Sol reproduced: overall
+    // similarity clears the old bare-Jaccard threshold even though the
+    // blocking resource named in the comment is genuinely different.
+    expect(isNearDuplicateDispositionComment(priorBody, newBody)).toBe(false);
+
+    const db = fakeDbReturning([
+      {
+        id: "comment-1",
+        body: priorBody,
+        authorUserId: "user-1",
+        authorAgentId: null,
+        deletedAt: null,
+      },
+    ]);
+
+    const result = await findRedundantSelfDispositionComment(db, {
+      ...BASE_INPUT,
+      commentBody: newBody,
+    });
+
+    expect(result).toBeNull();
   });
 });

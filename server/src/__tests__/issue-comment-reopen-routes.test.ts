@@ -43,7 +43,18 @@ const mockTxInsert = vi.hoisted(() => vi.fn(() => ({ values: mockTxInsertValues 
 const mockTx = vi.hoisted(() => ({
   insert: mockTxInsert,
 }));
-const mockDbSelectOrderBy = vi.hoisted(() => vi.fn(async () => []));
+// `findRedundantSelfDispositionComment` chains `.orderBy(...).limit(1)` on
+// this call, so the mock must return a `.limit()`-bearing object rather than
+// a bare Promise, or that unrelated helper throws before the blocked-
+// justification logic under test ever runs.
+const mockDbSelectOrderBy = vi.hoisted(() => vi.fn(() => ({
+  limit: () => ({
+    then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+      Promise.resolve([]).then(onFulfilled, onRejected),
+  }),
+  then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+    Promise.resolve([]).then(onFulfilled, onRejected),
+})));
 // Rows returned by the `blocked` justification probes in
 // listLiveBlockedJustifications(). Keyed by drizzle table name so the two
 // probes (issue_thread_interactions / issue_approvals) can be driven
@@ -352,7 +363,14 @@ describe.sequential("issue comment reopen routes", () => {
     mockDb.transaction.mockReset();
     mockTxInsertValues.mockResolvedValue(undefined);
     mockTxInsert.mockImplementation(() => ({ values: mockTxInsertValues }));
-    mockDbSelectOrderBy.mockResolvedValue([]);
+    mockDbSelectOrderBy.mockImplementation(() => ({
+      limit: () => ({
+        then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+          Promise.resolve([]).then(onFulfilled, onRejected),
+      }),
+      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve([]).then(onFulfilled, onRejected),
+    }));
     mockLimitRowsByTable.clear();
     mockDbSelectWhere.mockImplementation(() => ({
       orderBy: mockDbSelectOrderBy,

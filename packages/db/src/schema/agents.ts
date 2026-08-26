@@ -23,6 +23,12 @@ export const agents = pgTable(
     status: text("status").notNull().default("idle"),
     reportsTo: uuid("reports_to").references((): AnyPgColumn => agents.id),
     capabilities: text("capabilities"),
+    // "dispatch" (default): Paperclip's heartbeat scheduler owns invocation, exactly today's
+    // behavior. "pull": an external, self-scheduling process (e.g. a resident seat) owns
+    // invocation and only reports liveness back to Paperclip; the scheduler must not dispatch
+    // runs to it. See doc/plans/2026-08-21-pull-agent-execution-model.md. This column is
+    // read-only surface area in this change — no dispatch/scheduler code path reads it yet.
+    executionModel: text("execution_model").notNull().default("dispatch"),
     adapterType: text("adapter_type").notNull().default("process"),
     adapterConfig: jsonb("adapter_config").$type<Record<string, unknown>>().notNull().default({}),
     runtimeConfig: jsonb("runtime_config").$type<Record<string, unknown>>().notNull().default({}),

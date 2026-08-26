@@ -392,3 +392,37 @@ how an "unmanaged local process is not a durable action path" (§8) already rule
 liveness claims for issues, this rules out unproven liveness claims for agents — but that doc edit
 is left for the follow-up PR that actually implements §5/§7, not this one, so the two changes land
 with their actual behavior rather than describing behavior that doesn't exist yet.
+
+## 10. Reconciliation note (added when §5/§7 landed)
+
+Two independent lines of work implemented this design in parallel and diverged from §2.1 in one
+concrete way, reconciled here so a future reader does not trust the column over the code:
+
+- `agents.execution_model` (the top-level `text` column, `default 'dispatch'`) landed exactly as
+  §2.1 describes: additive, default-preserving, and it does round-trip through every read path that
+  spreads the agent row (verified in that PR's own test).
+- The scheduler-skip (§5), the `PullAgentLifecycleCard`/roster UI (§4/§8), the CLI lease reporter,
+  and the dispatch-policy gate that actually blocks `claimQueuedRun`/`heartbeat.wakeup()` for a
+  pull-mode agent (`resolveAgentHeartbeatDispatchPolicy`, `server/src/services/pull-agent-dispatch.ts`)
+  all key off `agents.runtimeConfig.executionModel` (a JSON field inside the existing `runtimeConfig`
+  jsonb column), **not** the `agents.execution_model` column above. This was built against an older
+  base commit, before the column existed, and was not reconciled against it before this merge.
+
+**`agents.runtimeConfig.executionModel` is the field that is actually load-bearing today.** Setting
+`agents.execution_model` (the column) to `"pull"` does **not** disable heartbeat dispatch, does
+**not** change scheduler eligibility, and is not read by `pullAgentLifecycleService`, the roster, or
+any UI. The column is currently write-once-at-migration-default and otherwise inert — nothing in
+this codebase ever sets it away from `"dispatch"`. Anyone wiring a pull-mode agent (ComCap's bridge
+migration in §7 included) must set `runtimeConfig.executionModel = "pull"` (plus
+`runtimeConfig.pull.dispatchEnabled` / `runtimeConfig.pull.leaseTtlSec` as needed, see
+`pull-agent-dispatch.ts` and `pull-agent-lifecycle.ts`), not the column.
+
+This is flagged rather than silently fixed in this pass because reconciling the two — either by
+making the column the source of truth (would require rewiring every call site listed above and
+re-running their tests) or by dropping the now-redundant column — is itself a behavior-affecting
+change to code that already has upstream CI/review history, and is exactly the kind of change this
+repo's own contribution model asks to keep small and separately reviewable. Filed as a fast-follow:
+either (a) delete `agents.execution_model` as dead schema, or (b) have the two write sites that
+persist `runtimeConfig` (`server/src/routes/agents.ts` around the `applyPullHeartbeatWriteGuard`
+call sites) also mirror the resolved value onto the column, so a direct SQL/API read of the column
+is never stale. No behavior described elsewhere in this document changes as a result of this note.

@@ -161,6 +161,20 @@ export const ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_DAYS = 7;
 const ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_MS = ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 const ISSUE_CREATE_IDEMPOTENCY_KEY_CLEANUP_BATCH_SIZE = 500;
 const DELETED_ISSUE_COMMENT_BODY = "";
+// An issue can enter `in_progress` with no checkout run and no execution run
+// (most commonly: a checkout performed by a non-agent actor — e.g. a board
+// API token — which has no run id to attach; see `checkout()` and
+// `requireAgentRunId`). If the run that was meant to adopt the lock
+// (`adoptUnownedCheckoutRun`) never shows up, nothing can release the issue:
+// the assignee-only write boundary treats `in_progress` as held even though
+// no run holds it. `reapWedgedInProgressCheckouts` below recovers that case
+// on a time basis, since there is no live run to lease/heartbeat against.
+// Exported so the reap interval and tests can reference (or override) it.
+export const ISSUE_WEDGED_CHECKOUT_STALE_MS = 2 * 60 * 60 * 1000;
+// Sweep cadence for the reap above — same hourly shape as the other
+// interval-based background sweeps in `app.ts` (see
+// `IMPORT_TRANSFER_SPOOL_SWEEP_INTERVAL_MS`).
+export const ISSUE_WEDGED_CHECKOUT_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 const ISSUE_WAKE_DIAGNOSTICS_ACTIVITY_ACTIONS = ["issue.tree_hold_wakeup_deferred"] as const;
 
 function wakeRequestTargetsIssue(issueId: string) {
@@ -5361,6 +5375,95 @@ export function issueService(db: Db) {
     return { comment, parent };
   }
 
+  /**
+   * Finds issues wedged in `in_progress` with neither a checkout run nor an
+   * execution run, and have not been touched in at least `staleAfterMs`, and
+   * releases each one back to `todo` — clearing the assignee and run-lock
+   * columns, exactly like a normal `release()`. This is a time-based reap,
+   * not a lease/heartbeat expiry: there is no run id here to check for
+   * liveness in the first place (that case is already handled lazily by
+   * `clearCheckoutRunIfTerminal` / `clearExecutionRunIfTerminal` whenever a
+   * stored run id turns out to be terminal or missing). A short staleness
+   * window would fight a legitimate checkout still waiting for its run to
+   * attach, so the default favors safety over speed; see
+   * `ISSUE_WEDGED_CHECKOUT_STALE_MS`.
+   *
+   * Every candidate is re-verified under a row lock immediately before the
+   * write, so a concurrent adoption, release, or edit between the initial
+   * scan and the write wins over the reap.
+   */
+  async function reapWedgedInProgressCheckouts(
+    staleAfterMs: number = ISSUE_WEDGED_CHECKOUT_STALE_MS,
+  ): Promise<Array<{ id: string; companyId: string; identifier: string | null }>> {
+    const cutoff = new Date(Date.now() - staleAfterMs);
+    const candidates = await db
+      .select({ id: issues.id, companyId: issues.companyId, identifier: issues.identifier })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.status, "in_progress"),
+          isNull(issues.checkoutRunId),
+          isNull(issues.executionRunId),
+          lt(issues.updatedAt, cutoff),
+        ),
+      );
+    if (candidates.length === 0) return [];
+
+    const reaped: Array<{ id: string; companyId: string; identifier: string | null }> = [];
+    for (const candidate of candidates) {
+      const releasedAt = new Date();
+      const wasReleased = await db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select ${issues.id} from ${issues} where ${issues.id} = ${candidate.id} for update`,
+        );
+        const locked = await tx
+          .select({
+            status: issues.status,
+            checkoutRunId: issues.checkoutRunId,
+            executionRunId: issues.executionRunId,
+            updatedAt: issues.updatedAt,
+          })
+          .from(issues)
+          .where(eq(issues.id, candidate.id))
+          .then((rows) => rows[0] ?? null);
+        if (
+          !locked ||
+          locked.status !== "in_progress" ||
+          locked.checkoutRunId != null ||
+          locked.executionRunId != null ||
+          !locked.updatedAt ||
+          locked.updatedAt.getTime() > cutoff.getTime()
+        ) {
+          return false;
+        }
+        await tx
+          .update(issues)
+          .set({
+            status: "todo",
+            assigneeAgentId: null,
+            checkoutRunId: null,
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: releasedAt,
+          })
+          .where(eq(issues.id, candidate.id));
+        await tx.insert(issueComments).values({
+          companyId: candidate.companyId,
+          issueId: candidate.id,
+          authorType: "system",
+          body:
+            "Automatically released from a wedged `in_progress` state: no checkout run or "
+            + "execution run was ever recorded, and the issue had not been updated in over "
+            + `${Math.round(staleAfterMs / (60 * 60 * 1000))}h. Returned to \`todo\` for re-pickup.`,
+        });
+        return true;
+      });
+      if (wasReleased) reaped.push(candidate);
+    }
+    return reaped;
+  }
+
   async function archiveInbox(
     companyId: string,
     issueId: string,
@@ -7490,6 +7593,9 @@ export function issueService(db: Db) {
         blockedByIssueIds?: string[];
         actorAgentId?: string | null;
         actorUserId?: string | null;
+        /** Only consulted for the self-checkout-via-update guard below. */
+        actorType?: string | null;
+        actorRunId?: string | null;
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -7508,6 +7614,8 @@ export function issueService(db: Db) {
         blockedByIssueIds,
         actorAgentId,
         actorUserId,
+        actorType,
+        actorRunId,
         ...issueData
       } = data;
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
@@ -7547,6 +7655,29 @@ export function issueService(db: Db) {
       }
       if (patch.status === "in_progress" && !nextAssigneeAgentId && !nextAssigneeUserId) {
         throw unprocessable("in_progress issues require an assignee");
+      }
+      // Symmetry with the exit path: `assertAgentIssueMutationAllowed` already
+      // requires a live run id from an agent mutating its own `in_progress`
+      // issue. An agent self-checking-out *into* `in_progress` through this
+      // generic update — rather than `POST /issues/:id/checkout`, which
+      // already enforces this for agent actors — must carry the same live run
+      // id. This only fires for an agent assigning the issue to itself; it
+      // does not affect board/system/user actors, or an agent assigning a
+      // *different* agent (checkout is still the only path that can attach a
+      // run id it doesn't own). The actual patch.checkoutRunId stamp happens
+      // further down, after the assignee-change clear below, so that clear
+      // does not immediately wipe what this sets.
+      const enteringInProgress = patch.status === "in_progress" && existing.status !== "in_progress";
+      const selfCheckoutViaUpdate =
+        enteringInProgress &&
+        actorType === "agent" &&
+        Boolean(actorAgentId) &&
+        nextAssigneeAgentId === actorAgentId &&
+        !nextAssigneeUserId;
+      if (selfCheckoutViaUpdate && !actorRunId) {
+        throw unprocessable(
+          "in_progress requires a live run id when an agent checks itself out; use POST /issues/:id/checkout",
+        );
       }
       if (patch.status === "in_progress") {
         const dependencyReadiness = blockedByIssueIds === undefined
@@ -7650,6 +7781,15 @@ export function issueService(db: Db) {
         patch.executionRunId = null;
         patch.executionAgentNameKey = null;
         patch.executionLockedAt = null;
+      }
+      // Applied last so neither clear above can wipe it: a self-checkout via
+      // update (validated further up) always carries a live run id by this
+      // point, so it always becomes the checkout/execution lock — the same
+      // fields a real `POST /issues/:id/checkout` would set.
+      if (selfCheckoutViaUpdate && actorRunId) {
+        patch.checkoutRunId = actorRunId;
+        patch.executionRunId = actorRunId;
+        patch.executionLockedAt = patch.updatedAt;
       }
 
       const runUpdate = async (tx: any) => {
@@ -8435,6 +8575,8 @@ export function issueService(db: Db) {
           },
         };
       }),
+
+    reapWedgedInProgressCheckouts,
 
     listLabels: (companyId: string) =>
       db.select().from(labels).where(eq(labels.companyId, companyId)).orderBy(asc(labels.name), asc(labels.id)),

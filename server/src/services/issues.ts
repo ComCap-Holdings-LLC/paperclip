@@ -7490,6 +7490,10 @@ export function issueService(db: Db) {
         blockedByIssueIds?: string[];
         actorAgentId?: string | null;
         actorUserId?: string | null;
+        // COM-12697: optional compare-and-swap guard, mirroring checkout's
+        // expectedStatuses. Never persisted -- stripped before the DB patch
+        // is built, same as labelIds/blockedByIssueIds/actorAgentId/actorUserId.
+        expectedStatuses?: string[];
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -7508,8 +7512,24 @@ export function issueService(db: Db) {
         blockedByIssueIds,
         actorAgentId,
         actorUserId,
+        expectedStatuses,
         ...issueData
       } = data;
+      // COM-12697: compare-and-swap guard, mirroring checkout's expectedStatuses.
+      // Called twice -- once here against the cheap unlocked `existing` read (a
+      // fast rejection for the common case), and again, authoritatively, in
+      // runUpdate() against the row read under `.for("update")` -- so both call
+      // sites throw the identical shape.
+      const assertExpectedStatus = (currentStatus: string) => {
+        if (expectedStatuses && expectedStatuses.length > 0 && !expectedStatuses.includes(currentStatus)) {
+          throw conflict("Issue status has changed since it was read", {
+            issueId: id,
+            expectedStatuses,
+            currentStatus,
+          });
+        }
+      };
+      assertExpectedStatus(existing.status);
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
@@ -7663,6 +7683,10 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        // COM-12697: this is the actual compare-and-swap boundary -- the row
+        // lock above closes the race the pre-check above cannot (another
+        // writer landing between that unlocked read and this transaction).
+        assertExpectedStatus(receiptExisting.status);
         const [previousLabelsByIssueId, previousRelationSummaries] = await Promise.all([
           nextLabelIds !== undefined
             ? labelMapForIssues(tx, [id])

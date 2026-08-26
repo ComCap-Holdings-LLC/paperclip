@@ -5797,6 +5797,148 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
   });
 });
 
+describeEmbeddedPostgres("issueService.update expectedStatuses (CAS guard)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-cas-guard-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    // activityLog before issues/companies: update()'s status-transition side
+    // effects can insert rows FK'd to both (see the sibling
+    // "issueService.clearExecutionRunIfTerminal" describe block above, which
+    // deletes in the same order for the same reason).
+    await db.delete(activityLog);
+    await db.delete(issues);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  it("rejects with 409 and leaves the row untouched when expectedStatuses no longer matches", async () => {
+    // COM-12697: PATCH /issues/:id had no CAS primitive, unlike checkout's
+    // existing expectedStatuses -- so a caller doing read-then-conditionally-
+    // write (e.g. the unblock poller) could silently clobber a concurrent
+    // status change. update() now accepts the same expectedStatuses guard,
+    // checked both as a cheap early rejection and, authoritatively, under the
+    // same row lock ("for update") that the write itself takes.
+    //
+    // This exercises the cheap pre-check (existing.status read before the
+    // transaction opens); it cannot deterministically exercise the narrower
+    // window the authoritative in-transaction check alone closes (another
+    // writer landing between that unlocked read and the row lock) without a
+    // dependency-injected delay this service does not expose. That residual
+    // gap matches the ticket's own framing -- a narrow, no-known-incident race.
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "CAS guard issue",
+      status: "blocked",
+      priority: "medium",
+    });
+
+    await expect(
+      svc.update(issueId, { expectedStatuses: ["todo"], priority: "high" }),
+    ).rejects.toMatchObject({
+      status: 409,
+      details: { issueId, expectedStatuses: ["todo"], currentStatus: "blocked" },
+    });
+
+    const row = await db
+      .select({ status: issues.status, priority: issues.priority })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toMatchObject({ status: "blocked", priority: "medium" });
+
+    const matching = await svc.update(issueId, { expectedStatuses: ["blocked"], priority: "high" });
+    expect(matching?.priority).toBe("high");
+  });
+
+  it("closes the TOCTOU window: a status change that lands after the unlocked pre-check still trips the row-locked authoritative check", async () => {
+    // Fable review (xreview, correctness lens): the cheap pre-check above
+    // proves nothing about the actual CAS boundary, which is the row-locked
+    // read inside runUpdate()'s transaction. This deterministically forces
+    // the race the pre-check cannot see: a second transaction holds
+    // `SELECT ... FOR UPDATE` on the row (so its status is still "todo" when
+    // update()'s unlocked pre-check runs and passes), commits a status
+    // change to "in_progress" only once update()'s own `.for("update")` is
+    // already blocked waiting on the lock, then releases. If the
+    // authoritative check were missing (or used the stale pre-check value
+    // instead of re-reading under the lock), this update would wrongly
+    // succeed instead of rejecting with the POST-change status.
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "CAS guard TOCTOU issue",
+      status: "todo",
+      priority: "medium",
+    });
+
+    const rowLocked = deferred<void>();
+    const canCommitStatusChange = deferred<void>();
+
+    const concurrentStatusChange = db.transaction(async (tx) => {
+      await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`);
+      rowLocked.resolve();
+      await canCommitStatusChange.promise;
+      await tx.update(issues).set({ status: "in_progress", assigneeAgentId: null }).where(eq(issues.id, issueId));
+    });
+
+    await rowLocked.promise;
+
+    const updatePromise = svc.update(issueId, { expectedStatuses: ["todo"], priority: "high" });
+    // This ordering is not just "likely" -- it's guaranteed by transaction
+    // visibility. The concurrent transaction's status write hasn't executed
+    // yet (it's blocked on canCommitStatusChange), so under Postgres's
+    // default READ COMMITTED isolation there is no committed value for any
+    // other session to observe as anything but "todo" until we resolve it
+    // below. update()'s unlocked pre-check (an ordinary SELECT, no FOR
+    // UPDATE) is therefore structurally unable to see "in_progress" -- it can
+    // only ever read "todo" and pass, so the eventual 409 this test asserts
+    // can only come from the authoritative check inside runUpdate()'s
+    // `.for("update")`, which blocks here until we release the lock.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    canCommitStatusChange.resolve();
+    await concurrentStatusChange;
+
+    await expect(updatePromise).rejects.toMatchObject({
+      status: 409,
+      details: { issueId, expectedStatuses: ["todo"], currentStatus: "in_progress" },
+    });
+
+    const row = await db
+      .select({ status: issues.status, priority: issues.priority })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toMatchObject({ status: "in_progress", priority: "medium" });
+  });
+});
+
 describeEmbeddedPostgres("accepted plan decomposition", () => {
   let db!: ReturnType<typeof createDb>;
   let svc!: ReturnType<typeof issueService>;

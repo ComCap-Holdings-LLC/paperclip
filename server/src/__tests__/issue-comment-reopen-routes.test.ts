@@ -43,13 +43,67 @@ const mockTxInsert = vi.hoisted(() => vi.fn(() => ({ values: mockTxInsertValues 
 const mockTx = vi.hoisted(() => ({
   insert: mockTxInsert,
 }));
-const mockDbSelectOrderBy = vi.hoisted(() => vi.fn(async () => []));
-const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
-  orderBy: mockDbSelectOrderBy,
+// `findRedundantSelfDispositionComment` chains `.orderBy(...).limit(1)` on
+// this call, so the mock must return a `.limit()`-bearing object rather than
+// a bare Promise, or that unrelated helper throws before the blocked-
+// justification logic under test ever runs.
+const mockDbSelectOrderBy = vi.hoisted(() => vi.fn(() => ({
+  limit: () => ({
+    then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+      Promise.resolve([]).then(onFulfilled, onRejected),
+  }),
   then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
     Promise.resolve([]).then(onFulfilled, onRejected),
 })));
-const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockDbSelectWhere })));
+// Rows returned by the `blocked` justification probes in
+// listLiveBlockedJustifications(). Keyed by drizzle table name so the two
+// probes (issue_thread_interactions / issue_approvals) can be driven
+// independently even though they are issued together inside a Promise.all.
+const mockLimitRowsByTable = vi.hoisted(() => new Map<string, unknown[]>());
+const drizzleTableName = vi.hoisted(() => (table: unknown): string => {
+  if (!table || typeof table !== "object") return "";
+  const sym = Object.getOwnPropertySymbols(table)
+    .find((s) => s.description === "drizzle:Name");
+  return sym ? String((table as Record<symbol, unknown>)[sym]) : "";
+});
+const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
+  orderBy: mockDbSelectOrderBy,
+  limit: () => ({
+    then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+      Promise.resolve([]).then(onFulfilled, onRejected),
+  }),
+  then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+    Promise.resolve([]).then(onFulfilled, onRejected),
+})));
+const mockDbSelectFrom = vi.hoisted(() => vi.fn((table: unknown) => {
+  const rows = mockLimitRowsByTable.get(drizzleTableName(table)) ?? [];
+  return {
+    where: (...args: unknown[]) => ({
+      ...(mockDbSelectWhere as (...a: unknown[]) => Record<string, unknown>)(...args),
+      limit: () => ({
+        then: (
+          onFulfilled: (r: unknown[]) => unknown,
+          onRejected?: (reason: unknown) => unknown,
+        ) => Promise.resolve(rows).then(onFulfilled, onRejected),
+      }),
+    }),
+    // `issue_approvals` joins `approvals`; the joined-table rows are keyed off
+    // the join target so a pending approval can be simulated.
+    innerJoin: (joined: unknown) => {
+      const joinedRows = mockLimitRowsByTable.get(drizzleTableName(joined)) ?? [];
+      return {
+        where: () => ({
+          limit: () => ({
+            then: (
+              onFulfilled: (r: unknown[]) => unknown,
+              onRejected?: (reason: unknown) => unknown,
+            ) => Promise.resolve(joinedRows).then(onFulfilled, onRejected),
+          }),
+        }),
+      };
+    },
+  };
+}));
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
 const mockDb = vi.hoisted(() => ({
   select: mockDbSelect,
@@ -309,13 +363,51 @@ describe.sequential("issue comment reopen routes", () => {
     mockDb.transaction.mockReset();
     mockTxInsertValues.mockResolvedValue(undefined);
     mockTxInsert.mockImplementation(() => ({ values: mockTxInsertValues }));
-    mockDbSelectOrderBy.mockResolvedValue([]);
-    mockDbSelectWhere.mockImplementation(() => ({
-      orderBy: mockDbSelectOrderBy,
+    mockDbSelectOrderBy.mockImplementation(() => ({
+      limit: () => ({
+        then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+          Promise.resolve([]).then(onFulfilled, onRejected),
+      }),
       then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
         Promise.resolve([]).then(onFulfilled, onRejected),
     }));
-    mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
+    mockLimitRowsByTable.clear();
+    mockDbSelectWhere.mockImplementation(() => ({
+      orderBy: mockDbSelectOrderBy,
+      limit: () => ({
+        then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+          Promise.resolve([]).then(onFulfilled, onRejected),
+      }),
+      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve([]).then(onFulfilled, onRejected),
+    }));
+    mockDbSelectFrom.mockImplementation((table: unknown) => {
+      const rows = mockLimitRowsByTable.get(drizzleTableName(table)) ?? [];
+      return {
+        where: (...args: unknown[]) => ({
+          ...mockDbSelectWhere(...(args as [])),
+          limit: () => ({
+            then: (
+              onFulfilled: (r: unknown[]) => unknown,
+              onRejected?: (reason: unknown) => unknown,
+            ) => Promise.resolve(rows).then(onFulfilled, onRejected),
+          }),
+        }),
+        innerJoin: (joined: unknown) => {
+          const joinedRows = mockLimitRowsByTable.get(drizzleTableName(joined)) ?? [];
+          return {
+            where: () => ({
+              limit: () => ({
+                then: (
+                  onFulfilled: (r: unknown[]) => unknown,
+                  onRejected?: (reason: unknown) => unknown,
+                ) => Promise.resolve(joinedRows).then(onFulfilled, onRejected),
+              }),
+            }),
+          };
+        },
+      };
+    });
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
     mockDb.transaction.mockImplementation(async (fn: (tx: typeof mockTx) => Promise<unknown>) => fn(mockTx));
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
@@ -907,6 +999,132 @@ describe.sequential("issue comment reopen routes", () => {
         }),
       }),
     ));
+  });
+
+  // --- COM-11584 regression -------------------------------------------------
+  // Entering `blocked` is permitted on four independent grounds: unresolved
+  // first-class blockers, a pending thread interaction, a pending approval, or
+  // an `unblockDescriptor`. The implicit comment reopen only ever re-checked
+  // the first, so a plain conversational comment on an issue blocked solely on
+  // one of the other three silently moved it to `todo` and the service's
+  // blocked -> non-blocked branch then nulled `unblockDescriptor`,
+  // `blockedTransitionAt` and `blockedOwnerNotifiedAt`, destroying the
+  // provenance of the block. Observed live on COM-8279.
+
+  it("does not clear a descriptor-only block via a POST comment (COM-11584)", async () => {
+    const issue = { ...makeIssue("blocked"), unblockDescriptor: { owner: { agentId: "22222222-2222-4222-8222-222222222222" }, action: "Aron/Mac unload" } };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+    }));
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "just checking in" });
+
+    expect(res.status).toBe(201);
+    // The block survives: no status write at all, so the service never runs the
+    // branch that nulls unblockDescriptor/blockedTransitionAt.
+    expect(mockIssueService.update).not.toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      expect.objectContaining({ status: "todo" }),
+    );
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ reason: "issue_reopened_via_comment" }),
+    );
+  });
+
+  it("does not clear an interaction-only block via a POST comment (COM-11584)", async () => {
+    const issue = { ...makeIssue("blocked"), unblockDescriptor: null };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockLimitRowsByTable.set("issue_thread_interactions", [{ id: "interaction-1" }]);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+    }));
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "just checking in" });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.update).not.toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      expect.objectContaining({ status: "todo" }),
+    );
+  });
+
+  it("does not clear an approval-only block via a POST comment (COM-11584)", async () => {
+    const issue = { ...makeIssue("blocked"), unblockDescriptor: null };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockLimitRowsByTable.set("approvals", [{ id: "approval-1" }]);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+    }));
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "just checking in" });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.update).not.toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      expect.objectContaining({ status: "todo" }),
+    );
+  });
+
+  it("still honours an EXPLICIT reopen on a descriptor-only block (COM-11584)", async () => {
+    const issue = { ...makeIssue("blocked"), unblockDescriptor: { owner: { agentId: "22222222-2222-4222-8222-222222222222" }, action: "Aron/Mac unload" } };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) =>
+      makeIssueUpdateReceipt(issue as ReturnType<typeof makeIssue>, patch));
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ comment: "the unload is done, please continue", reopen: true });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      expect.objectContaining({ status: "todo" }),
+    );
+  });
+
+  it("does not clear a descriptor-only block via the PATCH comment path (COM-11584)", async () => {
+    const issue = { ...makeIssue("blocked"), unblockDescriptor: { owner: { agentId: "22222222-2222-4222-8222-222222222222" }, action: "Aron/Mac unload" } };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) =>
+      makeIssueUpdateReceipt(issue as ReturnType<typeof makeIssue>, patch));
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ comment: "what is the status here?" });
+
+    expect(res.status).toBe(200);
+    const patches = mockIssueService.update.mock.calls.map((call: unknown[]) => call[1]);
+    expect(patches.every((p: Record<string, unknown>) => p.status !== "todo")).toBe(true);
+  });
+
+  it("still reopens a blocked issue with NO live justification (COM-11584 guard is narrow)", async () => {
+    const issue = { ...makeIssue("blocked"), unblockDescriptor: null };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+    }));
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "please continue" });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      { status: "todo" },
+    );
   });
 
   it("moves in-progress issues with a scheduled retry back to todo via POST human comments", async () => {

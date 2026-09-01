@@ -28,7 +28,10 @@ async function readPostgresClock(tx: Pick<Db, "execute">): Promise<Date> {
   const rows = Array.from(await tx.execute(sql<{ observedAt: Date | string }>`
     select clock_timestamp() as "observedAt"
   `));
-  const observedAt = new Date(rows[0]?.observedAt ?? "");
+  // Drizzle's generic execute result is exposed as an unknown row shape here;
+  // the SQL alias above is the narrow, runtime-validated boundary we consume.
+  const observedAtValue = rows[0]?.observedAt as Date | string | undefined;
+  const observedAt = new Date(observedAtValue ?? "");
   if (Number.isNaN(observedAt.getTime())) throw new Error("database clock returned an invalid timestamp");
   return observedAt;
 }

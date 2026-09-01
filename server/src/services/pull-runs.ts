@@ -1,4 +1,4 @@
-import { and, eq, gt, inArray, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, heartbeatRuns, issues } from "@paperclipai/db";
 import { badRequest, conflict, forbidden, notFound } from "../errors.js";
@@ -35,6 +35,12 @@ export function pullRunService(db: Db) {
 
   async function expireRun(runId: string, now = new Date()) {
     return db.transaction(async (tx) => {
+      // Lifecycle operations always lock issue before run.  The issue service's
+      // checkout/adoption paths use the same order, avoiding a run->issue
+      // deadlock when expiry races a checkout-owner assertion.
+      await tx.execute(
+        sql`select ${issues.id} from ${issues} where ${issues.checkoutRunId} = ${runId} or ${issues.executionRunId} = ${runId} order by ${issues.id} for update`,
+      );
       await tx.execute(
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${runId} for update`,
       );
@@ -73,6 +79,23 @@ export function pullRunService(db: Db) {
         .where(and(eq(issues.checkoutRunId, run.id), eq(issues.executionRunId, run.id)));
       return true;
     });
+  }
+
+  /** Scheduler-facing recovery: expired external pulls cannot depend on a
+   * later client request to release their issue checkout. */
+  async function sweepExpired(now = new Date(), limit = 100) {
+    const candidates = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.triggerDetail, EXTERNAL_PULL_RUN_TRIGGER),
+        inArray(heartbeatRuns.status, LIVE_RUN_STATUSES),
+        or(isNull(heartbeatRuns.leaseExpiresAt), lte(heartbeatRuns.leaseExpiresAt, now)),
+      ))
+      .limit(limit);
+    let expired = 0;
+    for (const candidate of candidates) if (await expireRun(candidate.id, now)) expired += 1;
+    return expired;
   }
 
   async function requirePullAgent(companyId: string, agentId: string) {
@@ -225,6 +248,13 @@ export function pullRunService(db: Db) {
       throw conflict("Pull run lease expired");
     }
     return db.transaction(async (tx) => {
+      // See expireRun: issue -> run is the canonical lifecycle lock order.
+      await tx.execute(
+        sql`select ${issues.id} from ${issues} where ${issues.checkoutRunId} = ${run.id} or ${issues.executionRunId} = ${run.id} order by ${issues.id} for update`,
+      );
+      await tx.execute(
+        sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${run.id} for update`,
+      );
       const updated = await tx
         .update(heartbeatRuns)
         .set({ status, finishedAt: now, leaseExpiresAt: null, updatedAt: now })
@@ -276,6 +306,7 @@ export function pullRunService(db: Db) {
   return {
     start,
     heartbeat,
+    sweepExpired,
     complete: (companyId: string, agentId: string, runId: string) => finish(companyId, agentId, runId, "succeeded"),
     cancel: (companyId: string, agentId: string, runId: string) => finish(companyId, agentId, runId, "cancelled"),
   };

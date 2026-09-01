@@ -3,7 +3,7 @@ import express from "express";
 import request from "supertest";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb, heartbeatRuns, issues } from "@paperclipai/db";
+import { activityLog, agents, companies, createDb, heartbeatRuns, issues } from "@paperclipai/db";
 import { issueService } from "../services/issues.js";
 import { pullRunService } from "../services/pull-runs.js";
 import { errorHandler } from "../middleware/index.js";
@@ -26,6 +26,7 @@ describeEmbeddedPostgres("external pull-run leases", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(activityLog);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
@@ -98,6 +99,40 @@ describeEmbeddedPostgres("external pull-run leases", () => {
       .send({ leaseSeconds: 60 });
     expect(started.status, JSON.stringify(started.body)).toBe(201);
     expect(started.body.runId).not.toBe(suppliedRunId);
+  });
+
+  it("rejects malformed pull-run route identifiers before querying UUID columns", async () => {
+    const f = await fixture();
+    const actor = {
+      type: "agent" as const,
+      source: "agent_key" as const,
+      agentId: f.agentId,
+      companyId: f.companyId,
+      keyId: randomUUID(),
+    };
+    const app = createApp(actor);
+    expect((await request(app).post("/api/issues/not-a-uuid/pull-runs").send({})).status).toBe(400);
+    expect((await request(app).post("/api/pull-runs/not-a-uuid/heartbeat").send({})).status).toBe(400);
+    expect((await request(app).post("/api/pull-runs/not-a-uuid/complete").send({})).status).toBe(400);
+    expect((await request(app).post("/api/pull-runs/not-a-uuid/cancel").send({})).status).toBe(400);
+    expect(await db.select().from(activityLog)).toHaveLength(0);
+  });
+
+  it("allows a no-run-id retry to return the existing server-owned lease", async () => {
+    const f = await fixture();
+    const actor = {
+      type: "agent" as const,
+      source: "agent_key" as const,
+      agentId: f.agentId,
+      companyId: f.companyId,
+      keyId: randomUUID(),
+    };
+    const app = createApp(actor);
+    const first = await request(app).post(`/api/issues/${f.issueId}/pull-runs`).send({ leaseSeconds: 60 });
+    const retry = await request(app).post(`/api/issues/${f.issueId}/pull-runs`).send({ leaseSeconds: 60 });
+    expect(first.status, JSON.stringify(first.body)).toBe(201);
+    expect(retry.status, JSON.stringify(retry.body)).toBe(200);
+    expect(retry.body.runId).toBe(first.body.runId);
   });
 
   it("server-issues a live run, atomically claims the issue, and retries idempotently", async () => {
@@ -199,6 +234,18 @@ describeEmbeddedPostgres("external pull-run leases", () => {
     issue = await db.select().from(issues).where(eq(issues.id, f.issueId)).then((rows) => rows[0]!);
     expect(issue.checkoutRunId).toBeNull();
     expect(issue.executionRunId).toBeNull();
+  });
+
+  it("authoritatively sweeps expired orphaned runs without another client call", async () => {
+    const f = await fixture();
+    const svc = pullRunService(db);
+    const started = await svc.start({ companyId: f.companyId, agentId: f.agentId, issueId: f.issueId, expectedStatuses: ["todo"], leaseSeconds: 60 });
+    await db.update(heartbeatRuns).set({ leaseExpiresAt: new Date(Date.now() - 1_000) }).where(eq(heartbeatRuns.id, started.run.id));
+    expect(await svc.sweepExpired()).toBe(1);
+    const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, started.run.id)).then((rows) => rows[0]!);
+    const issue = await db.select().from(issues).where(eq(issues.id, f.issueId)).then((rows) => rows[0]!);
+    expect(run.status).toBe("timed_out");
+    expect(issue.checkoutRunId).toBeNull();
   });
 
   it("cancel is owner-only, terminal, and requeues an in-progress issue", async () => {

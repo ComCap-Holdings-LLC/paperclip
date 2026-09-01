@@ -71,15 +71,22 @@ export async function expireExternalPullRun(db: Db, runId: string, now = new Dat
       .then((rows) => rows[0] ?? null);
     if (!updated) return false;
 
-    const ownedIssue = await tx
-      .select({ id: issues.id })
+    const ownedIssues = await tx
+      .select({
+        id: issues.id,
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
       .from(issues)
       .where(or(eq(issues.checkoutRunId, run.id), eq(issues.executionRunId, run.id)))
-      .then((rows) => rows[0] ?? null);
-
+      .orderBy(issues.id);
     await tx
       .update(issues)
       .set({
+        status: sql`case when ${issues.status} = 'in_progress' and ${issues.assigneeAgentId} = ${run.agentId} and (${issues.checkoutRunId} is null or ${issues.checkoutRunId} = ${run.id}) and (${issues.executionRunId} is null or ${issues.executionRunId} = ${run.id}) then 'todo' else ${issues.status} end`,
+        assigneeAgentId: sql`case when ${issues.status} = 'in_progress' and ${issues.assigneeAgentId} = ${run.agentId} and (${issues.checkoutRunId} is null or ${issues.checkoutRunId} = ${run.id}) and (${issues.executionRunId} is null or ${issues.executionRunId} = ${run.id}) then null else ${issues.assigneeAgentId} end`,
         checkoutRunId: sql`case when ${issues.checkoutRunId} = ${run.id} then null else ${issues.checkoutRunId} end`,
         executionRunId: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionRunId} end`,
         executionAgentNameKey: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionAgentNameKey} end`,
@@ -97,9 +104,9 @@ export async function expireExternalPullRun(db: Db, runId: string, now = new Dat
       action: "pull_run.expired",
       entityType: "heartbeat_run",
       entityId: run.id,
-      issueId: ownedIssue?.id ?? null,
+      issueId: ownedIssues[0]?.id ?? null,
       details: {
-        issueId: ownedIssue?.id ?? null,
+        issueId: ownedIssues[0]?.id ?? null,
         reason: "lease_expired",
       },
     }, publications);

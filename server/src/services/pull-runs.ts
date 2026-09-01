@@ -343,8 +343,8 @@ export function pullRunService(db: Db) {
       const requeued = status === "cancelled" && ownedIssues.some((issue) =>
         issue.status === "in_progress"
         && issue.assigneeAgentId === agentId
-        && issue.checkoutRunId === run.id
-        && issue.executionRunId === run.id,
+        && (issue.checkoutRunId == null || issue.checkoutRunId === run.id)
+        && (issue.executionRunId == null || issue.executionRunId === run.id),
       );
       if (ownedIssues.length > 0) {
         await tx
@@ -352,8 +352,8 @@ export function pullRunService(db: Db) {
           .set({
             ...(status === "cancelled"
               ? {
-                status: sql`case when ${issues.status} = 'in_progress' and ${issues.assigneeAgentId} = ${agentId} and ${issues.checkoutRunId} = ${run.id} and ${issues.executionRunId} = ${run.id} then 'todo' else ${issues.status} end`,
-                assigneeAgentId: sql`case when ${issues.status} = 'in_progress' and ${issues.assigneeAgentId} = ${agentId} and ${issues.checkoutRunId} = ${run.id} and ${issues.executionRunId} = ${run.id} then null else ${issues.assigneeAgentId} end`,
+                status: sql`case when ${issues.status} = 'in_progress' and ${issues.assigneeAgentId} = ${agentId} and (${issues.checkoutRunId} is null or ${issues.checkoutRunId} = ${run.id}) and (${issues.executionRunId} is null or ${issues.executionRunId} = ${run.id}) then 'todo' else ${issues.status} end`,
+                assigneeAgentId: sql`case when ${issues.status} = 'in_progress' and ${issues.assigneeAgentId} = ${agentId} and (${issues.checkoutRunId} is null or ${issues.checkoutRunId} = ${run.id}) and (${issues.executionRunId} is null or ${issues.executionRunId} = ${run.id}) then null else ${issues.assigneeAgentId} end`,
               }
               : {}),
             checkoutRunId: sql`case when ${issues.checkoutRunId} = ${run.id} then null else ${issues.checkoutRunId} end`,

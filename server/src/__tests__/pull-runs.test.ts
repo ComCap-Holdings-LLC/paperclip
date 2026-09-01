@@ -447,4 +447,89 @@ describeEmbeddedPostgres("external pull-run leases", () => {
     expect(issueA).toMatchObject({ checkoutRunId: null, executionRunId: executionHolderId });
     expect(issueB).toMatchObject({ checkoutRunId: checkoutHolderId, executionRunId: null, executionAgentNameKey: null, executionLockedAt: null });
   });
+
+  it.each([
+    ["checkout-only", "checkout", false],
+    ["execution-only", "execution", false],
+    ["checkout with another execution holder", "checkout", true],
+  ] as const)("%s terminal cleanup requeues only when no other lock remains", async (_description, ownedLock, hasOtherLock) => {
+    const f = await fixture();
+    const svc = pullRunService(db);
+    const started = await svc.start({
+      companyId: f.companyId,
+      agentId: f.agentId,
+      issueId: f.issueId,
+      expectedStatuses: ["todo"],
+      leaseSeconds: 120,
+    });
+    const otherRunId = randomUUID();
+    if (hasOtherLock) {
+      await db.insert(heartbeatRuns).values({
+        id: otherRunId,
+        companyId: f.companyId,
+        agentId: f.agentId,
+        status: "running",
+        invocationSource: "manual",
+      });
+    }
+    await db.update(issues)
+      .set({
+        checkoutRunId: ownedLock === "checkout" ? started.run.id : null,
+        executionRunId: ownedLock === "execution" ? started.run.id : (hasOtherLock ? otherRunId : null),
+        executionAgentNameKey: ownedLock === "execution" || hasOtherLock ? "wren" : null,
+        executionLockedAt: ownedLock === "execution" || hasOtherLock ? new Date() : null,
+      })
+      .where(eq(issues.id, f.issueId));
+
+    await svc.cancel(f.companyId, f.agentId, started.run.id);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, f.issueId)).then((rows) => rows[0]!);
+    expect(issue).toMatchObject(hasOtherLock
+      ? { status: "in_progress", assigneeAgentId: f.agentId, checkoutRunId: null, executionRunId: otherRunId }
+      : { status: "todo", assigneeAgentId: null, checkoutRunId: null, executionRunId: null });
+  });
+
+  it.each([
+    ["checkout-only", "checkout", false],
+    ["execution-only", "execution", false],
+    ["checkout with another execution holder", "checkout", true],
+  ] as const)("%s expiry cleanup requeues only when no other lock remains", async (_description, ownedLock, hasOtherLock) => {
+    const f = await fixture();
+    const svc = pullRunService(db);
+    const started = await svc.start({
+      companyId: f.companyId,
+      agentId: f.agentId,
+      issueId: f.issueId,
+      expectedStatuses: ["todo"],
+      leaseSeconds: 120,
+    });
+    const otherRunId = randomUUID();
+    if (hasOtherLock) {
+      await db.insert(heartbeatRuns).values({
+        id: otherRunId,
+        companyId: f.companyId,
+        agentId: f.agentId,
+        status: "running",
+        invocationSource: "manual",
+      });
+    }
+    await db.update(issues)
+      .set({
+        checkoutRunId: ownedLock === "checkout" ? started.run.id : null,
+        executionRunId: ownedLock === "execution" ? started.run.id : (hasOtherLock ? otherRunId : null),
+        executionAgentNameKey: ownedLock === "execution" || hasOtherLock ? "wren" : null,
+        executionLockedAt: ownedLock === "execution" || hasOtherLock ? new Date() : null,
+      })
+      .where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns)
+      .set({ leaseExpiresAt: new Date(Date.now() - 1_000) })
+      .where(eq(heartbeatRuns.id, started.run.id));
+
+    expect(await svc.sweepExpired()).toBe(1);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, f.issueId)).then((rows) => rows[0]!);
+    expect(issue).toMatchObject(hasOtherLock
+      ? { status: "in_progress", assigneeAgentId: f.agentId, checkoutRunId: null, executionRunId: otherRunId }
+      : { status: "todo", assigneeAgentId: null, checkoutRunId: null, executionRunId: null });
+  });
 });

@@ -1,6 +1,11 @@
 import { Router } from "express";
 import { z } from "zod";
 import {
+  PULL_RUN_LEASE_DEFAULT_SECONDS,
+  PULL_RUN_LEASE_MAX_SECONDS,
+  PULL_RUN_LEASE_MIN_SECONDS,
+} from "../services/pull-runs.js";
+import {
   // Agent
   createAgentSchema,
   createAgentHireSchema,
@@ -584,11 +589,13 @@ const externalObjectSummariesBodySchema = z.object({
 }).strict();
 
 const pullRunLeaseSchema = z.object({
-  leaseSeconds: z.number().int().min(5).max(900).default(60),
+  leaseSeconds: z.number().int().min(PULL_RUN_LEASE_MIN_SECONDS).max(PULL_RUN_LEASE_MAX_SECONDS)
+    .default(PULL_RUN_LEASE_DEFAULT_SECONDS),
 }).strict().default({});
 
 const startPullRunSchema = z.object({
-  leaseSeconds: z.number().int().min(5).max(900).default(60),
+  leaseSeconds: z.number().int().min(PULL_RUN_LEASE_MIN_SECONDS).max(PULL_RUN_LEASE_MAX_SECONDS)
+    .default(PULL_RUN_LEASE_DEFAULT_SECONDS),
   expectedStatuses: z.array(z.enum(["backlog", "todo", "in_progress"])).nonempty()
     .default(["backlog", "todo", "in_progress"]),
 }).strict().default({});

@@ -583,6 +583,16 @@ const externalObjectSummariesBodySchema = z.object({
   issueIds: z.array(z.string().uuid()).max(1000),
 }).strict();
 
+const pullRunLeaseSchema = z.object({
+  leaseSeconds: z.number().int().min(5).max(900).default(60),
+}).strict().default({});
+
+const startPullRunSchema = z.object({
+  leaseSeconds: z.number().int().min(5).max(900).default(60),
+  expectedStatuses: z.array(z.enum(["backlog", "todo", "in_progress"])).nonempty()
+    .default(["backlog", "todo", "in_progress"]),
+}).strict().default({});
+
 const refreshExternalObjectsBodySchema = z.object({
   objectIds: z.array(z.string().uuid()).max(50).optional(),
 }).strict();
@@ -2439,6 +2449,33 @@ registry.registerPath({
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/pull-runs",
+  tags: ["issues"],
+  summary: "Start a pull run for an issue",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(startPullRunSchema),
+  },
+  responses: { 200: r.ok(), 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+for (const [path, summary, body] of [
+  ["/api/pull-runs/{runId}/heartbeat", "Renew a pull run lease", pullRunLeaseSchema],
+  ["/api/pull-runs/{runId}/complete", "Complete a pull run", undefined],
+  ["/api/pull-runs/{runId}/cancel", "Cancel a pull run", undefined],
+] as const) {
+  registry.registerPath({
+    method: "post",
+    path,
+    tags: ["issues"],
+    summary,
+    ...(body ? { request: { params: z.object({ runId: z.string() }), body: jsonBody(body) } } : { request: { params: z.object({ runId: z.string() }) } }),
+    responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+  });
+}
 
 registry.registerPath({
   method: "post",

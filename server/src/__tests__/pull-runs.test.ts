@@ -353,6 +353,116 @@ describeEmbeddedPostgres("external pull-run leases", () => {
     }
   });
 
+  it("returns conflict without renewing when heartbeat attachment stabilization exhausts its retries", async () => {
+    const f = await fixture();
+    const baseSvc = pullRunService(db);
+    const started = await baseSvc.start({
+      companyId: f.companyId,
+      agentId: f.agentId,
+      issueId: f.issueId,
+      expectedStatuses: ["todo"],
+      leaseSeconds: 120,
+    });
+    const secondAttachedIssueId = randomUUID();
+    const candidateIssueId = randomUUID();
+    await db.insert(issues).values([
+      { id: secondAttachedIssueId, companyId: f.companyId, title: "Second attached", status: "todo" },
+      { id: candidateIssueId, companyId: f.companyId, title: "Racing attachment", status: "todo" },
+    ]);
+    await issueService(db).checkout(secondAttachedIssueId, f.agentId, ["todo"], started.run.id, {
+      requireExternalPullRun: true,
+    });
+
+    let attachmentSetError: (new () => Error) | null = null;
+    let lifecycleTransactionAttempts = 0;
+    const retryExhaustionDb = new Proxy(db, {
+      get(target, property, receiver) {
+        if (property !== "transaction") return Reflect.get(target, property, receiver);
+        return async (...args: Parameters<typeof db.transaction>) => {
+          lifecycleTransactionAttempts += 1;
+          if (attachmentSetError) throw new attachmentSetError();
+          try {
+            return await target.transaction(...args);
+          } catch (error) {
+            if (error instanceof Error && error.constructor.name === "PullRunAttachmentSetChangedError") {
+              attachmentSetError = error.constructor as new () => Error;
+            }
+            throw error;
+          }
+        };
+      },
+    });
+    const svc = pullRunService(retryExhaustionDb);
+    const attachedIssueIds = [f.issueId, secondAttachedIssueId].sort();
+    const issueLockDb = createDb(tempDb!.connectionString);
+    const runLockDb = createDb(tempDb!.connectionString);
+    const attachmentDb = createDb(tempDb!.connectionString);
+    const issueLockReady = deferred<void>();
+    const releaseIssueLock = deferred<void>();
+    const runLockReady = deferred<void>();
+    const releaseRunLock = deferred<void>();
+    const issueLock = issueLockDb.transaction(async (tx) => {
+      await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${attachedIssueIds[1]} for update`);
+      issueLockReady.resolve();
+      await releaseIssueLock.promise;
+    });
+    const runLock = runLockDb.transaction(async (tx) => {
+      await tx.execute(sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${started.run.id} for update`);
+      runLockReady.resolve();
+      await releaseRunLock.promise;
+    });
+    await Promise.all([issueLockReady.promise, runLockReady.promise]);
+
+    try {
+      const lifecycle = svc.heartbeat(f.companyId, f.agentId, started.run.id, 300);
+      expect(await waitForBlockedForUpdate("issues")).toBe(true);
+
+      const attachment = attachmentDb.transaction(async (tx) => {
+        await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${candidateIssueId} for update`);
+        await tx.execute(sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${started.run.id} for update`);
+        await tx
+          .update(issues)
+          .set({
+            status: "in_progress",
+            assigneeAgentId: f.agentId,
+            checkoutRunId: started.run.id,
+            executionRunId: started.run.id,
+            executionLockedAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(eq(issues.id, candidateIssueId));
+      });
+      expect(await waitForBlockedForUpdate("heartbeat_runs")).toBe(true);
+
+      releaseRunLock.resolve();
+      await attachment;
+      releaseIssueLock.resolve();
+      await Promise.all([issueLock, runLock]);
+
+      await expect(lifecycle).rejects.toMatchObject({ status: 409 });
+      expect(lifecycleTransactionAttempts).toBe(3);
+      const [run, heartbeatLogs] = await Promise.all([
+        db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, started.run.id)).then((rows) => rows[0]!),
+        db.select({ action: activityLog.action }).from(activityLog).where(and(
+          eq(activityLog.runId, started.run.id),
+          eq(activityLog.action, "pull_run.heartbeat"),
+        )),
+      ]);
+      expect(run).toMatchObject({ status: "running", finishedAt: null });
+      expect(run.leaseExpiresAt?.getTime()).toBe(started.run.leaseExpiresAt?.getTime());
+      expect(heartbeatLogs).toHaveLength(0);
+    } finally {
+      releaseIssueLock.resolve();
+      releaseRunLock.resolve();
+      await Promise.allSettled([issueLock, runLock]);
+      await Promise.all([
+        issueLockDb.$client.end(),
+        runLockDb.$client.end(),
+        attachmentDb.$client.end(),
+      ]);
+    }
+  });
+
   it("does not renew a scoped heartbeat when an attached issue is outside the authorized set", async () => {
     const f = await fixture();
     const svc = pullRunService(db);

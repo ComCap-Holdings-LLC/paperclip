@@ -423,7 +423,9 @@ export function pullRunService(db: Db) {
         }
         return updated;
       } catch (error) {
-        if (!(error instanceof PullRunAttachmentSetChangedError) || attempt === 2) throw error;
+        if (error instanceof PullRunAttachmentSetChangedError && attempt < 2) continue;
+        if (error instanceof PullRunAttachmentSetChangedError) throw conflict("Pull run issue locks changed; retry");
+        throw error;
       }
     }
     throw conflict("Pull run attachment set changed; retry");

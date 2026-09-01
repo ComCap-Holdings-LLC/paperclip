@@ -24,14 +24,36 @@ export type CrossIssueInfluenceDecision = {
 
 type DatabaseClockReader = (tx: Pick<Db, "execute">) => Promise<Date>;
 
+function isIterable(value: unknown): value is Iterable<unknown> {
+  return (
+    value !== null &&
+    (typeof value === "object" || typeof value === "function") &&
+    Symbol.iterator in value &&
+    typeof value[Symbol.iterator] === "function"
+  );
+}
+
+function databaseClockRows(result: unknown): unknown[] {
+  if (result !== null && typeof result === "object" && "rows" in result) {
+    const { rows } = result as { rows?: unknown };
+    return Array.isArray(rows) ? rows : [];
+  }
+  return isIterable(result) ? Array.from(result) : [];
+}
+
 async function readPostgresClock(tx: Pick<Db, "execute">): Promise<Date> {
-  const rows = Array.from(await tx.execute(sql<{ observedAt: Date | string }>`
+  const rows = databaseClockRows(await tx.execute(sql<{ observedAt: Date | string }>`
     select clock_timestamp() as "observedAt"
   `));
   // Drizzle's generic execute result is exposed as an unknown row shape here;
   // the SQL alias above is the narrow, runtime-validated boundary we consume.
-  const observedAtValue = rows[0]?.observedAt as Date | string | undefined;
-  const observedAt = new Date(observedAtValue ?? "");
+  const firstRow = rows[0];
+  const observedAtValue = firstRow !== null && typeof firstRow === "object" && "observedAt" in firstRow
+    ? firstRow.observedAt
+    : undefined;
+  const observedAt = new Date(
+    observedAtValue instanceof Date || typeof observedAtValue === "string" ? observedAtValue : "",
+  );
   if (Number.isNaN(observedAt.getTime())) throw new Error("database clock returned an invalid timestamp");
   return observedAt;
 }

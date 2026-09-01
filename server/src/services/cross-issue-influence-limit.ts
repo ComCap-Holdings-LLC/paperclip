@@ -1,4 +1,4 @@
-import { and, count, eq, gte } from "drizzle-orm";
+import { and, count, eq, gte, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { activityLog, heartbeatRuns } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
@@ -22,6 +22,17 @@ export type CrossIssueInfluenceDecision = {
   enforceAt: string;
 };
 
+type DatabaseClockReader = (tx: Pick<Db, "execute">) => Promise<Date>;
+
+async function readPostgresClock(tx: Pick<Db, "execute">): Promise<Date> {
+  const rows = Array.from(await tx.execute(sql<{ observedAt: Date | string }>`
+    select clock_timestamp() as "observedAt"
+  `));
+  const observedAt = new Date(rows[0]?.observedAt ?? "");
+  if (Number.isNaN(observedAt.getTime())) throw new Error("database clock returned an invalid timestamp");
+  return observedAt;
+}
+
 export function crossIssueInfluenceRunContextError() {
   // Copy comes from the shared issue-write denial contract (the open cross-task write design (failure UX))
   // so the agent reading this 403 is told the fix, not just the refusal.
@@ -40,10 +51,9 @@ function readRunSourceIssueId(contextSnapshot: unknown) {
 
 export function evaluateCrossIssueInfluenceLimit(input: {
   priorCount: number;
-  now?: Date;
+  observedAt: Date;
 }): CrossIssueInfluenceDecision {
-  const now = input.now ?? new Date();
-  const mode = now >= CROSS_ISSUE_INFLUENCE_ENFORCE_AT ? "enforce" : "log_only";
+  const mode = input.observedAt >= CROSS_ISSUE_INFLUENCE_ENFORCE_AT ? "enforce" : "log_only";
   const nextCount = input.priorCount + 1;
   return {
     allowed: mode === "log_only" || nextCount <= CROSS_ISSUE_INFLUENCE_LIMIT,
@@ -72,8 +82,8 @@ export async function observeCrossIssueInfluence(
     targetIssueId: string;
     targetIssueIdentifier?: string | null;
     kind: CrossIssueInfluenceKind;
-    now?: Date;
   },
+  readDatabaseClock: DatabaseClockReader = readPostgresClock,
 ): Promise<CrossIssueInfluenceDecision | null> {
   // API-key callers control the run header. Reject malformed UUIDs before the
   // database can turn an untrusted identifier into a PostgreSQL cast error.
@@ -113,8 +123,10 @@ export async function observeCrossIssueInfluence(
       return null;
     }
 
-    const now = input.now ?? new Date();
-    const windowStart = new Date(now.getTime() - CROSS_ISSUE_INFLUENCE_WINDOW_MS);
+    // Read PostgreSQL's wall clock once after the run lock.  It is the only
+    // clock allowed to define both the rolling cutoff and the observation.
+    const observedAt = await readDatabaseClock(tx);
+    const windowStart = new Date(observedAt.getTime() - CROSS_ISSUE_INFLUENCE_WINDOW_MS);
     const priorCount = await tx
       .select({ count: count() })
       .from(activityLog)
@@ -125,7 +137,7 @@ export async function observeCrossIssueInfluence(
         gte(activityLog.createdAt, windowStart),
       ))
       .then((rows) => Number(rows[0]?.count ?? 0));
-    const decision = evaluateCrossIssueInfluenceLimit({ priorCount, now });
+    const decision = evaluateCrossIssueInfluenceLimit({ priorCount, observedAt });
 
     await tx.insert(activityLog).values({
       companyId: input.companyId,
@@ -150,10 +162,9 @@ export async function observeCrossIssueInfluence(
         enforceAt: decision.enforceAt,
         allowed: decision.allowed,
       },
-      // Keep the recorded observation on the same clock used to select the
-      // rolling window. This also makes a caller-supplied clock deterministic
-      // in tests without changing the normal production timestamp behavior.
-      createdAt: now,
+      // Keep the persisted observation on the one database clock used for
+      // the inclusive rolling window cutoff.
+      createdAt: observedAt,
     });
 
     const logContext = {

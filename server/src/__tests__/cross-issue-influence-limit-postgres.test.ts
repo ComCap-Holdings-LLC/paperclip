@@ -78,10 +78,9 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       targetIssueId,
       targetIssueIdentifier: "CAP-2",
       kind: "comment" as const,
-      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
     };
     const decisions = await Promise.all(Array.from({ length: 21 }, (_, index) =>
-      observeCrossIssueInfluence(db, { ...input, kind: index % 2 === 0 ? "comment" : "update" }),
+      observeCrossIssueInfluence(db, { ...input, kind: index % 2 === 0 ? "comment" : "update" }, async () => CROSS_ISSUE_INFLUENCE_ENFORCE_AT),
     ));
 
     expect(decisions.filter((decision) => decision?.allowed)).toHaveLength(20);
@@ -127,8 +126,8 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
     })));
 
     await expect(observeCrossIssueInfluence(db, {
-      companyId, runId, agentId, targetIssueId, targetIssueIdentifier: "CAP-2", kind: "comment", now,
-    })).resolves.toMatchObject({ allowed: true, count: 1, cap: 20 });
+      companyId, runId, agentId, targetIssueId, targetIssueIdentifier: "CAP-2", kind: "comment",
+    }, async () => now)).resolves.toMatchObject({ allowed: true, count: 1, cap: 20 });
   });
 
   it("counts observations exactly at the inclusive 60-second cutoff", async () => {
@@ -160,7 +159,7 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
     })));
 
     await expect(observeCrossIssueInfluence(db, {
-      companyId, runId, agentId, targetIssueId, targetIssueIdentifier: "CAP-2", kind: "comment", now,
-    })).resolves.toMatchObject({ allowed: false, count: 21, cap: 20 });
+      companyId, runId, agentId, targetIssueId, targetIssueIdentifier: "CAP-2", kind: "comment",
+    }, async () => now)).resolves.toMatchObject({ allowed: false, count: 21, cap: 20 });
   });
 });

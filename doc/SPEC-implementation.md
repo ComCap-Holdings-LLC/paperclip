@@ -585,8 +585,10 @@ the normal agent rewake throttle; comment presentation cannot give it human
 wake privileges. Agent issue comments and updates require a persisted heartbeat
 run bound to the authenticated agent and company; missing, invalid, or mismatched
 run context fails closed before mutation. A run may attempt at most 20 cross-issue comments or issue
-updates across the shared counter in an inclusive rolling 60-second window. An
-observation at exactly `now - 60 seconds` still counts; once the oldest observation is older,
+updates across the shared counter in an inclusive rolling 60-second window. The server reads
+PostgreSQL `clock_timestamp()` once after locking the run row; an observation at exactly that
+database timestamp minus 60 seconds still counts, and the same timestamp is persisted for the
+new observation. Once the oldest observation is older,
 capacity refills and the agent may retry without waiting for a new heartbeat run. The server records each attempt with its
 source issue, target issue, run, count, and rollout mode, and fails closed with
 the cap in the error once enforcement is active. Assignee self-comments do not

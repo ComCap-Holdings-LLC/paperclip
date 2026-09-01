@@ -40,8 +40,14 @@ describe("migration file names", () => {
 
   it("enumerates only real migration files", () => {
     expect(
-      listMigrationFileNames(["._0219_pull_run_lease.sql", ".foo.sql", "0219_pull_run_lease.sql"]),
-    ).toEqual(["0219_pull_run_lease.sql"]);
+      listMigrationFileNames([
+        "._0219_pull_run_lease.sql",
+        ".foo.sql",
+        "001_z.sql",
+        "001_a.sql",
+        "001_A.sql",
+      ]),
+    ).toEqual(["001_A.sql", "001_a.sql", "001_z.sql"]);
   });
 });
 

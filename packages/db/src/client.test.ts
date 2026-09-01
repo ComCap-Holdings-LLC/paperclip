@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
 import {
   applyPendingMigrations,
+  compareMigrationFileNames,
   isMigrationFileName,
   inspectMigrations,
   listMigrationFileNames,
@@ -48,6 +49,10 @@ describe("migration file names", () => {
         "001_A.sql",
       ]),
     ).toEqual(["001_A.sql", "001_a.sql", "001_z.sql"]);
+  });
+
+  it("uses code-unit ordering for migration names", () => {
+    expect(compareMigrationFileNames("0100-Z.sql", "0100_a.sql")).toBe(-1);
   });
 });
 

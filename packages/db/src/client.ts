@@ -4,10 +4,10 @@ import { migrate as migratePg } from "drizzle-orm/postgres-js/migrator";
 import { readFile, readdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import postgres from "postgres";
-import { listMigrationFileNames } from "./migration-files.js";
+import { compareMigrationFileNames, listMigrationFileNames } from "./migration-files.js";
 import * as schema from "./schema/index.js";
 
-export { isMigrationFileName, listMigrationFileNames } from "./migration-files.js";
+export { compareMigrationFileNames, isMigrationFileName, listMigrationFileNames } from "./migration-files.js";
 
 const MIGRATIONS_FOLDER = fileURLToPath(new URL("./migrations", import.meta.url));
 const DRIZZLE_MIGRATIONS_TABLE = "__drizzle_migrations";
@@ -180,10 +180,10 @@ async function orderMigrationsByJournal(migrationFiles: string[]): Promise<strin
   return [...migrationFiles].sort((left, right) => {
     const leftOrder = orderByFileName.get(left);
     const rightOrder = orderByFileName.get(right);
-    if (leftOrder === undefined && rightOrder === undefined) return left.localeCompare(right);
+    if (leftOrder === undefined && rightOrder === undefined) return compareMigrationFileNames(left, right);
     if (leftOrder === undefined) return 1;
     if (rightOrder === undefined) return -1;
-    if (leftOrder === rightOrder) return left.localeCompare(right);
+    if (leftOrder === rightOrder) return compareMigrationFileNames(left, right);
     return leftOrder - rightOrder;
   });
 }

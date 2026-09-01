@@ -59,7 +59,7 @@ describe("cross-issue influence limit rollout", () => {
   it("logs observations without enforcement during the one-week rollout", () => {
     const decision = evaluateCrossIssueInfluenceLimit({
       priorCount: CROSS_ISSUE_INFLUENCE_LIMIT,
-      now: new Date(CROSS_ISSUE_INFLUENCE_ENFORCE_AT.getTime() - 1),
+      observedAt: new Date(CROSS_ISSUE_INFLUENCE_ENFORCE_AT.getTime() - 1),
     });
 
     expect(decision).toMatchObject({
@@ -71,15 +71,15 @@ describe("cross-issue influence limit rollout", () => {
   });
 
   it("allows the twentieth influence and fails closed on the twenty-first after the flip", () => {
-    const now = CROSS_ISSUE_INFLUENCE_ENFORCE_AT;
-    expect(evaluateCrossIssueInfluenceLimit({ priorCount: 19, now })).toMatchObject({
+    const observedAt = CROSS_ISSUE_INFLUENCE_ENFORCE_AT;
+    expect(evaluateCrossIssueInfluenceLimit({ priorCount: 19, observedAt })).toMatchObject({
       allowed: true,
       mode: "enforce",
       count: 20,
       cap: 20,
     });
 
-    const rejected = evaluateCrossIssueInfluenceLimit({ priorCount: 20, now });
+    const rejected = evaluateCrossIssueInfluenceLimit({ priorCount: 20, observedAt });
     expect(rejected).toMatchObject({
       allowed: false,
       mode: "enforce",
@@ -113,12 +113,12 @@ describe("cross-issue influence limit rollout", () => {
       runId: "11111111-1111-4111-8111-111111111111",
       agentId: "33333333-3333-4333-8333-333333333333",
       targetIssueId: "55555555-5555-4555-8555-555555555555",
-      now: new Date(CROSS_ISSUE_INFLUENCE_ENFORCE_AT.getTime() - 1),
     } as const;
+    const readDatabaseClock = async () => new Date(CROSS_ISSUE_INFLUENCE_ENFORCE_AT.getTime() - 1);
 
-    await expect(observeCrossIssueInfluence(fake.db as never, { ...base, kind: "comment" }))
+    await expect(observeCrossIssueInfluence(fake.db as never, { ...base, kind: "comment" }, readDatabaseClock))
       .resolves.toMatchObject({ count: 1, allowed: true });
-    await expect(observeCrossIssueInfluence(fake.db as never, { ...base, kind: "update" }))
+    await expect(observeCrossIssueInfluence(fake.db as never, { ...base, kind: "update" }, readDatabaseClock))
       .resolves.toMatchObject({ count: 2, allowed: true });
 
     expect(fake.observedCount).toBe(2);
@@ -137,6 +137,31 @@ describe("cross-issue influence limit rollout", () => {
       kind: "comment",
     })).resolves.toBeNull();
     expect(fake.inserted).toEqual([]);
+  });
+
+  it("uses the injected database clock, not opposing application clocks, for the decision and observation", async () => {
+    const databaseTime = new Date("2026-08-12T00:01:00.000Z");
+    const tooEarlyApplicationClock = new Date("2026-08-01T00:00:00.000Z");
+    const tooLateApplicationClock = new Date("2027-08-01T00:00:00.000Z");
+    const base = {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "comment" as const,
+    };
+    const outcomes = await Promise.all([tooEarlyApplicationClock, tooLateApplicationClock].map(async (now) => {
+      const fake = counterDb(20);
+      // A stale caller may still send the former, untyped `now` field at runtime.
+      // The service contract ignores it and relies solely on the database-clock seam.
+      const decision = await observeCrossIssueInfluence(fake.db as never, { ...base, now }, async () => databaseTime);
+      return { decision, createdAt: fake.inserted[0]?.createdAt };
+    }));
+
+    expect(outcomes).toEqual([
+      { decision: expect.objectContaining({ allowed: false, mode: "enforce", count: 21 }), createdAt: databaseTime },
+      { decision: expect.objectContaining({ allowed: false, mode: "enforce", count: 21 }), createdAt: databaseTime },
+    ]);
   });
 
   it.each([

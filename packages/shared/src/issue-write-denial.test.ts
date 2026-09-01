@@ -70,6 +70,7 @@ describe("describeIssueWriteDenial", () => {
     expect(copy.tone).toBe("cap");
     expect(copy.boundary).toContain("20");
     expect(copy.description).toContain("attempt 21");
+    expect(copy.description).toContain("database clock");
     expect(copy.description).toContain("still allowed");
     expect(copy.sanctionedPath).toContain("60 seconds");
   });

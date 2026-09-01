@@ -233,7 +233,7 @@ export function describeIssueWriteDenial(
         title: "This run has spent its cross-issue write budget",
         description:
           `A single heartbeat run may make at most ${cap} cross-issue comments or task ` +
-          `updates combined in the previous 60 seconds${attempt !== null ? `; this was attempt ${attempt}` : ""}. The cap ` +
+          `updates combined in the previous 60 seconds according to the server's database clock${attempt !== null ? `; this was attempt ${attempt}` : ""}. The cap ` +
           `bounds runaway comment sprays and loops — it is a rate backstop, not a ` +
           `permission decision, so ${actor} is still allowed to write to ${issue}.`,
         whoCanAct:

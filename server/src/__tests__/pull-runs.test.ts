@@ -612,6 +612,7 @@ describeEmbeddedPostgres("external pull-run leases", () => {
       "pull_run.started",
       "pull_run.heartbeat",
       "pull_run.completed",
+      "pull_run.issue_completed",
     ]);
     await expect(svc.complete(f.companyId, f.agentId, started.run.id))
       .rejects.toMatchObject({ status: 409 });

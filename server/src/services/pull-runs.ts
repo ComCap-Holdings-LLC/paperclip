@@ -210,11 +210,14 @@ export function pullRunService(db: Db) {
 
   async function requirePullAgent(companyId: string, agentId: string) {
     const agent = await db
-      .select({ id: agents.id, companyId: agents.companyId })
+      .select({ id: agents.id, companyId: agents.companyId, executionModel: agents.executionModel })
       .from(agents)
       .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId)))
       .then((rows) => rows[0] ?? null);
     if (!agent) throw notFound("Agent not found");
+    if (agent.executionModel !== "pull") {
+      throw forbidden("External pull runs require executionModel 'pull'");
+    }
     return agent;
   }
 

@@ -131,7 +131,9 @@ import {
 } from "./activity-log.js";
 import { buildIssueChanges } from "./issue-change-receipt.js";
 import {
+  EXTERNAL_PULL_RUN_TRIGGER,
   expireExternalPullRun,
+  externalPullRunIsExpired,
   TERMINAL_HEARTBEAT_RUN_STATUSES,
 } from "./external-pull-run-lifecycle.js";
 
@@ -782,8 +784,12 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
 
 function heartbeatRunIsTerminal(run: {
   status: string;
+  triggerDetail?: string | null;
+  leaseExpiresAt?: Date | null;
 }) {
-  return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
+  return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)
+    || (run.triggerDetail === EXTERNAL_PULL_RUN_TRIGGER
+      && externalPullRunIsExpired(run, new Date()));
 }
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;

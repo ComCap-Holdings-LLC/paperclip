@@ -73,6 +73,10 @@ export interface IssueWriteDenialContext {
   cap?: number | null;
   /** Attempt count that tripped the cap. */
   count?: number | null;
+  /** Lifetime attempt count for the current heartbeat run. */
+  lifetimeCount?: number | null;
+  /** Lifetime cross-issue influence cap for the current heartbeat run. */
+  lifetimeCap?: number | null;
   /** ISO timestamp at which log-only rollout becomes enforcement. */
   enforceAt?: string | null;
 }
@@ -224,6 +228,9 @@ export function describeIssueWriteDenial(
     case "cross_issue_influence_cap_exceeded": {
       const cap = context.cap ?? 20;
       const attempt = context.count ?? null;
+      const lifetimeCap = context.lifetimeCap ?? 200;
+      const lifetimeCount = context.lifetimeCount ?? null;
+      const lifetimeExhausted = lifetimeCount !== null && lifetimeCount >= lifetimeCap;
       return {
         code,
         status: 429,
@@ -237,11 +244,17 @@ export function describeIssueWriteDenial(
           `bounds runaway comment sprays and loops — it is a rate backstop, not a ` +
           `permission decision, so ${actor} is still allowed to write to ${issue}.`,
         whoCanAct:
-          `${actor} again in this heartbeat run once the oldest cross-issue write is more ` +
-          `than 60 seconds old, or ${assignee} on ${issue} directly.`,
+          lifetimeExhausted
+            ? `${assignee} on ${issue} directly; this heartbeat run has exhausted its ` +
+              `${lifetimeCap}-write lifetime ceiling and must end before another run retries.`
+            : `${actor} again in this heartbeat run once the oldest cross-issue write is more ` +
+              `than 60 seconds old, or ${assignee} on ${issue} directly.`,
         sanctionedPath:
-          `Consolidate what is left into one comment on your own task, then retry after the ` +
-          `oldest cross-issue write is more than 60 seconds old.`,
+          lifetimeExhausted
+            ? `Consolidate what is left into one comment on your own task, then let a new ` +
+              `heartbeat run retry the remaining work.`
+            : `Consolidate what is left into one comment on your own task, then retry after the ` +
+              `oldest cross-issue write is more than 60 seconds old.`,
       };
     }
 

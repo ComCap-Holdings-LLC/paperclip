@@ -249,6 +249,8 @@ export function crossIssueInfluenceLimitError(
     ...context,
     cap: decision.cap,
     count: decision.count,
+    lifetimeCount: decision.lifetimeCount,
+    lifetimeCap: decision.lifetimeCap,
     enforceAt: decision.enforceAt,
   });
   return {

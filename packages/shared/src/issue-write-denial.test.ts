@@ -89,6 +89,21 @@ describe("describeIssueWriteDenial", () => {
     expect(copy.whoCanAct).not.toContain("next heartbeat run");
   });
 
+  it("does not promise a rolling-window retry after the lifetime ceiling", () => {
+    const copy = describeIssueWriteDenial("cross_issue_influence_cap_exceeded", {
+      actorLabel: "Fable",
+      assigneeLabel: "CodexCoder",
+      issueIdentifier: "TASK-482",
+      lifetimeCount: 200,
+      lifetimeCap: 200,
+    });
+
+    expect(copy.whoCanAct).toContain("exhausted");
+    expect(copy.whoCanAct).toContain("must end");
+    expect(copy.whoCanAct).not.toContain("60 seconds");
+    expect(copy.sanctionedPath).toContain("new heartbeat run");
+  });
+
   it("defaults the cap to the shipped limit when context omits it", () => {
     const copy = describeIssueWriteDenial("cross_issue_influence_cap_exceeded");
     expect(copy.boundary).toContain("20");

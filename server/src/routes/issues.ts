@@ -1905,7 +1905,9 @@ const REDUNDANT_DISPOSITION_COMMENT_MAX_DIFFERING_TOKENS = 1;
 function normalizeDispositionCommentText(body: string): string {
   return body
     .toLowerCase()
-    .replace(/```[\s\S]*?```/g, " ")
+    // Keep fenced evidence in the comparison: a changed command, error, or
+    // patch is a new fact even when the surrounding disposition is unchanged.
+    .replace(/```/g, " ")
     // Markdown decoration and general punctuation, including curly/em/en
     // dashes and quotes, is stripped so wording that differs only in
     // formatting (headings, bullets, a comma vs. an em dash, a trailing

@@ -64,6 +64,15 @@ describe("isNearDuplicateDispositionComment", () => {
     ).toBe(false);
   });
 
+  it("does not discard materially different fenced evidence", () => {
+    expect(
+      isNearDuplicateDispositionComment(
+        "Still blocked.\n```\nError: migration timed out after 10s\n```",
+        "Still blocked.\n```\nError: migration timed out after 20s\n```",
+      ),
+    ).toBe(false);
+  });
+
   it("treats empty input as not duplicate", () => {
     expect(isNearDuplicateDispositionComment("", "still blocked")).toBe(false);
     expect(isNearDuplicateDispositionComment("still blocked", "")).toBe(false);

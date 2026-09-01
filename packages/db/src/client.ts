@@ -4,7 +4,10 @@ import { migrate as migratePg } from "drizzle-orm/postgres-js/migrator";
 import { readFile, readdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import postgres from "postgres";
+import { listMigrationFileNames } from "./migration-files.js";
 import * as schema from "./schema/index.js";
+
+export { isMigrationFileName, listMigrationFileNames } from "./migration-files.js";
 
 const MIGRATIONS_FOLDER = fileURLToPath(new URL("./migrations", import.meta.url));
 const DRIZZLE_MIGRATIONS_TABLE = "__drizzle_migrations";
@@ -131,10 +134,7 @@ export async function getPostgresDataDirectory(url: string): Promise<string | nu
 
 async function listMigrationFiles(): Promise<string[]> {
   const entries = await readdir(MIGRATIONS_FOLDER, { withFileTypes: true });
-  return entries
-    .filter((entry) => entry.isFile() && entry.name.endsWith(".sql"))
-    .map((entry) => entry.name)
-    .sort((a, b) => a.localeCompare(b));
+  return listMigrationFileNames(entries.filter((entry) => entry.isFile()).map((entry) => entry.name));
 }
 
 type MigrationJournalFile = {

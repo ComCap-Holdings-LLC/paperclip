@@ -158,8 +158,8 @@ jobs:
         id: schema
         run: |
           set -euo pipefail
-          last=$(ls packages/db/src/migrations/*.sql | sed 's|.*/||' | LC_ALL=C sort | tail -1)
-          count=$(ls packages/db/src/migrations/*.sql | wc -l | tr -d ' ')
+          last=$(find packages/db/src/migrations -maxdepth 1 -type f -name '*.sql' ! -name '.*' -print | sed 's|.*/||' | LC_ALL=C sort | tail -1)
+          count=$(find packages/db/src/migrations -maxdepth 1 -type f -name '*.sql' ! -name '.*' | wc -l | tr -d ' ')
           echo "last=${last}" >> "$GITHUB_OUTPUT"
           echo "count=${count}" >> "$GITHUB_OUTPUT"
 
@@ -346,8 +346,8 @@ jobs:
         id: schema
         run: |
           set -euo pipefail
-          last=$(ls packages/db/src/migrations/*.sql | sed 's|.*/||' | LC_ALL=C sort | tail -1)
-          count=$(ls packages/db/src/migrations/*.sql | wc -l | tr -d ' ')
+          last=$(find packages/db/src/migrations -maxdepth 1 -type f -name '*.sql' ! -name '.*' -print | sed 's|.*/||' | LC_ALL=C sort | tail -1)
+          count=$(find packages/db/src/migrations -maxdepth 1 -type f -name '*.sql' ! -name '.*' | wc -l | tr -d ' ')
           echo "last=${last}" >> "$GITHUB_OUTPUT"
           echo "count=${count}" >> "$GITHUB_OUTPUT"
 

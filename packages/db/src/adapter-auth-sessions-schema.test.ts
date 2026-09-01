@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import { getTableConfig } from "drizzle-orm/pg-core";
 import { describe, expect, it } from "vitest";
+import { isMigrationFileName } from "./migration-files.js";
 import { adapterAuthSessions } from "./schema/adapter_auth_sessions.js";
 
 type PgTable = Parameters<typeof getTableConfig>[0];
@@ -24,7 +25,7 @@ function columnIsNotNull(table: PgTable, columnName: string): boolean {
 // later re-generation with a different name does not break the test.
 function activeIndexMigrationSql(): string {
   const migrationsDir = new URL("./migrations/", import.meta.url);
-  const files = fs.readdirSync(migrationsDir).filter((name) => name.endsWith(".sql"));
+  const files = fs.readdirSync(migrationsDir).filter((name) => isMigrationFileName(name));
   for (const name of files) {
     const content = fs.readFileSync(new URL(name, migrationsDir), "utf8");
     if (content.includes("adapter_auth_sessions_company_adapter_active_uq")) {

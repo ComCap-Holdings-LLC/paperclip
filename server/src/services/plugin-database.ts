@@ -328,7 +328,7 @@ function bindSql(statement: string, params: readonly unknown[] = []): SQL {
 async function listSqlMigrationFiles(migrationsDir: string): Promise<string[]> {
   const entries = await readdir(migrationsDir, { withFileTypes: true });
   return entries
-    .filter((entry) => entry.isFile() && entry.name.endsWith(".sql"))
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".sql") && !entry.name.startsWith("."))
     .map((entry) => entry.name)
     .sort((a, b) => a.localeCompare(b));
 }

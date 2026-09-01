@@ -448,6 +448,11 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
       );`,
       "utf8",
     );
+    await writeFile(
+      path.join(packageRoot, pluginManifest.database!.migrationsDir, "._003_resource_fork.sql"),
+      "not valid SQL; this resource fork must not be treated as a migration",
+      "utf8",
+    );
     const pluginId = await installPluginRecord(pluginManifest);
     await pluginDatabaseService(db).applyMigrations(pluginId, pluginManifest, packageRoot);
 

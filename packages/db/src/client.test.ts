@@ -4,7 +4,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
 import {
   applyPendingMigrations,
+  isMigrationFileName,
   inspectMigrations,
+  listMigrationFileNames,
   resetPostgresDatabase,
 } from "./client.js";
 import {
@@ -29,6 +31,19 @@ async function migrationHash(migrationFile: string): Promise<string> {
   );
   return createHash("sha256").update(content).digest("hex");
 }
+
+describe("migration file names", () => {
+  it("ignores AppleDouble resource forks", () => {
+    expect(isMigrationFileName("0219_pull_run_lease.sql")).toBe(true);
+    expect(isMigrationFileName("._0219_pull_run_lease.sql")).toBe(false);
+  });
+
+  it("enumerates only real migration files", () => {
+    expect(
+      listMigrationFileNames(["._0219_pull_run_lease.sql", ".foo.sql", "0219_pull_run_lease.sql"]),
+    ).toEqual(["0219_pull_run_lease.sql"]);
+  });
+});
 
 const userVisibleUpdatedAtTables = new Set([
   "companies",

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import { basename } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { isMigrationFileName } from "./migration-files.js";
 import { MIGRATION_SAFETY_BASELINE } from "./migration-safety-baseline.js";
 import {
   getTableSizeEstimate,
@@ -996,7 +997,7 @@ export function analyzeMigrationSafety(
 
 async function readMigrations(): Promise<MigrationSafetyInput[]> {
   const files = (await readdir(migrationsDir))
-    .filter((entry) => entry.endsWith(".sql"))
+    .filter((entry) => isMigrationFileName(entry))
     .sort();
 
   return Promise.all(

@@ -1,5 +1,6 @@
 import { readdir, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { isMigrationFileName } from "./migration-files.js";
 
 const migrationsDir = fileURLToPath(new URL("./migrations", import.meta.url));
 const journalPath = fileURLToPath(new URL("./migrations/meta/_journal.json", import.meta.url));
@@ -65,7 +66,7 @@ function ensureJournalMatchesFiles(migrationFiles: string[], journalTags: string
 
 async function main() {
   const migrationFiles = (await readdir(migrationsDir))
-    .filter((entry) => entry.endsWith(".sql"))
+    .filter((entry) => isMigrationFileName(entry))
     .sort();
 
   ensureNoDuplicates(migrationFiles, "migration files");

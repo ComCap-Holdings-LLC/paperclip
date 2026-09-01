@@ -229,18 +229,19 @@ export function describeIssueWriteDenial(
         status: 429,
         tone: "cap",
         // No parentheses: surfaces render the boundary inside their own parens.
-        boundary: `Per-run cross-issue cap of ${cap} writes`,
+        boundary: `Per-run cross-issue cap of ${cap} writes per rolling minute`,
         title: "This run has spent its cross-issue write budget",
         description:
           `A single heartbeat run may make at most ${cap} cross-issue comments or task ` +
-          `updates combined${attempt !== null ? `; this was attempt ${attempt}` : ""}. The cap ` +
+          `updates combined in the previous 60 seconds according to the server's database clock${attempt !== null ? `; this was attempt ${attempt}` : ""}. The cap ` +
           `bounds runaway comment sprays and loops — it is a rate backstop, not a ` +
           `permission decision, so ${actor} is still allowed to write to ${issue}.`,
         whoCanAct:
-          `${actor} on its next heartbeat run, or ${assignee} on ${issue} directly.`,
+          `${actor} again in this heartbeat run once the oldest cross-issue write is more ` +
+          `than 60 seconds old, or ${assignee} on ${issue} directly.`,
         sanctionedPath:
-          `Consolidate what is left into one comment on your own task, or end the run and ` +
-          `continue on the next heartbeat — the budget resets per run.`,
+          `Consolidate what is left into one comment on your own task, then retry after the ` +
+          `oldest cross-issue write is more than 60 seconds old.`,
       };
     }
 

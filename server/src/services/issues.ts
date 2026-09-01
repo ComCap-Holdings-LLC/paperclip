@@ -130,6 +130,12 @@ import {
   type ActivityPublication,
 } from "./activity-log.js";
 import { buildIssueChanges } from "./issue-change-receipt.js";
+import {
+  expireExternalPullRun,
+  TERMINAL_HEARTBEAT_RUN_STATUSES,
+} from "./external-pull-run-lifecycle.js";
+
+export { TERMINAL_HEARTBEAT_RUN_STATUSES } from "./external-pull-run-lifecycle.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
@@ -774,7 +780,11 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
   return checkoutRunId == null;
 }
 
-export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "interrupted", "failed", "cancelled", "timed_out"]);
+function heartbeatRunIsTerminal(run: {
+  status: string;
+}) {
+  return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
+}
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
 
@@ -931,11 +941,15 @@ async function resolveAcceptedPlanClaimOwner(input: {
   }
 
   const existingOwnerRun = await input.dbOrTx
-    .select({ status: heartbeatRuns.status })
+    .select({
+      status: heartbeatRuns.status,
+      triggerDetail: heartbeatRuns.triggerDetail,
+      leaseExpiresAt: heartbeatRuns.leaseExpiresAt,
+    })
     .from(heartbeatRuns)
     .where(eq(heartbeatRuns.id, input.claim.ownerRunId))
     .then((rows) => rows[0] ?? null);
-  if (existingOwnerRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(existingOwnerRun.status)) {
+  if (existingOwnerRun && !heartbeatRunIsTerminal(existingOwnerRun)) {
     return {
       ownerAgentId: input.claim.ownerAgentId,
       ownerUserId: input.claim.ownerUserId,
@@ -1138,12 +1152,16 @@ export async function heartbeatRunIsTerminalOrMissing(
   runId: string,
 ): Promise<boolean> {
   const run = await dbOrTx
-    .select({ status: heartbeatRuns.status })
+    .select({
+      status: heartbeatRuns.status,
+      triggerDetail: heartbeatRuns.triggerDetail,
+      leaseExpiresAt: heartbeatRuns.leaseExpiresAt,
+    })
     .from(heartbeatRuns)
     .where(eq(heartbeatRuns.id, runId))
-    .then((rows: Array<{ status: string }>) => rows[0] ?? null);
+    .then((rows) => rows[0] ?? null);
   if (!run) return true;
-  return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
+  return heartbeatRunIsTerminal(run);
 }
 
 /**
@@ -5056,6 +5074,8 @@ export function issueService(db: Db) {
     actorRunId: string;
     expectedCheckoutRunId: string;
   }) {
+    await expireExternalPullRun(db, input.expectedCheckoutRunId);
+    await expireExternalPullRun(db, input.actorRunId);
     return db.transaction(async (tx) => {
       const lockedIssue = await tx
         .select({
@@ -5081,28 +5101,31 @@ export function issueService(db: Db) {
         return { adopted: null, latest: lockedIssue };
       }
 
-      await Promise.all([
-        tx.execute(
-          sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.expectedCheckoutRunId} for update`,
-        ),
-        tx.execute(
-          sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.actorRunId} for update`,
-        ),
-      ]);
+      await tx.execute(
+        sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} in (${input.expectedCheckoutRunId}, ${input.actorRunId}) order by ${heartbeatRuns.id} for update`,
+      );
       const [existingRun, actorRun] = await Promise.all([
         tx
-          .select({ status: heartbeatRuns.status })
+          .select({
+            status: heartbeatRuns.status,
+            triggerDetail: heartbeatRuns.triggerDetail,
+            leaseExpiresAt: heartbeatRuns.leaseExpiresAt,
+          })
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.id, input.expectedCheckoutRunId))
           .then((rows) => rows[0] ?? null),
         tx
-          .select({ status: heartbeatRuns.status })
+          .select({
+            status: heartbeatRuns.status,
+            triggerDetail: heartbeatRuns.triggerDetail,
+            leaseExpiresAt: heartbeatRuns.leaseExpiresAt,
+          })
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.id, input.actorRunId))
           .then((rows) => rows[0] ?? null),
       ]);
-      const stale = !existingRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(existingRun.status);
-      const actorLive = actorRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status);
+      const stale = !existingRun || heartbeatRunIsTerminal(existingRun);
+      const actorLive = actorRun && !heartbeatRunIsTerminal(actorRun);
       if (!stale || !actorLive) {
         return { adopted: null, latest: lockedIssue };
       }
@@ -5156,16 +5179,24 @@ export function issueService(db: Db) {
     actorAgentId: string;
     actorRunId: string;
   }) {
+    await expireExternalPullRun(db, input.actorRunId);
     return db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select ${issues.id} from ${issues} where ${issues.id} = ${input.issueId} for update`,
+      );
       await tx.execute(
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.actorRunId} for update`,
       );
       const actorRun = await tx
-        .select({ status: heartbeatRuns.status })
+        .select({
+          status: heartbeatRuns.status,
+          triggerDetail: heartbeatRuns.triggerDetail,
+          leaseExpiresAt: heartbeatRuns.leaseExpiresAt,
+        })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, input.actorRunId))
         .then((rows) => rows[0] ?? null);
-      if (!actorRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status)) return null;
+      if (!actorRun || heartbeatRunIsTerminal(actorRun)) return null;
 
       const now = new Date();
       const adopted = await tx
@@ -5199,6 +5230,14 @@ export function issueService(db: Db) {
   }
 
   async function clearExecutionRunIfTerminal(issueId: string): Promise<boolean> {
+    const executionRunId = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]?.executionRunId ?? null);
+    if (!executionRunId) return false;
+    if (await expireExternalPullRun(db, executionRunId)) return true;
+
     return db.transaction(async (tx) => {
       await tx.execute(
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
@@ -5214,11 +5253,15 @@ export function issueService(db: Db) {
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.executionRunId} for update`,
       );
       const run = await tx
-        .select({ status: heartbeatRuns.status })
+        .select({
+          status: heartbeatRuns.status,
+          triggerDetail: heartbeatRuns.triggerDetail,
+          leaseExpiresAt: heartbeatRuns.leaseExpiresAt,
+        })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, issue.executionRunId))
         .then((rows) => rows[0] ?? null);
-      if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
+      if (run && !heartbeatRunIsTerminal(run)) return false;
 
       const updated = await tx
         .update(issues)
@@ -5241,12 +5284,18 @@ export function issueService(db: Db) {
     });
   }
 
-  // Symmetric to clearExecutionRunIfTerminal. Clears checkoutRunId (and the
-  // bundled execution lock cols) when the row's checkoutRunId points at a
-  // heartbeat run that is terminal or no longer exists. No assignee/status
-  // precondition: a terminal run holds no real claim regardless of who is
-  // assigned or what status the issue is currently in.
+  // Symmetric to clearExecutionRunIfTerminal. Clears checkoutRunId when it
+  // points at a terminal or missing run, and clears execution columns only
+  // when they belong to that same run.
   async function clearCheckoutRunIfTerminal(issueId: string): Promise<boolean> {
+    const checkoutRunId = await db
+      .select({ checkoutRunId: issues.checkoutRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]?.checkoutRunId ?? null);
+    if (!checkoutRunId) return false;
+    if (await expireExternalPullRun(db, checkoutRunId)) return true;
+
     return db.transaction(async (tx) => {
       await tx.execute(
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
@@ -5262,40 +5311,35 @@ export function issueService(db: Db) {
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.checkoutRunId} for update`,
       );
       const run = await tx
-        .select({ status: heartbeatRuns.status })
+        .select({
+          status: heartbeatRuns.status,
+          triggerDetail: heartbeatRuns.triggerDetail,
+          leaseExpiresAt: heartbeatRuns.leaseExpiresAt,
+        })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, issue.checkoutRunId))
         .then((rows) => rows[0] ?? null);
-      if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
+      if (run && !heartbeatRunIsTerminal(run)) return false;
 
-      if (issue.executionRunId && issue.executionRunId !== issue.checkoutRunId) {
-        await tx.execute(
-          sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.executionRunId} for update`,
-        );
-        const executionRun = await tx
-          .select({ status: heartbeatRuns.status })
-          .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.id, issue.executionRunId))
-          .then((rows) => rows[0] ?? null);
-        if (executionRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(executionRun.status)) return false;
-      }
+      const executionBelongsToCheckoutRun = issue.executionRunId === issue.checkoutRunId;
 
       const updated = await tx
         .update(issues)
         .set({
           checkoutRunId: null,
-          executionRunId: null,
-          executionAgentNameKey: null,
-          executionLockedAt: null,
+          ...(executionBelongsToCheckoutRun
+            ? {
+                executionRunId: null,
+                executionAgentNameKey: null,
+                executionLockedAt: null,
+              }
+            : {}),
           updatedAt: new Date(),
         })
         .where(
           and(
             eq(issues.id, issueId),
             eq(issues.checkoutRunId, issue.checkoutRunId),
-            issue.executionRunId
-              ? eq(issues.executionRunId, issue.executionRunId)
-              : isNull(issues.executionRunId),
           ),
         )
         .returning({ id: issues.id })

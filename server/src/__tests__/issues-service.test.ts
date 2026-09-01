@@ -5458,7 +5458,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     expect(row).toEqual({ executionRunId: null, executionLockedAt: null });
   });
 
-  it("does not clear checkout locks when a different execution run is live", async () => {
+  it("clears a terminal checkout lock while preserving a different live execution run", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
@@ -5513,7 +5513,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       executionLockedAt: new Date("2026-06-10T10:06:00.000Z"),
     });
 
-    await expect(svc.clearCheckoutRunIfTerminal(issueId)).resolves.toBe(false);
+    await expect(svc.clearCheckoutRunIfTerminal(issueId)).resolves.toBe(true);
 
     const row = await db
       .select({
@@ -5525,7 +5525,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
-    expect(row?.checkoutRunId).toBe(failedRunId);
+    expect(row?.checkoutRunId).toBeNull();
     expect(row?.executionRunId).toBe(runningRunId);
     expect(row?.executionAgentNameKey).toBe("codexcoder");
     expect(row?.executionLockedAt).toBeInstanceOf(Date);
@@ -5702,13 +5702,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     });
   });
 
-  it("checkout adoption of a stale checkoutRunId preserves the issue's assigneeUserId", async () => {
-    // Regression for PR #2482 checkout-adoption review finding: any adoption
-    // helper that re-locks an existing in_progress issue (e.g. when the prior
-    // checkout/execution run is terminal) must not strip the row's
-    // assigneeUserId. We exercise this via the adoptStaleCheckoutRun path,
-    // which fires when checkoutRunId points at a terminal run while
-    // executionRunId still points at a different, non-terminal run.
+  it("checkout does not replace a different live execution run after clearing a terminal checkout", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const userId = randomUUID();
@@ -5773,8 +5767,9 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       executionLockedAt: new Date("2026-06-10T10:00:00.000Z"),
     });
 
-    const result = await svc.checkout(issueId, agentId, ["todo", "in_progress"], successorRunId);
-    expect(result).toBeTruthy();
+    await expect(
+      svc.checkout(issueId, agentId, ["todo", "in_progress"], successorRunId),
+    ).rejects.toMatchObject({ status: 409 });
 
     const row = await db
       .select({
@@ -5791,8 +5786,8 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       status: "in_progress",
       assigneeAgentId: agentId,
       assigneeUserId: userId,
-      checkoutRunId: successorRunId,
-      executionRunId: successorRunId,
+      checkoutRunId: null,
+      executionRunId: queuedExecutionRunId,
     });
   });
 });

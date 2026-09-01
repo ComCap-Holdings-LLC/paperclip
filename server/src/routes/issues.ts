@@ -224,6 +224,12 @@ import {
   type TrustPresetResolution,
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
+import {
+  PULL_RUN_LEASE_DEFAULT_SECONDS,
+  PULL_RUN_LEASE_MAX_SECONDS,
+  PULL_RUN_LEASE_MIN_SECONDS,
+  pullRunService,
+} from "../services/pull-runs.js";
 import { deliverAgentUnblockNotification } from "../services/routable-blocked.js";
 import {
   assertIssueReviewVerdictActorAllowed,
@@ -256,6 +262,17 @@ const inboxArchiveBodySchema = z.object({
 const externalObjectSummariesSchema = z.object({
   issueIds: z.array(z.string().uuid()).max(1000),
 }).strict();
+const pullRunLeaseSchema = z.object({
+  leaseSeconds: z.number().int().min(PULL_RUN_LEASE_MIN_SECONDS).max(PULL_RUN_LEASE_MAX_SECONDS)
+    .default(PULL_RUN_LEASE_DEFAULT_SECONDS),
+}).strict().default({});
+const startPullRunSchema = z.object({
+  leaseSeconds: z.number().int().min(PULL_RUN_LEASE_MIN_SECONDS).max(PULL_RUN_LEASE_MAX_SECONDS)
+    .default(PULL_RUN_LEASE_DEFAULT_SECONDS),
+  expectedStatuses: z.array(z.enum(["backlog", "todo", "in_progress"])).nonempty()
+    .default(["backlog", "todo", "in_progress"]),
+}).strict().default({});
+const pullRunParamSchema = z.string().uuid();
 
 const promoteLowTrustOutputSchema = z.object({
   sourceArtifactKind: z.enum(["comment", "document", "work_product", "issue"]),
@@ -2878,6 +2895,7 @@ export function issueRoutes(
 ) {
   const router = Router();
   const svc = issueService(db);
+  const pullRuns = pullRunService(db);
   const runRedactions = createRunSecretRedactionRegistry(db);
   const access = accessService(db);
   const heartbeat = heartbeatService(db, {
@@ -4099,7 +4117,7 @@ export function issueRoutes(
       /** Used only to name the task in denial copy (plan §6). */
       identifier?: string | null;
     },
-    options: { allowVisibleIssueWrite?: boolean } = {},
+    options: { allowVisibleIssueWrite?: boolean; requireCheckoutOwner?: boolean } = {},
   ) {
     if (req.actor.type !== "agent") return true;
     const actorAgentId = req.actor.agentId;
@@ -4134,6 +4152,10 @@ export function issueRoutes(
     if (!boundaryDecision.allowed) {
       return denyIssueWrite(req, res, issue, issueWriteDenialCodeForDecision(boundaryDecision));
     }
+    // Starting a server-minted pull run deliberately has no actor run id yet.
+    // Keep every policy gate above, but leave the ownership proof to the
+    // pull-run lifecycle service after it has minted the server-owned run.
+    if (options.requireCheckoutOwner === false) return true;
     if (issue.assigneeAgentId === null) {
       return true;
     }
@@ -10526,6 +10548,141 @@ export function issueRoutes(
 
     await queueTaskWatchdogEvaluation(existing, actor.runId);
     res.json(issue);
+  });
+
+  router.post("/issues/:id/pull-runs", validate(startPullRunSchema), async (req, res) => {
+    const actor = req.actor;
+    if (actor.type !== "agent" || actor.source !== "agent_key" || !actor.companyId || !actor.agentId) {
+      res.status(403).json({ error: "Agent API key required" });
+      return;
+    }
+    if (actor.runId) {
+      res.status(400).json({ error: "Pull-run start does not accept a client-supplied run id" });
+      return;
+    }
+    const parsedIssueId = pullRunParamSchema.safeParse(req.params.id);
+    if (!parsedIssueId.success) {
+      res.status(400).json({ error: "Invalid issue id" });
+      return;
+    }
+    const id = parsedIssueId.data;
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    // Pull start is an issue mutation plus (when unassigned) an assignment.  It
+    // must take the exact same authorization path as checkout; otherwise a
+    // scoped/low-trust key can turn an issue into an active assignment merely by
+    // asking the server to mint a run.
+    if (!(await assertAgentIssueMutationAllowed(req, res, issue, { requireCheckoutOwner: false }))) return;
+    if (issue.projectId) {
+      const project = await projectsSvc.getById(issue.projectId);
+      if (project?.pausedAt) {
+        res.status(409).json({
+          error: project.pauseReason === "budget"
+            ? "Project is paused because its budget hard-stop was reached"
+            : "Project is paused",
+        });
+        return;
+      }
+    }
+    if (issue.assigneeAgentId !== actor.agentId) {
+      await assertCanAssignTasks(req, issue.companyId, {
+        issueId: issue.id,
+        projectId: issue.projectId ?? null,
+        parentIssueId: issue.parentId ?? null,
+        assigneeAgentId: actor.agentId,
+        assigneeUserId: null,
+      });
+    }
+    const result = await pullRuns.start({
+      companyId: actor.companyId,
+      agentId: actor.agentId,
+      issueId: issue.id,
+      expectedStatuses: req.body.expectedStatuses,
+      leaseSeconds: req.body.leaseSeconds,
+      auditActor: {
+        actorType: "agent",
+        actorId: actor.agentId,
+        agentId: actor.agentId,
+        agentApiKeyId: actor.keyId,
+        responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+      },
+    });
+    res.status(result.idempotent ? 200 : 201).json({
+      runId: result.run.id,
+      status: result.run.status,
+      leaseExpiresAt: result.run.leaseExpiresAt,
+      idempotent: result.idempotent,
+      issue: result.issue,
+    });
+  });
+
+  router.post("/pull-runs/:runId/heartbeat", validate(pullRunLeaseSchema), async (req, res) => {
+    const actor = req.actor;
+    if (actor.type !== "agent" || actor.source !== "agent_key" || !actor.companyId || !actor.agentId) {
+      res.status(403).json({ error: "Agent API key required" });
+      return;
+    }
+    const parsedRunId = pullRunParamSchema.safeParse(req.params.runId);
+    if (!parsedRunId.success) {
+      res.status(400).json({ error: "Invalid pull run id" });
+      return;
+    }
+    const run = await pullRuns.heartbeat(
+      actor.companyId,
+      actor.agentId,
+      parsedRunId.data,
+      req.body.leaseSeconds,
+      {
+        actorType: "agent",
+        actorId: actor.agentId,
+        agentId: actor.agentId,
+        agentApiKeyId: actor.keyId,
+        responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+      },
+    );
+    res.json({ runId: run.id, status: run.status, leaseExpiresAt: run.leaseExpiresAt });
+  });
+
+  router.post("/pull-runs/:runId/complete", async (req, res) => {
+    const actor = req.actor;
+    if (actor.type !== "agent" || actor.source !== "agent_key" || !actor.companyId || !actor.agentId) {
+      res.status(403).json({ error: "Agent API key required" });
+      return;
+    }
+    const parsedRunId = pullRunParamSchema.safeParse(req.params.runId);
+    if (!parsedRunId.success) {
+      res.status(400).json({ error: "Invalid pull run id" });
+      return;
+    }
+    const run = await pullRuns.complete(actor.companyId, actor.agentId, parsedRunId.data, {
+      actorType: "agent",
+      actorId: actor.agentId,
+      agentId: actor.agentId,
+      agentApiKeyId: actor.keyId,
+      responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+    });
+    res.json({ runId: run.id, status: run.status, finishedAt: run.finishedAt });
+  });
+
+  router.post("/pull-runs/:runId/cancel", async (req, res) => {
+    const actor = req.actor;
+    if (actor.type !== "agent" || actor.source !== "agent_key" || !actor.companyId || !actor.agentId) {
+      res.status(403).json({ error: "Agent API key required" });
+      return;
+    }
+    const parsedRunId = pullRunParamSchema.safeParse(req.params.runId);
+    if (!parsedRunId.success) {
+      res.status(400).json({ error: "Invalid pull run id" });
+      return;
+    }
+    const run = await pullRuns.cancel(actor.companyId, actor.agentId, parsedRunId.data, {
+      actorType: "agent",
+      actorId: actor.agentId,
+      agentId: actor.agentId,
+      agentApiKeyId: actor.keyId,
+      responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+    });
+    res.json({ runId: run.id, status: run.status, finishedAt: run.finishedAt });
   });
 
   router.post("/issues/:id/checkout", validate(checkoutIssueSchema), async (req, res) => {

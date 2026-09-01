@@ -1,4 +1,4 @@
-import { and, count, eq } from "drizzle-orm";
+import { and, count, eq, gte, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { activityLog, heartbeatRuns } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
@@ -6,6 +6,7 @@ import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 
 export const CROSS_ISSUE_INFLUENCE_LIMIT = 20;
+export const CROSS_ISSUE_INFLUENCE_WINDOW_MS = 60_000;
 export const CROSS_ISSUE_INFLUENCE_ENFORCE_AT = new Date("2026-08-11T00:00:00.000Z");
 
 const CROSS_ISSUE_INFLUENCE_ACTIVITY = "issue.cross_issue_influence_observed";
@@ -20,6 +21,45 @@ export type CrossIssueInfluenceDecision = {
   cap: number;
   enforceAt: string;
 };
+
+type DatabaseClockReader = (tx: Pick<Db, "execute">) => Promise<Date>;
+
+function isIterable(value: unknown): value is Iterable<unknown> {
+  return (
+    value !== null &&
+    (typeof value === "object" || typeof value === "function") &&
+    Symbol.iterator in value &&
+    typeof value[Symbol.iterator] === "function"
+  );
+}
+
+function databaseClockRows(result: unknown): unknown[] {
+  if (result !== null && typeof result === "object" && "rows" in result) {
+    const { rows } = result as { rows?: unknown };
+    return Array.isArray(rows) ? rows : [];
+  }
+  return isIterable(result) ? Array.from(result) : [];
+}
+
+async function readPostgresClock(tx: Pick<Db, "execute">): Promise<Date> {
+  // PostgreSQL timestamps may carry microseconds while JavaScript Date and this
+  // Drizzle column persist milliseconds. Normalize before deriving the cutoff
+  // so the inclusive boundary and inserted observation use identical precision.
+  const rows = databaseClockRows(await tx.execute(sql<{ observedAt: Date | string }>`
+    select date_trunc('milliseconds', clock_timestamp()) as "observedAt"
+  `));
+  // Drizzle's generic execute result is exposed as an unknown row shape here;
+  // the SQL alias above is the narrow, runtime-validated boundary we consume.
+  const firstRow = rows[0];
+  const observedAtValue = firstRow !== null && typeof firstRow === "object" && "observedAt" in firstRow
+    ? firstRow.observedAt
+    : undefined;
+  const observedAt = new Date(
+    observedAtValue instanceof Date || typeof observedAtValue === "string" ? observedAtValue : "",
+  );
+  if (Number.isNaN(observedAt.getTime())) throw new Error("database clock returned an invalid timestamp");
+  return observedAt;
+}
 
 export function crossIssueInfluenceRunContextError() {
   // Copy comes from the shared issue-write denial contract (the open cross-task write design (failure UX))
@@ -39,10 +79,9 @@ function readRunSourceIssueId(contextSnapshot: unknown) {
 
 export function evaluateCrossIssueInfluenceLimit(input: {
   priorCount: number;
-  now?: Date;
+  observedAt: Date;
 }): CrossIssueInfluenceDecision {
-  const now = input.now ?? new Date();
-  const mode = now >= CROSS_ISSUE_INFLUENCE_ENFORCE_AT ? "enforce" : "log_only";
+  const mode = input.observedAt >= CROSS_ISSUE_INFLUENCE_ENFORCE_AT ? "enforce" : "log_only";
   const nextCount = input.priorCount + 1;
   return {
     allowed: mode === "log_only" || nextCount <= CROSS_ISSUE_INFLUENCE_LIMIT,
@@ -71,8 +110,8 @@ export async function observeCrossIssueInfluence(
     targetIssueId: string;
     targetIssueIdentifier?: string | null;
     kind: CrossIssueInfluenceKind;
-    now?: Date;
   },
+  readDatabaseClock: DatabaseClockReader = readPostgresClock,
 ): Promise<CrossIssueInfluenceDecision | null> {
   // API-key callers control the run header. Reject malformed UUIDs before the
   // database can turn an untrusted identifier into a PostgreSQL cast error.
@@ -112,6 +151,10 @@ export async function observeCrossIssueInfluence(
       return null;
     }
 
+    // Read PostgreSQL's wall clock once after the run lock.  It is the only
+    // clock allowed to define both the rolling cutoff and the observation.
+    const observedAt = await readDatabaseClock(tx);
+    const windowStart = new Date(observedAt.getTime() - CROSS_ISSUE_INFLUENCE_WINDOW_MS);
     const priorCount = await tx
       .select({ count: count() })
       .from(activityLog)
@@ -119,9 +162,10 @@ export async function observeCrossIssueInfluence(
         eq(activityLog.companyId, input.companyId),
         eq(activityLog.runId, input.runId),
         eq(activityLog.action, CROSS_ISSUE_INFLUENCE_ACTIVITY),
+        gte(activityLog.createdAt, windowStart),
       ))
       .then((rows) => Number(rows[0]?.count ?? 0));
-    const decision = evaluateCrossIssueInfluenceLimit({ priorCount, now: input.now });
+    const decision = evaluateCrossIssueInfluenceLimit({ priorCount, observedAt });
 
     await tx.insert(activityLog).values({
       companyId: input.companyId,
@@ -146,6 +190,9 @@ export async function observeCrossIssueInfluence(
         enforceAt: decision.enforceAt,
         allowed: decision.allowed,
       },
+      // Keep the persisted observation on the one database clock used for
+      // the inclusive rolling window cutoff.
+      createdAt: observedAt,
     });
 
     const logContext = {
@@ -177,7 +224,7 @@ export function crossIssueInfluenceLimitError(
   context: { actorLabel?: string | null; assigneeLabel?: string | null; issueIdentifier?: string | null } = {},
 ) {
   // The cap is a rate backstop, not a permission decision — the shared copy
-  // contract says so explicitly, and names the next run as the way forward.
+  // contract says so explicitly, and names the rolling-window retry path.
   const { body } = issueWriteDenialResponse("cross_issue_influence_cap_exceeded", {
     ...context,
     cap: decision.cap,

@@ -101,7 +101,7 @@ describe("cross-issue influence limit rollout", () => {
     expect(capError.error).toContain("20");
     expect(capError.error).toContain("Who can act:");
     expect(capError.error).toContain("Try this:");
-    expect(capError.error).toContain("next heartbeat");
+    expect(capError.error).toContain("60 seconds");
     expect(capError.details.boundary).toContain("20");
     expect(capError.details.whoCanAct).toContain("Fable");
   });

@@ -71,7 +71,7 @@ describe("describeIssueWriteDenial", () => {
     expect(copy.boundary).toContain("20");
     expect(copy.description).toContain("attempt 21");
     expect(copy.description).toContain("still allowed");
-    expect(copy.sanctionedPath).toContain("next heartbeat");
+    expect(copy.sanctionedPath).toContain("60 seconds");
   });
 
   it("defaults the cap to the shipped limit when context omits it", () => {

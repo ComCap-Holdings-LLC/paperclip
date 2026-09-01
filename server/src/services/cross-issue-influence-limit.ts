@@ -1,4 +1,4 @@
-import { and, count, eq } from "drizzle-orm";
+import { and, count, eq, gte } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { activityLog, heartbeatRuns } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
@@ -6,6 +6,7 @@ import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 
 export const CROSS_ISSUE_INFLUENCE_LIMIT = 20;
+export const CROSS_ISSUE_INFLUENCE_WINDOW_MS = 60_000;
 export const CROSS_ISSUE_INFLUENCE_ENFORCE_AT = new Date("2026-08-11T00:00:00.000Z");
 
 const CROSS_ISSUE_INFLUENCE_ACTIVITY = "issue.cross_issue_influence_observed";
@@ -112,6 +113,8 @@ export async function observeCrossIssueInfluence(
       return null;
     }
 
+    const now = input.now ?? new Date();
+    const windowStart = new Date(now.getTime() - CROSS_ISSUE_INFLUENCE_WINDOW_MS);
     const priorCount = await tx
       .select({ count: count() })
       .from(activityLog)
@@ -119,9 +122,10 @@ export async function observeCrossIssueInfluence(
         eq(activityLog.companyId, input.companyId),
         eq(activityLog.runId, input.runId),
         eq(activityLog.action, CROSS_ISSUE_INFLUENCE_ACTIVITY),
+        gte(activityLog.createdAt, windowStart),
       ))
       .then((rows) => Number(rows[0]?.count ?? 0));
-    const decision = evaluateCrossIssueInfluenceLimit({ priorCount, now: input.now });
+    const decision = evaluateCrossIssueInfluenceLimit({ priorCount, now });
 
     await tx.insert(activityLog).values({
       companyId: input.companyId,
@@ -146,6 +150,10 @@ export async function observeCrossIssueInfluence(
         enforceAt: decision.enforceAt,
         allowed: decision.allowed,
       },
+      // Keep the recorded observation on the same clock used to select the
+      // rolling window. This also makes a caller-supplied clock deterministic
+      // in tests without changing the normal production timestamp behavior.
+      createdAt: now,
     });
 
     const logContext = {
@@ -177,7 +185,7 @@ export function crossIssueInfluenceLimitError(
   context: { actorLabel?: string | null; assigneeLabel?: string | null; issueIdentifier?: string | null } = {},
 ) {
   // The cap is a rate backstop, not a permission decision — the shared copy
-  // contract says so explicitly, and names the next run as the way forward.
+  // contract says so explicitly, and names the rolling-window retry path.
   const { body } = issueWriteDenialResponse("cross_issue_influence_cap_exceeded", {
     ...context,
     cap: decision.cap,

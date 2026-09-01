@@ -171,6 +171,7 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
       .send({ body: "Cross-issue collaboration note" });
     expect(commentResponse.status, JSON.stringify(commentResponse.body)).toBe(201);
     expect(commentResponse.body).toMatchObject({
+      authorType: "agent",
       authorAgentId: fixture.actorAgent.id,
       onBehalfOfUserId: fixture.responsibleUserId,
       createdByRunId: fixture.run.id,

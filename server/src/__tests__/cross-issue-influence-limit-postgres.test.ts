@@ -40,7 +40,7 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
     await tempDb?.cleanup();
   });
 
-  it("allows exactly one of concurrent attempts 20 and 21", async () => {
+  it("allows exactly 20 of 21 concurrent attempts from the same run", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const runId = randomUUID();
@@ -71,19 +71,6 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       responsibleUserId: "board-user",
       contextSnapshot: { issueId: sourceIssueId },
     });
-    await db.insert(activityLog).values(
-      Array.from({ length: 19 }, () => ({
-        companyId,
-        actorType: "agent" as const,
-        actorId: agentId,
-        agentId,
-        runId,
-        action: "issue.cross_issue_influence_observed",
-        entityType: "issue",
-        entityId: targetIssueId,
-      })),
-    );
-
     const input = {
       companyId,
       runId,
@@ -93,13 +80,15 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       kind: "comment" as const,
       now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
     };
-    const decisions = await Promise.all([
-      observeCrossIssueInfluence(db, input),
-      observeCrossIssueInfluence(db, { ...input, kind: "update" }),
-    ]);
+    const decisions = await Promise.all(Array.from({ length: 21 }, (_, index) =>
+      observeCrossIssueInfluence(db, { ...input, kind: index % 2 === 0 ? "comment" : "update" }),
+    ));
 
-    expect(decisions.map((decision) => decision?.allowed).sort()).toEqual([false, true]);
-    expect(decisions.map((decision) => decision?.count).sort((a, b) => Number(a) - Number(b))).toEqual([20, 21]);
+    expect(decisions.filter((decision) => decision?.allowed)).toHaveLength(20);
+    expect(decisions.filter((decision) => !decision?.allowed)).toHaveLength(1);
+    expect(decisions.map((decision) => decision?.count).sort((a, b) => Number(a) - Number(b))).toEqual(
+      Array.from({ length: 21 }, (_, index) => index + 1),
+    );
 
     const recorded = await db
       .select({ action: activityLog.action })
@@ -107,5 +96,71 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       .where(and(eq(activityLog.companyId, companyId), eq(activityLog.runId, runId)));
     expect(recorded.filter((row) => row.action === "issue.cross_issue_influence_observed")).toHaveLength(20);
     expect(recorded.filter((row) => row.action === "issue.cross_issue_influence_cap_rejected")).toHaveLength(1);
+  });
+
+  it("refills the run budget after observations age out of the inclusive 60-second window", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const sourceIssueId = randomUUID();
+    const targetIssueId = randomUUID();
+    const now = new Date("2026-08-12T00:01:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      defaultResponsibleUserId: "board-user",
+    });
+    await db.insert(agents).values({
+      id: agentId, companyId, name: "Rolling Coder", role: "engineer",
+      adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId, status: "running", responsibleUserId: "board-user",
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    await db.insert(activityLog).values(Array.from({ length: 20 }, () => ({
+      companyId, actorType: "agent" as const, actorId: agentId, agentId, runId,
+      action: "issue.cross_issue_influence_observed", entityType: "issue", entityId: targetIssueId,
+      createdAt: new Date(now.getTime() - 60_001),
+    })));
+
+    await expect(observeCrossIssueInfluence(db, {
+      companyId, runId, agentId, targetIssueId, targetIssueIdentifier: "CAP-2", kind: "comment", now,
+    })).resolves.toMatchObject({ allowed: true, count: 1, cap: 20 });
+  });
+
+  it("counts observations exactly at the inclusive 60-second cutoff", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const sourceIssueId = randomUUID();
+    const targetIssueId = randomUUID();
+    const now = new Date("2026-08-12T00:01:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      defaultResponsibleUserId: "board-user",
+    });
+    await db.insert(agents).values({
+      id: agentId, companyId, name: "Boundary Coder", role: "engineer",
+      adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId, status: "running", responsibleUserId: "board-user",
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    await db.insert(activityLog).values(Array.from({ length: 20 }, () => ({
+      companyId, actorType: "agent" as const, actorId: agentId, agentId, runId,
+      action: "issue.cross_issue_influence_observed", entityType: "issue", entityId: targetIssueId,
+      createdAt: new Date(now.getTime() - 60_000),
+    })));
+
+    await expect(observeCrossIssueInfluence(db, {
+      companyId, runId, agentId, targetIssueId, targetIssueIdentifier: "CAP-2", kind: "comment", now,
+    })).resolves.toMatchObject({ allowed: false, count: 21, cap: 20 });
   });
 });

@@ -19,7 +19,7 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
 describeEmbeddedPostgres("external pull-run leases", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
-  let activityFailureObjectsInstalled = false;
+  let activityFailureFunctionName: string | null = null;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-pull-runs-");
@@ -27,10 +27,10 @@ describeEmbeddedPostgres("external pull-run leases", () => {
   }, 20_000);
 
   afterEach(async () => {
-    if (activityFailureObjectsInstalled) {
-      await db.execute(sql`drop trigger if exists reject_pull_run_started_activity on ${activityLog}`);
-      await db.execute(sql`drop function if exists reject_pull_run_started_activity()`);
-      activityFailureObjectsInstalled = false;
+    if (activityFailureFunctionName) {
+      await db.execute(sql.raw(`drop trigger if exists ${activityFailureFunctionName} on activity_log`));
+      await db.execute(sql.raw(`drop function if exists ${activityFailureFunctionName}()`));
+      activityFailureFunctionName = null;
     }
     await db.delete(activityLog);
     await db.delete(issues);
@@ -179,7 +179,7 @@ describeEmbeddedPostgres("external pull-run leases", () => {
       end;
       $function$
     `);
-    activityFailureObjectsInstalled = true;
+    activityFailureFunctionName = "reject_pull_run_started_activity";
     await db.execute(sql`
       create trigger reject_pull_run_started_activity
       before insert on ${activityLog}
@@ -279,12 +279,19 @@ describeEmbeddedPostgres("external pull-run leases", () => {
     await expect(issueService(db).assertCheckoutOwner(f.issueId, f.agentId, started.run.id))
       .rejects.toMatchObject({ status: 409 });
     let issue = await db.select().from(issues).where(eq(issues.id, f.issueId)).then((rows) => rows[0]!);
+    let run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, started.run.id)).then((rows) => rows[0]!);
     expect(issue.checkoutRunId).toBeNull();
     expect(issue.executionRunId).toBeNull();
+    expect(run.status).toBe("timed_out");
+    await expect(db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(eq(activityLog.runId, started.run.id)))
+      .resolves.toContainEqual({ action: "pull_run.expired" });
 
     await expect(svc.heartbeat(f.companyId, f.agentId, started.run.id, 120))
       .rejects.toMatchObject({ status: 409 });
-    const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, started.run.id)).then((rows) => rows[0]!);
+    run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, started.run.id)).then((rows) => rows[0]!);
     expect(run.status).toBe("timed_out");
     issue = await db.select().from(issues).where(eq(issues.id, f.issueId)).then((rows) => rows[0]!);
     expect(issue.checkoutRunId).toBeNull();
@@ -301,6 +308,81 @@ describeEmbeddedPostgres("external pull-run leases", () => {
     const issue = await db.select().from(issues).where(eq(issues.id, f.issueId)).then((rows) => rows[0]!);
     expect(run.status).toBe("timed_out");
     expect(issue.checkoutRunId).toBeNull();
+  });
+
+  it("rolls back timeout and lock release when expiry audit persistence fails", async () => {
+    const f = await fixture();
+    const svc = pullRunService(db);
+    const started = await svc.start({
+      companyId: f.companyId,
+      agentId: f.agentId,
+      issueId: f.issueId,
+      expectedStatuses: ["todo"],
+      leaseSeconds: 60,
+    });
+    await db.update(heartbeatRuns)
+      .set({ leaseExpiresAt: new Date(Date.now() - 1_000) })
+      .where(eq(heartbeatRuns.id, started.run.id));
+    await db.execute(sql`
+      create function reject_pull_run_expired_activity()
+      returns trigger
+      language plpgsql
+      as $function$
+      begin
+        raise exception 'forced pull-run expiry activity failure';
+      end;
+      $function$
+    `);
+    activityFailureFunctionName = "reject_pull_run_expired_activity";
+    await db.execute(sql`
+      create trigger reject_pull_run_expired_activity
+      before insert on ${activityLog}
+      for each row
+      when (new.action = 'pull_run.expired')
+      execute function reject_pull_run_expired_activity()
+    `);
+
+    await expect(svc.sweepExpired()).rejects.toThrow(/insert into "activity_log"/);
+
+    const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, started.run.id)).then((rows) => rows[0]!);
+    const issue = await db.select().from(issues).where(eq(issues.id, f.issueId)).then((rows) => rows[0]!);
+    expect(run.status).toBe("running");
+    expect(issue.checkoutRunId).toBe(started.run.id);
+    expect(issue.executionRunId).toBe(started.run.id);
+    expect(await db.select().from(activityLog).where(eq(activityLog.action, "pull_run.expired"))).toHaveLength(0);
+  });
+
+  it("clears only terminal-run lock columns and preserves a different live run", async () => {
+    const f = await fixture();
+    const svc = pullRunService(db);
+    const started = await svc.start({
+      companyId: f.companyId,
+      agentId: f.agentId,
+      issueId: f.issueId,
+      expectedStatuses: ["todo"],
+      leaseSeconds: 60,
+    });
+    const liveRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: liveRunId,
+      companyId: f.companyId,
+      agentId: f.agentId,
+      status: "running",
+      invocationSource: "manual",
+    });
+    await db.update(issues)
+      .set({ executionRunId: liveRunId, executionLockedAt: new Date() })
+      .where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns)
+      .set({ leaseExpiresAt: new Date(Date.now() - 1_000) })
+      .where(eq(heartbeatRuns.id, started.run.id));
+
+    expect(await svc.sweepExpired()).toBe(1);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, f.issueId)).then((rows) => rows[0]!);
+    expect(issue.checkoutRunId).toBeNull();
+    expect(issue.executionRunId).toBe(liveRunId);
+    expect(issue.executionLockedAt).toBeInstanceOf(Date);
   });
 
   it("cancel is owner-only, terminal, and requeues an in-progress issue", async () => {

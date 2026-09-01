@@ -964,6 +964,16 @@ export async function startServer(): Promise<StartedServer> {
         logger.error({ err }, "external-object scheduler tick failed");
       }));
   };
+  const schedulePullRunExpirySweep = (now = new Date()) => {
+    if (heartbeatSchedulerStopped) return;
+    trackHeartbeatSchedulerWork(pullRuns.sweepExpired(now).catch((err: unknown) => {
+      logger.error({ err }, "pull-run lease expiry sweep failed");
+    }));
+  };
+
+  // External pull-run leases are a server lifecycle concern, not heartbeat
+  // scheduling. Expire them on startup even when heartbeat scheduling is off.
+  await pullRuns.sweepExpired();
 
   if (heartbeat) {
     const secretProposals = createSecretProposalsService(db as any);
@@ -1187,7 +1197,6 @@ export async function startServer(): Promise<StartedServer> {
       logger.warn({ ...toolHealthSweep }, "startup tool connection health sweep found failing connections");
     }
     await decisionExecutor.sweepExpired();
-    await pullRuns.sweepExpired();
 
     // Run the adapter login reaper once at startup, so a login sandbox that
     // outlived a server restart is deleted before timer ticks start.
@@ -1226,9 +1235,7 @@ export async function startServer(): Promise<StartedServer> {
         trackHeartbeatSchedulerWork(decisionExecutor.sweepExpired().catch((err: unknown) => {
           logger.error({ err }, "decision expiry sweep failed");
         }));
-        trackHeartbeatSchedulerWork(pullRuns.sweepExpired().catch((err: unknown) => {
-          logger.error({ err }, "pull-run lease expiry sweep failed");
-        }));
+        schedulePullRunExpirySweep(new Date());
         trackHeartbeatSchedulerWork(runRetentionSweep().catch((err: unknown) => {
           logger.error({ err }, "decision retention sweep failed");
         }));
@@ -1398,6 +1405,7 @@ export async function startServer(): Promise<StartedServer> {
     });
   } else {
     startHeartbeatSchedulerInterval(() => {
+      schedulePullRunExpirySweep(new Date());
       scheduleExternalObjectRefreshSweep(new Date());
     });
   }

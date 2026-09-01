@@ -29,6 +29,8 @@ const {
   issueThreadInteractionServiceFactoryMock,
   issueThreadInteractionServiceMock,
   loadConfigMock,
+  pullRunServiceFactoryMock,
+  pullRunServiceMock,
   resolveHeartbeatSchedulingSuppressionMock,
   routineServiceFactoryMock,
   routineServiceMock,
@@ -122,6 +124,10 @@ const {
     close: vi.fn(),
   };
   const loadConfigMock = vi.fn();
+  const pullRunServiceMock = {
+    sweepExpired: vi.fn(async () => 0),
+  };
+  const pullRunServiceFactoryMock = vi.fn(() => pullRunServiceMock);
 
   return {
     createAppMock,
@@ -143,6 +149,8 @@ const {
     issueThreadInteractionServiceFactoryMock,
     issueThreadInteractionServiceMock,
     loadConfigMock,
+    pullRunServiceFactoryMock,
+    pullRunServiceMock,
     resolveHeartbeatSchedulingSuppressionMock,
     routineServiceFactoryMock,
     routineServiceMock,
@@ -316,6 +324,10 @@ vi.mock("../services/secret-proposals.js", () => ({
   createSecretProposalsService: vi.fn(() => ({
     sweepExpired: vi.fn(async () => 0),
   })),
+}));
+
+vi.mock("../services/pull-runs.js", () => ({
+  pullRunService: pullRunServiceFactoryMock,
 }));
 
 vi.mock("../storage/index.js", () => ({
@@ -506,7 +518,7 @@ describe("startServer feedback export wiring", () => {
     }
   });
 
-  it("keeps external object refresh active when heartbeat scheduling is disabled", async () => {
+  it("keeps lifecycle sweeps active when heartbeat scheduling is disabled", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: false,
       heartbeatSchedulerIntervalMs: 30000,
@@ -523,12 +535,14 @@ describe("startServer feedback export wiring", () => {
       await startServer();
 
       expect(heartbeatServiceFactoryMock).not.toHaveBeenCalled();
+      expect(pullRunServiceMock.sweepExpired).toHaveBeenCalledTimes(1);
       expect(intervalCallback).not.toBeNull();
       intervalCallback?.();
       await Promise.resolve();
       await Promise.resolve();
 
       expect(externalObjectsServiceMock.refreshDueObjectsForActiveCompanies).toHaveBeenCalledTimes(1);
+      expect(pullRunServiceMock.sweepExpired).toHaveBeenCalledTimes(2);
       expect(routineServiceMock.tickScheduledTriggers).not.toHaveBeenCalled();
       expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).not.toHaveBeenCalled();
     } finally {

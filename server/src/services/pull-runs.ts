@@ -8,13 +8,19 @@ import {
   type ActivityPublication,
   type LogActivityInput,
 } from "./activity-log.js";
-import { issueService, TERMINAL_HEARTBEAT_RUN_STATUSES } from "./issues.js";
+import { issueService } from "./issues.js";
+import {
+  EXTERNAL_PULL_RUN_TRIGGER,
+  expireExternalPullRun,
+  externalPullRunIsExpired,
+  LIVE_PULL_RUN_STATUSES,
+  TERMINAL_HEARTBEAT_RUN_STATUSES,
+} from "./external-pull-run-lifecycle.js";
 
-export const EXTERNAL_PULL_RUN_TRIGGER = "external_pull";
+export { EXTERNAL_PULL_RUN_TRIGGER } from "./external-pull-run-lifecycle.js";
 export const PULL_RUN_LEASE_DEFAULT_SECONDS = 120;
 export const PULL_RUN_LEASE_MIN_SECONDS = 30;
 export const PULL_RUN_LEASE_MAX_SECONDS = 600;
-const LIVE_RUN_STATUSES = ["queued", "scheduled_retry", "running"];
 
 export interface PullRunAuditActor {
   actorType: "agent" | "system";
@@ -46,7 +52,7 @@ function assertLeaseSeconds(leaseSeconds: number) {
 }
 
 function isExpired(run: { leaseExpiresAt: Date | null }, now: Date) {
-  return run.leaseExpiresAt == null || run.leaseExpiresAt.getTime() <= now.getTime();
+  return externalPullRunIsExpired(run, now);
 }
 
 export function pullRunService(db: Db) {
@@ -82,77 +88,6 @@ export function pullRunService(db: Db) {
     };
   }
 
-  async function expireRun(runId: string, now = new Date()) {
-    return auditedTransaction(async (tx, publications) => {
-      // Lifecycle operations always lock issue before run.  The issue service's
-      // checkout/adoption paths use the same order, avoiding a run->issue
-      // deadlock when expiry races a checkout-owner assertion.
-      await tx.execute(
-        sql`select ${issues.id} from ${issues} where ${issues.checkoutRunId} = ${runId} or ${issues.executionRunId} = ${runId} order by ${issues.id} for update`,
-      );
-      await tx.execute(
-        sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${runId} for update`,
-      );
-      const run = await tx
-        .select()
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, runId))
-        .then((rows) => rows[0] ?? null);
-      if (
-        !run
-        || run.triggerDetail !== EXTERNAL_PULL_RUN_TRIGGER
-        || TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)
-        || !isExpired(run, now)
-      ) {
-        return false;
-      }
-      const updated = await tx
-        .update(heartbeatRuns)
-        .set({
-          status: "timed_out",
-          finishedAt: now,
-          errorCode: "pull_run_lease_expired",
-          error: "External pull-run lease expired",
-          updatedAt: now,
-        })
-        .where(and(eq(heartbeatRuns.id, run.id), inArray(heartbeatRuns.status, LIVE_RUN_STATUSES)))
-        .returning({ id: heartbeatRuns.id })
-        .then((rows) => rows[0] ?? null);
-      if (!updated) return false;
-      const ownedIssue = await tx
-        .select({ id: issues.id })
-        .from(issues)
-        .where(or(eq(issues.checkoutRunId, run.id), eq(issues.executionRunId, run.id)))
-        .then((rows) => rows[0] ?? null);
-      await tx
-        .update(issues)
-        .set({
-          checkoutRunId: null,
-          executionRunId: null,
-          executionAgentNameKey: null,
-          executionLockedAt: null,
-          updatedAt: now,
-        })
-        .where(and(eq(issues.checkoutRunId, run.id), eq(issues.executionRunId, run.id)));
-      await logActivity(tx, {
-        companyId: run.companyId,
-        actorType: "system",
-        actorId: "pull-run-lease-sweeper",
-        agentId: run.agentId,
-        runId: run.id,
-        action: "pull_run.expired",
-        entityType: "heartbeat_run",
-        entityId: run.id,
-        issueId: ownedIssue?.id ?? null,
-        details: {
-          issueId: ownedIssue?.id ?? null,
-          reason: "lease_expired",
-        },
-      }, publications);
-      return true;
-    });
-  }
-
   /** Scheduler-facing recovery: expired external pulls cannot depend on a
    * later client request to release their issue checkout. */
   async function sweepExpired(now = new Date(), limit = 100) {
@@ -161,12 +96,12 @@ export function pullRunService(db: Db) {
       .from(heartbeatRuns)
       .where(and(
         eq(heartbeatRuns.triggerDetail, EXTERNAL_PULL_RUN_TRIGGER),
-        inArray(heartbeatRuns.status, LIVE_RUN_STATUSES),
+        inArray(heartbeatRuns.status, LIVE_PULL_RUN_STATUSES),
         or(isNull(heartbeatRuns.leaseExpiresAt), lte(heartbeatRuns.leaseExpiresAt, now)),
       ))
       .limit(limit);
     let expired = 0;
-    for (const candidate of candidates) if (await expireRun(candidate.id, now)) expired += 1;
+    for (const candidate of candidates) if (await expireExternalPullRun(db, candidate.id, now)) expired += 1;
     return expired;
   }
 
@@ -221,7 +156,7 @@ export function pullRunService(db: Db) {
     if (!issue) throw notFound("Issue not found");
 
     if (issue.checkoutRunId) {
-      await expireRun(issue.checkoutRunId);
+      await expireExternalPullRun(db, issue.checkoutRunId);
       issue = await db
         .select({
           id: issues.id,
@@ -320,7 +255,7 @@ export function pullRunService(db: Db) {
     if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) throw conflict("Pull run is terminal");
     const now = new Date();
     if (isExpired(run, now)) {
-      await expireRun(run.id, now);
+      await expireExternalPullRun(db, run.id, now);
       throw conflict("Pull run lease expired");
     }
     const updated = await auditedTransaction(async (tx, publications) => {
@@ -331,7 +266,7 @@ export function pullRunService(db: Db) {
           eq(heartbeatRuns.id, run.id),
           eq(heartbeatRuns.agentId, agentId),
           gt(heartbeatRuns.leaseExpiresAt, now),
-          inArray(heartbeatRuns.status, LIVE_RUN_STATUSES),
+          inArray(heartbeatRuns.status, LIVE_PULL_RUN_STATUSES),
         ))
         .returning()
         .then((rows) => rows[0] ?? null);
@@ -348,7 +283,7 @@ export function pullRunService(db: Db) {
       return next;
     });
     if (!updated) {
-      await expireRun(run.id, new Date());
+      await expireExternalPullRun(db, run.id, new Date());
       throw conflict("Pull run is no longer live");
     }
     return updated;
@@ -366,11 +301,11 @@ export function pullRunService(db: Db) {
     if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) throw conflict("Pull run is terminal");
     const now = new Date();
     if (isExpired(run, now)) {
-      await expireRun(run.id, now);
+      await expireExternalPullRun(db, run.id, now);
       throw conflict("Pull run lease expired");
     }
     return auditedTransaction(async (tx, publications) => {
-      // See expireRun: issue -> run is the canonical lifecycle lock order.
+      // External pull-run lifecycle operations use issue -> run lock order.
       await tx.execute(
         sql`select ${issues.id} from ${issues} where ${issues.checkoutRunId} = ${run.id} or ${issues.executionRunId} = ${run.id} order by ${issues.id} for update`,
       );
@@ -385,40 +320,48 @@ export function pullRunService(db: Db) {
           eq(heartbeatRuns.companyId, companyId),
           eq(heartbeatRuns.agentId, agentId),
           gt(heartbeatRuns.leaseExpiresAt, now),
-          inArray(heartbeatRuns.status, LIVE_RUN_STATUSES),
+          inArray(heartbeatRuns.status, LIVE_PULL_RUN_STATUSES),
         ))
         .returning()
         .then((rows) => rows[0] ?? null);
       if (!updated) throw conflict("Pull run is no longer live");
 
       const ownedIssue = await tx
-        .select({ id: issues.id, status: issues.status })
+        .select({
+          id: issues.id,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
         .from(issues)
         .where(and(
           eq(issues.companyId, companyId),
-          eq(issues.assigneeAgentId, agentId),
-          eq(issues.checkoutRunId, run.id),
-          eq(issues.executionRunId, run.id),
+          or(eq(issues.checkoutRunId, run.id), eq(issues.executionRunId, run.id)),
         ))
         .then((rows) => rows[0] ?? null);
       if (ownedIssue) {
+        const ownsBothLocks = ownedIssue.checkoutRunId === run.id
+          && ownedIssue.executionRunId === run.id;
+        const requeue = status === "cancelled"
+          && ownedIssue.status === "in_progress"
+          && ownedIssue.assigneeAgentId === agentId
+          && ownsBothLocks;
         await tx
           .update(issues)
           .set({
-            ...(status === "cancelled" && ownedIssue.status === "in_progress"
+            ...(requeue
               ? { status: "todo", assigneeAgentId: null }
               : {}),
-            checkoutRunId: null,
-            executionRunId: null,
-            executionAgentNameKey: null,
-            executionLockedAt: null,
+            checkoutRunId: sql`case when ${issues.checkoutRunId} = ${run.id} then null else ${issues.checkoutRunId} end`,
+            executionRunId: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionRunId} end`,
+            executionAgentNameKey: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionAgentNameKey} end`,
+            executionLockedAt: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionLockedAt} end`,
             updatedAt: now,
           })
           .where(and(
             eq(issues.id, ownedIssue.id),
-            eq(issues.assigneeAgentId, agentId),
-            eq(issues.checkoutRunId, run.id),
-            eq(issues.executionRunId, run.id),
+            or(eq(issues.checkoutRunId, run.id), eq(issues.executionRunId, run.id)),
           ));
       }
       await logActivity(tx, {
@@ -431,7 +374,11 @@ export function pullRunService(db: Db) {
         issueId: ownedIssue?.id ?? null,
         details: {
           issueId: ownedIssue?.id ?? null,
-          requeued: status === "cancelled" && ownedIssue?.status === "in_progress",
+          requeued: status === "cancelled"
+            && ownedIssue?.status === "in_progress"
+            && ownedIssue?.assigneeAgentId === agentId
+            && ownedIssue?.checkoutRunId === run.id
+            && ownedIssue?.executionRunId === run.id,
         },
       }, publications);
       return updated;

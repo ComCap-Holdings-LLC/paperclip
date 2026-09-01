@@ -42,8 +42,11 @@ function databaseClockRows(result: unknown): unknown[] {
 }
 
 async function readPostgresClock(tx: Pick<Db, "execute">): Promise<Date> {
+  // PostgreSQL timestamps may carry microseconds while JavaScript Date and this
+  // Drizzle column persist milliseconds. Normalize before deriving the cutoff
+  // so the inclusive boundary and inserted observation use identical precision.
   const rows = databaseClockRows(await tx.execute(sql<{ observedAt: Date | string }>`
-    select clock_timestamp() as "observedAt"
+    select date_trunc('milliseconds', clock_timestamp()) as "observedAt"
   `));
   // Drizzle's generic execute result is exposed as an unknown row shape here;
   // the SQL alias above is the narrow, runtime-validated boundary we consume.

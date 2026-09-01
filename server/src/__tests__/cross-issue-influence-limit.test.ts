@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { PgDialect } from "drizzle-orm/pg-core";
 import {
   CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
   CROSS_ISSUE_INFLUENCE_LIMIT,
@@ -14,8 +15,12 @@ function counterDb(
 ) {
   let observedCount = initialCount;
   const inserted: Array<Record<string, unknown>> = [];
+  const executedQueries: unknown[] = [];
   const tx = {
-    execute: async () => executeResult,
+    execute: async (query: unknown) => {
+      executedQueries.push(query);
+      return executeResult;
+    },
     select: (selection: Record<string, unknown>) => ({
       from: () => ({
         where: () => {
@@ -51,6 +56,7 @@ function counterDb(
       transaction: async (callback: (value: typeof tx) => Promise<unknown>) => callback(tx),
     },
     inserted,
+    executedQueries,
     get observedCount() {
       return observedCount;
     },
@@ -179,6 +185,25 @@ describe("cross-issue influence limit rollout", () => {
       kind: "comment",
     })).resolves.toMatchObject({ allowed: false, mode: "enforce", count: 21 });
 
+    expect(fake.inserted[0]?.createdAt).toEqual(observedAt);
+  });
+
+  it("normalizes the database clock to the millisecond precision persisted by the schema", async () => {
+    const observedAt = new Date("2026-08-12T00:01:00.123Z");
+    const fake = counterDb(0, {}, { rows: [{ observedAt }] });
+
+    await observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "comment",
+    });
+
+    const clockQuery = new PgDialect().sqlToQuery(fake.executedQueries[0] as never);
+    expect(clockQuery.sql.replace(/\s+/g, " ").trim()).toBe(
+      `select date_trunc('milliseconds', clock_timestamp()) as "observedAt"`,
+    );
     expect(fake.inserted[0]?.createdAt).toEqual(observedAt);
   });
 

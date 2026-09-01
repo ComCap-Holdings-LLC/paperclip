@@ -154,7 +154,8 @@ describe("cross-issue influence limit rollout", () => {
       const fake = counterDb(20);
       // A stale caller may still send the former, untyped `now` field at runtime.
       // The service contract ignores it and relies solely on the database-clock seam.
-      const decision = await observeCrossIssueInfluence(fake.db as never, { ...base, now }, async () => databaseTime);
+      const legacyInput: typeof base & { now: Date } = { ...base, now };
+      const decision = await observeCrossIssueInfluence(fake.db as never, legacyInput, async () => databaseTime);
       return { decision, createdAt: fake.inserted[0]?.createdAt };
     }));
 

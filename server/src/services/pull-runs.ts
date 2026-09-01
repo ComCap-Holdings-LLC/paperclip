@@ -2,6 +2,12 @@ import { and, eq, gt, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, heartbeatRuns, issues } from "@paperclipai/db";
 import { badRequest, conflict, forbidden, notFound } from "../errors.js";
+import {
+  logActivity,
+  publishActivity,
+  type ActivityPublication,
+  type LogActivityInput,
+} from "./activity-log.js";
 import { issueService, TERMINAL_HEARTBEAT_RUN_STATUSES } from "./issues.js";
 
 export const EXTERNAL_PULL_RUN_TRIGGER = "external_pull";
@@ -9,6 +15,19 @@ export const PULL_RUN_LEASE_DEFAULT_SECONDS = 120;
 export const PULL_RUN_LEASE_MIN_SECONDS = 30;
 export const PULL_RUN_LEASE_MAX_SECONDS = 600;
 const LIVE_RUN_STATUSES = ["queued", "scheduled_retry", "running"];
+
+export interface PullRunAuditActor {
+  actorType: "agent" | "system";
+  actorId: string;
+  agentId?: string | null;
+  agentApiKeyId?: string | null;
+  responsibleUserIdOverride?: string | null;
+}
+
+const DEFAULT_PULL_RUN_AUDIT_ACTOR: PullRunAuditActor = {
+  actorType: "system",
+  actorId: "external-pull-run-service",
+};
 
 function leaseExpiry(now: Date, leaseSeconds: number) {
   return new Date(now.getTime() + leaseSeconds * 1_000);
@@ -31,10 +50,40 @@ function isExpired(run: { leaseExpiresAt: Date | null }, now: Date) {
 }
 
 export function pullRunService(db: Db) {
-  const issuesSvc = issueService(db);
+  async function auditedTransaction<T>(
+    operation: (tx: Db, publications: ActivityPublication[]) => Promise<T>,
+  ): Promise<T> {
+    const publications: ActivityPublication[] = [];
+    const result = await db.transaction(async (tx) => operation(tx as unknown as Db, publications));
+    for (const publication of publications) publishActivity(publication);
+    return result;
+  }
+
+  function activityActor(
+    auditActor: PullRunAuditActor | undefined,
+    fallbackAgentId: string,
+  ): Pick<
+    LogActivityInput,
+    | "actorType"
+    | "actorId"
+    | "agentId"
+    | "agentApiKeyId"
+    | "responsibleUserIdOverride"
+  > {
+    const actor = auditActor ?? DEFAULT_PULL_RUN_AUDIT_ACTOR;
+    return {
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId ?? fallbackAgentId,
+      agentApiKeyId: actor.agentApiKeyId ?? null,
+      ...(actor.responsibleUserIdOverride !== undefined
+        ? { responsibleUserIdOverride: actor.responsibleUserIdOverride }
+        : {}),
+    };
+  }
 
   async function expireRun(runId: string, now = new Date()) {
-    return db.transaction(async (tx) => {
+    return auditedTransaction(async (tx, publications) => {
       // Lifecycle operations always lock issue before run.  The issue service's
       // checkout/adoption paths use the same order, avoiding a run->issue
       // deadlock when expiry races a checkout-owner assertion.
@@ -57,7 +106,7 @@ export function pullRunService(db: Db) {
       ) {
         return false;
       }
-      await tx
+      const updated = await tx
         .update(heartbeatRuns)
         .set({
           status: "timed_out",
@@ -66,7 +115,15 @@ export function pullRunService(db: Db) {
           error: "External pull-run lease expired",
           updatedAt: now,
         })
-        .where(and(eq(heartbeatRuns.id, run.id), inArray(heartbeatRuns.status, LIVE_RUN_STATUSES)));
+        .where(and(eq(heartbeatRuns.id, run.id), inArray(heartbeatRuns.status, LIVE_RUN_STATUSES)))
+        .returning({ id: heartbeatRuns.id })
+        .then((rows) => rows[0] ?? null);
+      if (!updated) return false;
+      const ownedIssue = await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(or(eq(issues.checkoutRunId, run.id), eq(issues.executionRunId, run.id)))
+        .then((rows) => rows[0] ?? null);
       await tx
         .update(issues)
         .set({
@@ -77,6 +134,21 @@ export function pullRunService(db: Db) {
           updatedAt: now,
         })
         .where(and(eq(issues.checkoutRunId, run.id), eq(issues.executionRunId, run.id)));
+      await logActivity(tx, {
+        companyId: run.companyId,
+        actorType: "system",
+        actorId: "pull-run-lease-sweeper",
+        agentId: run.agentId,
+        runId: run.id,
+        action: "pull_run.expired",
+        entityType: "heartbeat_run",
+        entityId: run.id,
+        issueId: ownedIssue?.id ?? null,
+        details: {
+          issueId: ownedIssue?.id ?? null,
+          reason: "lease_expired",
+        },
+      }, publications);
       return true;
     });
   }
@@ -111,8 +183,8 @@ export function pullRunService(db: Db) {
     return agent;
   }
 
-  async function loadOwnedRun(companyId: string, agentId: string, runId: string) {
-    const run = await db
+  async function loadOwnedRun(companyId: string, agentId: string, runId: string, dbOrTx: Db = db) {
+    const run = await dbOrTx
       .select()
       .from(heartbeatRuns)
       .where(and(
@@ -132,6 +204,7 @@ export function pullRunService(db: Db) {
     issueId: string;
     expectedStatuses: string[];
     leaseSeconds: number;
+    auditActor?: PullRunAuditActor;
   }) {
     assertLeaseSeconds(input.leaseSeconds);
     await requirePullAgent(input.companyId, input.agentId);
@@ -162,55 +235,85 @@ export function pullRunService(db: Db) {
       if (!issue) throw notFound("Issue not found");
     }
 
-    if (issue.assigneeAgentId === input.agentId && issue.checkoutRunId) {
-      const existing = await loadOwnedRun(input.companyId, input.agentId, issue.checkoutRunId).catch(() => null);
-      if (existing && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(existing.status) && !isExpired(existing, new Date())) {
-        return { run: existing, issue: await issuesSvc.getById(input.issueId), idempotent: true };
-      }
-    }
-
-    const now = new Date();
-    const run = await db
-      .insert(heartbeatRuns)
-      .values({
-        companyId: input.companyId,
-        agentId: input.agentId,
-        invocationSource: "on_demand",
-        triggerDetail: EXTERNAL_PULL_RUN_TRIGGER,
-        status: "running",
-        startedAt: now,
-        lastUsefulActionAt: now,
-        leaseExpiresAt: leaseExpiry(now, input.leaseSeconds),
-        contextSnapshot: { issueId: input.issueId, source: "external_pull" },
-      })
-      .returning()
-      .then((rows) => rows[0]!);
-
-    try {
-      const claimed = await issuesSvc.checkout(input.issueId, input.agentId, input.expectedStatuses, run.id);
-      return { run, issue: claimed, idempotent: false };
-    } catch (error) {
-      await db
-        .update(heartbeatRuns)
-        .set({ status: "cancelled", finishedAt: new Date(), errorCode: "pull_run_claim_failed", updatedAt: new Date() })
-        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")));
-
-      const winnerIssue = await db
-        .select({ assigneeAgentId: issues.assigneeAgentId, checkoutRunId: issues.checkoutRunId })
+    return auditedTransaction(async (tx, publications) => {
+      await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${input.issueId} and ${issues.companyId} = ${input.companyId} for update`);
+      const lockedIssue = await tx
+        .select({
+          id: issues.id,
+          assigneeAgentId: issues.assigneeAgentId,
+          checkoutRunId: issues.checkoutRunId,
+        })
         .from(issues)
         .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
         .then((rows) => rows[0] ?? null);
-      if (winnerIssue?.assigneeAgentId === input.agentId && winnerIssue.checkoutRunId) {
-        const winner = await loadOwnedRun(input.companyId, input.agentId, winnerIssue.checkoutRunId).catch(() => null);
-        if (winner && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(winner.status) && !isExpired(winner, new Date())) {
-          return { run: winner, issue: await issuesSvc.getById(input.issueId), idempotent: true };
+      if (!lockedIssue) throw notFound("Issue not found");
+
+      if (lockedIssue.assigneeAgentId === input.agentId && lockedIssue.checkoutRunId) {
+        const existing = await loadOwnedRun(
+          input.companyId,
+          input.agentId,
+          lockedIssue.checkoutRunId,
+          tx,
+        ).catch(() => null);
+        if (existing && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(existing.status) && !isExpired(existing, new Date())) {
+          const currentIssue = await issueService(tx).getById(input.issueId);
+          await logActivity(tx, {
+            companyId: input.companyId,
+            ...activityActor(input.auditActor, input.agentId),
+            runId: existing.id,
+            action: "pull_run.start_idempotent",
+            entityType: "issue",
+            entityId: input.issueId,
+            issueId: input.issueId,
+            details: { pullRunId: existing.id, leaseSeconds: input.leaseSeconds },
+          }, publications);
+          return { run: existing, issue: currentIssue, idempotent: true };
         }
       }
-      throw error;
-    }
+
+      const now = new Date();
+      const run = await tx
+        .insert(heartbeatRuns)
+        .values({
+          companyId: input.companyId,
+          agentId: input.agentId,
+          invocationSource: "on_demand",
+          triggerDetail: EXTERNAL_PULL_RUN_TRIGGER,
+          status: "running",
+          startedAt: now,
+          lastUsefulActionAt: now,
+          leaseExpiresAt: leaseExpiry(now, input.leaseSeconds),
+          contextSnapshot: { issueId: input.issueId, source: "external_pull" },
+        })
+        .returning()
+        .then((rows) => rows[0]!);
+      const claimed = await issueService(tx).checkout(
+        input.issueId,
+        input.agentId,
+        input.expectedStatuses,
+        run.id,
+      );
+      await logActivity(tx, {
+        companyId: input.companyId,
+        ...activityActor(input.auditActor, input.agentId),
+        runId: run.id,
+        action: "pull_run.started",
+        entityType: "issue",
+        entityId: input.issueId,
+        issueId: input.issueId,
+        details: { pullRunId: run.id, leaseSeconds: input.leaseSeconds },
+      }, publications);
+      return { run, issue: claimed, idempotent: false };
+    });
   }
 
-  async function heartbeat(companyId: string, agentId: string, runId: string, leaseSeconds: number) {
+  async function heartbeat(
+    companyId: string,
+    agentId: string,
+    runId: string,
+    leaseSeconds: number,
+    auditActor?: PullRunAuditActor,
+  ) {
     assertLeaseSeconds(leaseSeconds);
     await requirePullAgent(companyId, agentId);
     const run = await loadOwnedRun(companyId, agentId, runId);
@@ -220,17 +323,30 @@ export function pullRunService(db: Db) {
       await expireRun(run.id, now);
       throw conflict("Pull run lease expired");
     }
-    const updated = await db
-      .update(heartbeatRuns)
-      .set({ leaseExpiresAt: leaseExpiry(now, leaseSeconds), lastUsefulActionAt: now, updatedAt: now })
-      .where(and(
-        eq(heartbeatRuns.id, run.id),
-        eq(heartbeatRuns.agentId, agentId),
-        gt(heartbeatRuns.leaseExpiresAt, now),
-        inArray(heartbeatRuns.status, LIVE_RUN_STATUSES),
-      ))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    const updated = await auditedTransaction(async (tx, publications) => {
+      const next = await tx
+        .update(heartbeatRuns)
+        .set({ leaseExpiresAt: leaseExpiry(now, leaseSeconds), lastUsefulActionAt: now, updatedAt: now })
+        .where(and(
+          eq(heartbeatRuns.id, run.id),
+          eq(heartbeatRuns.agentId, agentId),
+          gt(heartbeatRuns.leaseExpiresAt, now),
+          inArray(heartbeatRuns.status, LIVE_RUN_STATUSES),
+        ))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!next) return null;
+      await logActivity(tx, {
+        companyId,
+        ...activityActor(auditActor, agentId),
+        runId: next.id,
+        action: "pull_run.heartbeat",
+        entityType: "heartbeat_run",
+        entityId: next.id,
+        details: { leaseSeconds },
+      }, publications);
+      return next;
+    });
     if (!updated) {
       await expireRun(run.id, new Date());
       throw conflict("Pull run is no longer live");
@@ -238,7 +354,13 @@ export function pullRunService(db: Db) {
     return updated;
   }
 
-  async function finish(companyId: string, agentId: string, runId: string, status: "succeeded" | "cancelled") {
+  async function finish(
+    companyId: string,
+    agentId: string,
+    runId: string,
+    status: "succeeded" | "cancelled",
+    auditActor?: PullRunAuditActor,
+  ) {
     await requirePullAgent(companyId, agentId);
     const run = await loadOwnedRun(companyId, agentId, runId);
     if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) throw conflict("Pull run is terminal");
@@ -247,7 +369,7 @@ export function pullRunService(db: Db) {
       await expireRun(run.id, now);
       throw conflict("Pull run lease expired");
     }
-    return db.transaction(async (tx) => {
+    return auditedTransaction(async (tx, publications) => {
       // See expireRun: issue -> run is the canonical lifecycle lock order.
       await tx.execute(
         sql`select ${issues.id} from ${issues} where ${issues.checkoutRunId} = ${run.id} or ${issues.executionRunId} = ${run.id} order by ${issues.id} for update`,
@@ -299,6 +421,19 @@ export function pullRunService(db: Db) {
             eq(issues.executionRunId, run.id),
           ));
       }
+      await logActivity(tx, {
+        companyId,
+        ...activityActor(auditActor, agentId),
+        runId: updated.id,
+        action: status === "succeeded" ? "pull_run.completed" : "pull_run.cancelled",
+        entityType: "heartbeat_run",
+        entityId: updated.id,
+        issueId: ownedIssue?.id ?? null,
+        details: {
+          issueId: ownedIssue?.id ?? null,
+          requeued: status === "cancelled" && ownedIssue?.status === "in_progress",
+        },
+      }, publications);
       return updated;
     });
   }
@@ -307,7 +442,9 @@ export function pullRunService(db: Db) {
     start,
     heartbeat,
     sweepExpired,
-    complete: (companyId: string, agentId: string, runId: string) => finish(companyId, agentId, runId, "succeeded"),
-    cancel: (companyId: string, agentId: string, runId: string) => finish(companyId, agentId, runId, "cancelled"),
+    complete: (companyId: string, agentId: string, runId: string, auditActor?: PullRunAuditActor) =>
+      finish(companyId, agentId, runId, "succeeded", auditActor),
+    cancel: (companyId: string, agentId: string, runId: string, auditActor?: PullRunAuditActor) =>
+      finish(companyId, agentId, runId, "cancelled", auditActor),
   };
 }

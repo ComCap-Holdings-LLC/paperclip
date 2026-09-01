@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { activityLog, agents, companies, createDb, heartbeatRuns, issues } from "@paperclipai/db";
 import { issueService } from "../services/issues.js";
@@ -19,6 +19,7 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
 describeEmbeddedPostgres("external pull-run leases", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let activityFailureObjectsInstalled = false;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-pull-runs-");
@@ -26,6 +27,11 @@ describeEmbeddedPostgres("external pull-run leases", () => {
   }, 20_000);
 
   afterEach(async () => {
+    if (activityFailureObjectsInstalled) {
+      await db.execute(sql`drop trigger if exists reject_pull_run_started_activity on ${activityLog}`);
+      await db.execute(sql`drop function if exists reject_pull_run_started_activity()`);
+      activityFailureObjectsInstalled = false;
+    }
     await db.delete(activityLog);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
@@ -161,6 +167,46 @@ describeEmbeddedPostgres("external pull-run leases", () => {
     expect(liveRuns).toHaveLength(1);
   });
 
+  it("rolls back the run and checkout when mandatory activity persistence fails", async () => {
+    const f = await fixture();
+    await db.execute(sql`
+      create function reject_pull_run_started_activity()
+      returns trigger
+      language plpgsql
+      as $function$
+      begin
+        raise exception 'forced pull-run activity failure';
+      end;
+      $function$
+    `);
+    activityFailureObjectsInstalled = true;
+    await db.execute(sql`
+      create trigger reject_pull_run_started_activity
+      before insert on ${activityLog}
+      for each row
+      when (new.action = 'pull_run.started')
+      execute function reject_pull_run_started_activity()
+    `);
+
+    await expect(pullRunService(db).start({
+      companyId: f.companyId,
+      agentId: f.agentId,
+      issueId: f.issueId,
+      expectedStatuses: ["todo"],
+      leaseSeconds: 120,
+    })).rejects.toThrow(/insert into "activity_log"/);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, f.issueId)).then((rows) => rows[0]!);
+    expect(issue).toMatchObject({
+      status: "todo",
+      assigneeAgentId: null,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+    expect(await db.select().from(heartbeatRuns)).toHaveLength(0);
+    expect(await db.select().from(activityLog)).toHaveLength(0);
+  });
+
   it("rejects dispatch agents and cross-agent or cross-company run control", async () => {
     const f = await fixture();
     const svc = pullRunService(db);
@@ -204,6 +250,15 @@ describeEmbeddedPostgres("external pull-run leases", () => {
     const issue = await db.select().from(issues).where(eq(issues.id, f.issueId)).then((rows) => rows[0]!);
     expect(issue.checkoutRunId).toBeNull();
     expect(issue.executionRunId).toBeNull();
+    const lifecycleActions = await db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(eq(activityLog.runId, started.run.id));
+    expect(lifecycleActions.map((row) => row.action)).toEqual([
+      "pull_run.started",
+      "pull_run.heartbeat",
+      "pull_run.completed",
+    ]);
     await expect(svc.complete(f.companyId, f.agentId, started.run.id))
       .rejects.toMatchObject({ status: 409 });
   });

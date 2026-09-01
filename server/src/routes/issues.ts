@@ -10599,19 +10599,13 @@ export function issueRoutes(
       issueId: issue.id,
       expectedStatuses: req.body.expectedStatuses,
       leaseSeconds: req.body.leaseSeconds,
-    });
-    const activityActor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: issue.companyId,
-      actorType: activityActor.actorType,
-      actorId: activityActor.actorId,
-      agentId: activityActor.agentId,
-      runId: result.run.id,
-      agentApiKeyId: activityActor.agentApiKeyId,
-      action: result.idempotent ? "pull_run.start_idempotent" : "pull_run.started",
-      entityType: "issue",
-      entityId: issue.id,
-      details: { pullRunId: result.run.id, leaseSeconds: req.body.leaseSeconds },
+      auditActor: {
+        actorType: "agent",
+        actorId: actor.agentId,
+        agentId: actor.agentId,
+        agentApiKeyId: actor.keyId,
+        responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+      },
     });
     res.status(result.idempotent ? 200 : 201).json({
       runId: result.run.id,
@@ -10638,19 +10632,14 @@ export function issueRoutes(
       actor.agentId,
       parsedRunId.data,
       req.body.leaseSeconds,
+      {
+        actorType: "agent",
+        actorId: actor.agentId,
+        agentId: actor.agentId,
+        agentApiKeyId: actor.keyId,
+        responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+      },
     );
-    await logActivity(db, {
-      companyId: actor.companyId,
-      actorType: "agent",
-      actorId: actor.agentId,
-      agentId: actor.agentId,
-      runId: run.id,
-      agentApiKeyId: actor.keyId,
-      action: "pull_run.heartbeat",
-      entityType: "heartbeat_run",
-      entityId: run.id,
-      details: { leaseSeconds: req.body.leaseSeconds },
-    });
     res.json({ runId: run.id, status: run.status, leaseExpiresAt: run.leaseExpiresAt });
   });
 
@@ -10665,8 +10654,13 @@ export function issueRoutes(
       res.status(400).json({ error: "Invalid pull run id" });
       return;
     }
-    const run = await pullRuns.complete(actor.companyId, actor.agentId, parsedRunId.data);
-    await logActivity(db, { companyId: actor.companyId, actorType: "agent", actorId: actor.agentId, agentId: actor.agentId, runId: run.id, agentApiKeyId: actor.keyId, action: "pull_run.completed", entityType: "heartbeat_run", entityId: run.id });
+    const run = await pullRuns.complete(actor.companyId, actor.agentId, parsedRunId.data, {
+      actorType: "agent",
+      actorId: actor.agentId,
+      agentId: actor.agentId,
+      agentApiKeyId: actor.keyId,
+      responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+    });
     res.json({ runId: run.id, status: run.status, finishedAt: run.finishedAt });
   });
 
@@ -10681,8 +10675,13 @@ export function issueRoutes(
       res.status(400).json({ error: "Invalid pull run id" });
       return;
     }
-    const run = await pullRuns.cancel(actor.companyId, actor.agentId, parsedRunId.data);
-    await logActivity(db, { companyId: actor.companyId, actorType: "agent", actorId: actor.agentId, agentId: actor.agentId, runId: run.id, agentApiKeyId: actor.keyId, action: "pull_run.cancelled", entityType: "heartbeat_run", entityId: run.id });
+    const run = await pullRuns.cancel(actor.companyId, actor.agentId, parsedRunId.data, {
+      actorType: "agent",
+      actorId: actor.agentId,
+      agentId: actor.agentId,
+      agentApiKeyId: actor.keyId,
+      responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+    });
     res.json({ runId: run.id, status: run.status, finishedAt: run.finishedAt });
   });
 

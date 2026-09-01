@@ -326,7 +326,7 @@ export function pullRunService(db: Db) {
         .then((rows) => rows[0] ?? null);
       if (!updated) throw conflict("Pull run is no longer live");
 
-      const ownedIssue = await tx
+      const ownedIssues = await tx
         .select({
           id: issues.id,
           status: issues.status,
@@ -339,19 +339,22 @@ export function pullRunService(db: Db) {
           eq(issues.companyId, companyId),
           or(eq(issues.checkoutRunId, run.id), eq(issues.executionRunId, run.id)),
         ))
-        .then((rows) => rows[0] ?? null);
-      if (ownedIssue) {
-        const ownsBothLocks = ownedIssue.checkoutRunId === run.id
-          && ownedIssue.executionRunId === run.id;
-        const requeue = status === "cancelled"
-          && ownedIssue.status === "in_progress"
-          && ownedIssue.assigneeAgentId === agentId
-          && ownsBothLocks;
+        .orderBy(issues.id);
+      const requeued = status === "cancelled" && ownedIssues.some((issue) =>
+        issue.status === "in_progress"
+        && issue.assigneeAgentId === agentId
+        && issue.checkoutRunId === run.id
+        && issue.executionRunId === run.id,
+      );
+      if (ownedIssues.length > 0) {
         await tx
           .update(issues)
           .set({
-            ...(requeue
-              ? { status: "todo", assigneeAgentId: null }
+            ...(status === "cancelled"
+              ? {
+                status: sql`case when ${issues.status} = 'in_progress' and ${issues.assigneeAgentId} = ${agentId} and ${issues.checkoutRunId} = ${run.id} and ${issues.executionRunId} = ${run.id} then 'todo' else ${issues.status} end`,
+                assigneeAgentId: sql`case when ${issues.status} = 'in_progress' and ${issues.assigneeAgentId} = ${agentId} and ${issues.checkoutRunId} = ${run.id} and ${issues.executionRunId} = ${run.id} then null else ${issues.assigneeAgentId} end`,
+              }
               : {}),
             checkoutRunId: sql`case when ${issues.checkoutRunId} = ${run.id} then null else ${issues.checkoutRunId} end`,
             executionRunId: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionRunId} end`,
@@ -360,7 +363,7 @@ export function pullRunService(db: Db) {
             updatedAt: now,
           })
           .where(and(
-            eq(issues.id, ownedIssue.id),
+            eq(issues.companyId, companyId),
             or(eq(issues.checkoutRunId, run.id), eq(issues.executionRunId, run.id)),
           ));
       }
@@ -371,14 +374,10 @@ export function pullRunService(db: Db) {
         action: status === "succeeded" ? "pull_run.completed" : "pull_run.cancelled",
         entityType: "heartbeat_run",
         entityId: updated.id,
-        issueId: ownedIssue?.id ?? null,
+        issueId: ownedIssues[0]?.id ?? null,
         details: {
-          issueId: ownedIssue?.id ?? null,
-          requeued: status === "cancelled"
-            && ownedIssue?.status === "in_progress"
-            && ownedIssue?.assigneeAgentId === agentId
-            && ownedIssue?.checkoutRunId === run.id
-            && ownedIssue?.executionRunId === run.id,
+          issueId: ownedIssues[0]?.id ?? null,
+          requeued,
         },
       }, publications);
       return updated;

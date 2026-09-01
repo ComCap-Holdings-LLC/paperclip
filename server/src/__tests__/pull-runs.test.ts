@@ -400,4 +400,51 @@ describeEmbeddedPostgres("external pull-run leases", () => {
     const issue = await db.select().from(issues).where(eq(issues.id, f.issueId)).then((rows) => rows[0]!);
     expect(issue).toMatchObject({ status: "todo", assigneeAgentId: null, checkoutRunId: null, executionRunId: null });
   });
+
+  it.each([
+    ["complete", "succeeded"],
+    ["cancel", "cancelled"],
+  ] as const)("%s clears terminal locks across every matching issue without clearing unrelated locks", async (operation, expectedStatus) => {
+    const f = await fixture();
+    const svc = pullRunService(db);
+    const started = await svc.start({
+      companyId: f.companyId,
+      agentId: f.agentId,
+      issueId: f.issueId,
+      expectedStatuses: ["todo"],
+      leaseSeconds: 120,
+    });
+    const issueBId = randomUUID();
+    const checkoutHolderId = randomUUID();
+    const executionHolderId = randomUUID();
+    await db.insert(heartbeatRuns).values([
+      { id: checkoutHolderId, companyId: f.companyId, agentId: f.agentId, status: "running", invocationSource: "manual" },
+      { id: executionHolderId, companyId: f.companyId, agentId: f.agentId, status: "running", invocationSource: "manual" },
+    ]);
+    await db.insert(issues).values({
+      id: issueBId,
+      companyId: f.companyId,
+      title: "Execution lock owner",
+      status: "todo",
+      checkoutRunId: checkoutHolderId,
+      executionRunId: started.run.id,
+      executionAgentNameKey: "wren",
+      executionLockedAt: new Date(),
+    });
+    await db.update(issues)
+      .set({ executionRunId: executionHolderId, executionAgentNameKey: "other", executionLockedAt: new Date() })
+      .where(eq(issues.id, f.issueId));
+
+    const finished = operation === "complete"
+      ? await svc.complete(f.companyId, f.agentId, started.run.id)
+      : await svc.cancel(f.companyId, f.agentId, started.run.id);
+
+    expect(finished.status).toBe(expectedStatus);
+    const [issueA, issueB] = await Promise.all([
+      db.select().from(issues).where(eq(issues.id, f.issueId)).then((rows) => rows[0]!),
+      db.select().from(issues).where(eq(issues.id, issueBId)).then((rows) => rows[0]!),
+    ]);
+    expect(issueA).toMatchObject({ checkoutRunId: null, executionRunId: executionHolderId });
+    expect(issueB).toMatchObject({ checkoutRunId: checkoutHolderId, executionRunId: null, executionAgentNameKey: null, executionLockedAt: null });
+  });
 });

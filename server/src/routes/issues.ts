@@ -2896,6 +2896,40 @@ export function issueRoutes(
   const router = Router();
   const svc = issueService(db);
   const pullRuns = pullRunService(db);
+
+  async function assertPullRunIssueMutationAllowed(
+    req: Request,
+    res: Response,
+    runId: string,
+  ) {
+    if (req.actor.type !== "agent" || !req.actor.companyId || !req.actor.agentId) return false;
+    const run = await db
+      .select({ companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId, contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    if (!run || run.companyId !== req.actor.companyId || run.agentId !== req.actor.agentId) {
+      res.status(404).json({ error: "Pull run not found" });
+      return false;
+    }
+    const context = run.contextSnapshot && typeof run.contextSnapshot === "object" && !Array.isArray(run.contextSnapshot)
+      ? run.contextSnapshot as Record<string, unknown>
+      : null;
+    const issueId = typeof context?.issueId === "string"
+      ? context.issueId.trim()
+      : typeof context?.taskId === "string"
+        ? context.taskId.trim()
+        : "";
+    const issue = issueId ? await svc.getById(issueId) : null;
+    if (!issue || issue.companyId !== req.actor.companyId) {
+      res.status(404).json({ error: "Pull run not found" });
+      return false;
+    }
+    // Lifecycle control is an issue mutation: apply the same scoped-key and
+    // ownership boundary as the issue mutation routes before changing either
+    // the run or its checkout.
+    return assertAgentIssueMutationAllowed(req, res, issue);
+  }
   const runRedactions = createRunSecretRedactionRegistry(db);
   const access = accessService(db);
   const heartbeat = heartbeatService(db, {
@@ -10627,6 +10661,7 @@ export function issueRoutes(
       res.status(400).json({ error: "Invalid pull run id" });
       return;
     }
+    if (!(await assertPullRunIssueMutationAllowed(req, res, parsedRunId.data))) return;
     const run = await pullRuns.heartbeat(
       actor.companyId,
       actor.agentId,
@@ -10654,6 +10689,7 @@ export function issueRoutes(
       res.status(400).json({ error: "Invalid pull run id" });
       return;
     }
+    if (!(await assertPullRunIssueMutationAllowed(req, res, parsedRunId.data))) return;
     const run = await pullRuns.complete(actor.companyId, actor.agentId, parsedRunId.data, {
       actorType: "agent",
       actorId: actor.agentId,
@@ -10675,6 +10711,7 @@ export function issueRoutes(
       res.status(400).json({ error: "Invalid pull run id" });
       return;
     }
+    if (!(await assertPullRunIssueMutationAllowed(req, res, parsedRunId.data))) return;
     const run = await pullRuns.cancel(actor.companyId, actor.agentId, parsedRunId.data, {
       actorType: "agent",
       actorId: actor.agentId,

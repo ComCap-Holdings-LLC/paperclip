@@ -8,6 +8,7 @@ import {
   evaluateCrossIssueInfluenceLimit,
   observeCrossIssueInfluence,
 } from "../services/cross-issue-influence-limit.ts";
+import { EXTERNAL_PULL_RUN_TRIGGER } from "../services/external-pull-run-lifecycle.ts";
 
 function counterDb(
   initialCount = 0,
@@ -38,6 +39,9 @@ function counterDb(
                 agentId: "33333333-3333-4333-8333-333333333333",
                 responsibleUserId: "user-1",
                 contextSnapshot: { issueId: "44444444-4444-4444-8444-444444444444" },
+                triggerDetail: EXTERNAL_PULL_RUN_TRIGGER,
+                status: "running",
+                leaseExpiresAt: new Date(Date.now() + 60_000),
                 ...runOverrides,
               }]),
             }),
@@ -146,6 +150,22 @@ describe("cross-issue influence limit rollout", () => {
 
     expect(fake.observedCount).toBe(2);
     expect(fake.inserted.map((row) => (row.details as { kind: string }).kind)).toEqual(["comment", "update"]);
+  });
+
+  it.each([
+    ["terminal", { status: "succeeded", leaseExpiresAt: new Date(Date.now() + 60_000) }],
+    ["expired", { status: "running", leaseExpiresAt: new Date(Date.now() - 1_000) }],
+    ["missing lease", { status: "running", leaseExpiresAt: null }],
+  ])("rejects a %s external pull run before counting influence", async (_label, runOverrides) => {
+    const fake = counterDb(0, runOverrides);
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "comment",
+    })).rejects.toMatchObject({ status: 403 });
+    expect(fake.inserted).toEqual([]);
   });
 
   it("does not count same-issue writes", async () => {

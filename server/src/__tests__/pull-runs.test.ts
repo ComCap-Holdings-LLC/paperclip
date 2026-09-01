@@ -141,6 +141,29 @@ describeEmbeddedPostgres("external pull-run leases", () => {
     expect(retry.body.runId).toBe(first.body.runId);
   });
 
+  it("applies scoped issue authorization before same-agent lifecycle control", async () => {
+    const f = await fixture();
+    const svc = pullRunService(db);
+    const started = await svc.start({
+      companyId: f.companyId,
+      agentId: f.agentId,
+      issueId: f.issueId,
+      expectedStatuses: ["todo"],
+      leaseSeconds: 120,
+    });
+    const denied = await request(createApp({
+      type: "agent",
+      source: "agent_key",
+      agentId: f.agentId,
+      companyId: f.companyId,
+      keyId: randomUUID(),
+      keyScope: { kind: "skill_test", issueId: randomUUID() },
+    })).post(`/api/pull-runs/${started.run.id}/cancel`).send({});
+    expect(denied.status, JSON.stringify(denied.body)).toBe(403);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, started.run.id)))
+      .toHaveLength(1);
+  });
+
   it("server-issues a live run, atomically claims the issue, and retries idempotently", async () => {
     const f = await fixture();
     const svc = pullRunService(db);

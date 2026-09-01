@@ -4,6 +4,12 @@ import { activityLog, heartbeatRuns } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+import {
+  EXTERNAL_PULL_RUN_TRIGGER,
+  externalPullRunIsExpired,
+  LIVE_PULL_RUN_STATUSES,
+  TERMINAL_HEARTBEAT_RUN_STATUSES,
+} from "./external-pull-run-lifecycle.js";
 
 export const CROSS_ISSUE_INFLUENCE_LIMIT = 20;
 export const CROSS_ISSUE_INFLUENCE_WINDOW_MS = 60_000;
@@ -132,6 +138,9 @@ export async function observeCrossIssueInfluence(
         agentId: heartbeatRuns.agentId,
         responsibleUserId: heartbeatRuns.responsibleUserId,
         contextSnapshot: heartbeatRuns.contextSnapshot,
+        triggerDetail: heartbeatRuns.triggerDetail,
+        status: heartbeatRuns.status,
+        leaseExpiresAt: heartbeatRuns.leaseExpiresAt,
       })
       .from(heartbeatRuns)
       .where(and(
@@ -144,7 +153,11 @@ export async function observeCrossIssueInfluence(
     if (
       !run ||
       run.companyId !== input.companyId ||
-      run.agentId !== input.agentId
+      run.agentId !== input.agentId ||
+      run.triggerDetail !== EXTERNAL_PULL_RUN_TRIGGER ||
+      !LIVE_PULL_RUN_STATUSES.includes(run.status) ||
+      TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status) ||
+      externalPullRunIsExpired(run, new Date())
     ) {
       throw crossIssueInfluenceRunContextError();
     }

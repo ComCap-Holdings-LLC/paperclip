@@ -16,6 +16,7 @@ import {
   CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
   observeCrossIssueInfluence,
 } from "../services/cross-issue-influence-limit.js";
+import { EXTERNAL_PULL_RUN_TRIGGER } from "../services/external-pull-run-lifecycle.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -68,6 +69,8 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       companyId,
       agentId,
       status: "running",
+      triggerDetail: EXTERNAL_PULL_RUN_TRIGGER,
+      leaseExpiresAt: new Date(Date.now() + 60_000),
       responsibleUserId: "board-user",
       contextSnapshot: { issueId: sourceIssueId },
     });
@@ -116,7 +119,8 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
     });
     await db.insert(heartbeatRuns).values({
-      id: runId, companyId, agentId, status: "running", responsibleUserId: "board-user",
+      id: runId, companyId, agentId, status: "running", triggerDetail: EXTERNAL_PULL_RUN_TRIGGER,
+      leaseExpiresAt: new Date(Date.now() + 60_000), responsibleUserId: "board-user",
       contextSnapshot: { issueId: sourceIssueId },
     });
     await db.insert(activityLog).values(Array.from({ length: 20 }, () => ({
@@ -149,7 +153,8 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
     });
     await db.insert(heartbeatRuns).values({
-      id: runId, companyId, agentId, status: "running", responsibleUserId: "board-user",
+      id: runId, companyId, agentId, status: "running", triggerDetail: EXTERNAL_PULL_RUN_TRIGGER,
+      leaseExpiresAt: new Date(Date.now() + 60_000), responsibleUserId: "board-user",
       contextSnapshot: { issueId: sourceIssueId },
     });
     await db.insert(activityLog).values(Array.from({ length: 20 }, () => ({

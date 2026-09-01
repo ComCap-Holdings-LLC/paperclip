@@ -4327,7 +4327,6 @@ export function issueRoutes(
       issue.id,
       actorAgentId,
       runId,
-      { capability: "internal" },
     );
     if (ownership.adoptedFromRunId) {
       const actor = getActorInfo(req);

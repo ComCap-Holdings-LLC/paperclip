@@ -134,6 +134,7 @@ import {
   EXTERNAL_PULL_RUN_TRIGGER,
   expireExternalPullRun,
   externalPullRunIsExpired,
+  LIVE_PULL_RUN_STATUSES,
   TERMINAL_HEARTBEAT_RUN_STATUSES,
 } from "./external-pull-run-lifecycle.js";
 
@@ -8036,7 +8037,13 @@ export function issueService(db: Db) {
         return enriched;
       }),
 
-    checkout: async (id: string, agentId: string, expectedStatuses: string[], checkoutRunId: string | null) => {
+    checkout: async (
+      id: string,
+      agentId: string,
+      expectedStatuses: string[],
+      checkoutRunId: string | null,
+      options: { requireExternalPullRun?: boolean } = {},
+    ) => {
       const issueCompany = await db
         .select({ companyId: issues.companyId })
         .from(issues)
@@ -8088,27 +8095,62 @@ export function issueService(db: Db) {
       const executionLockCondition = checkoutRunId
         ? or(isNull(issues.executionRunId), eq(issues.executionRunId, checkoutRunId))
         : isNull(issues.executionRunId);
-      const updated = await db
-        .update(issues)
-        .set({
-          assigneeAgentId: agentId,
-          assigneeUserId: null,
-          checkoutRunId,
-          executionRunId: checkoutRunId,
-          status: "in_progress",
-          startedAt: now,
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(issues.id, id),
-            inArray(issues.status, expectedStatuses),
-            or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
-            executionLockCondition,
-          ),
-        )
-        .returning()
-        .then((rows) => rows[0] ?? null);
+      // A supplied external pull run is an authorization capability, not merely
+      // an opaque foreign key. Lock the issue before the run, then revalidate it
+      // while both locks are held so terminal cleanup cannot race an attachment.
+      const updated = await db.transaction(async (rawTx) => {
+        const tx = rawTx as unknown as Db;
+        await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} and ${issues.companyId} = ${issueCompany.companyId} for update`);
+        if (checkoutRunId) {
+          await tx.execute(sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${checkoutRunId} for update`);
+          const run = await tx
+            .select({
+              companyId: heartbeatRuns.companyId,
+              agentId: heartbeatRuns.agentId,
+              triggerDetail: heartbeatRuns.triggerDetail,
+              status: heartbeatRuns.status,
+              leaseExpiresAt: heartbeatRuns.leaseExpiresAt,
+            })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, checkoutRunId))
+            .then((rows) => rows[0] ?? null);
+          const isExternal = run?.triggerDetail === EXTERNAL_PULL_RUN_TRIGGER;
+          if (options.requireExternalPullRun && !isExternal) {
+            throw conflict("Checkout requires a live external pull run");
+          }
+          if (isExternal && (
+            run.companyId !== issueCompany.companyId
+            || run.agentId !== agentId
+            || !LIVE_PULL_RUN_STATUSES.includes(run.status)
+            || !run.leaseExpiresAt
+            || externalPullRunIsExpired(run, now)
+          )) {
+            throw conflict("External pull run is not eligible for checkout");
+          }
+        }
+        return tx
+          .update(issues)
+          .set({
+            assigneeAgentId: agentId,
+            assigneeUserId: null,
+            checkoutRunId,
+            executionRunId: checkoutRunId,
+            status: "in_progress",
+            startedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issues.id, id),
+              eq(issues.companyId, issueCompany.companyId),
+              inArray(issues.status, expectedStatuses),
+              or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
+              executionLockCondition,
+            ),
+          )
+          .returning()
+          .then((rows) => rows[0] ?? null);
+      });
 
       if (updated) {
         const [enriched] = await withIssueLabels(db, [updated]);

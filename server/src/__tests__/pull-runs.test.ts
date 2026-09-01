@@ -107,6 +107,92 @@ describeEmbeddedPostgres("external pull-run leases", () => {
     expect(started.body.runId).not.toBe(suppliedRunId);
   });
 
+  it.each([
+    ["missing", async (f: Awaited<ReturnType<typeof fixture>>) => randomUUID()],
+    ["foreign-company", async (f: Awaited<ReturnType<typeof fixture>>) => {
+      const foreignAgentId = randomUUID();
+      const runId = randomUUID();
+      await db.insert(agents).values({ id: foreignAgentId, companyId: f.otherCompanyId, name: "Foreign", role: "engineer", status: "idle", executionModel: "pull" });
+      await db.insert(heartbeatRuns).values({
+        id: runId, companyId: f.otherCompanyId, agentId: foreignAgentId, triggerDetail: "external_pull", status: "running", invocationSource: "on_demand", leaseExpiresAt: new Date(Date.now() + 60_000),
+      });
+      return runId;
+    }],
+    ["foreign-agent", async (f: Awaited<ReturnType<typeof fixture>>) => {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId, companyId: f.companyId, agentId: f.otherAgentId, triggerDetail: "external_pull", status: "running", invocationSource: "on_demand", leaseExpiresAt: new Date(Date.now() + 60_000),
+      });
+      return runId;
+    }],
+    ["expired", async (f: Awaited<ReturnType<typeof fixture>>) => {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId, companyId: f.companyId, agentId: f.agentId, triggerDetail: "external_pull", status: "running", invocationSource: "on_demand", leaseExpiresAt: new Date(Date.now() - 1_000),
+      });
+      return runId;
+    }],
+    ["terminal", async (f: Awaited<ReturnType<typeof fixture>>) => {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId, companyId: f.companyId, agentId: f.agentId, triggerDetail: "external_pull", status: "cancelled", invocationSource: "on_demand", leaseExpiresAt: null,
+      });
+      return runId;
+    }],
+    ["non-external", async (f: Awaited<ReturnType<typeof fixture>>) => {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId, companyId: f.companyId, agentId: f.agentId, triggerDetail: "manual", status: "running", invocationSource: "manual", leaseExpiresAt: new Date(Date.now() + 60_000),
+      });
+      return runId;
+    }],
+  ] as const)("rejects a %s run capability without attaching it", async (_caseName, makeRunId) => {
+    const f = await fixture();
+    const runId = await makeRunId(f);
+
+    await expect(issueService(db).checkout(f.issueId, f.agentId, ["todo"], runId, {
+      requireExternalPullRun: true,
+    })).rejects.toThrow();
+
+    const issue = await db.select().from(issues).where(eq(issues.id, f.issueId)).then((rows) => rows[0]!);
+    expect(issue).toMatchObject({ status: "todo", checkoutRunId: null, executionRunId: null });
+  });
+
+  it.each(["complete", "cancel", "expiry"] as const)("serializes an attachment racing %s so no orphan can commit", async (operation) => {
+    const f = await fixture();
+    const svc = pullRunService(db);
+    const started = await svc.start({
+      companyId: f.companyId,
+      agentId: f.agentId,
+      issueId: f.issueId,
+      expectedStatuses: ["todo"],
+      leaseSeconds: 120,
+    });
+    const candidateIssueId = randomUUID();
+    await db.insert(issues).values({ id: candidateIssueId, companyId: f.companyId, title: "Racing attachment", status: "todo" });
+    if (operation === "expiry") {
+      await db.update(heartbeatRuns).set({ leaseExpiresAt: new Date(Date.now() - 1_000) }).where(eq(heartbeatRuns.id, started.run.id));
+    }
+
+    const attachment = issueService(db).checkout(candidateIssueId, f.agentId, ["todo"], started.run.id, {
+      requireExternalPullRun: true,
+    });
+    const lifecycle = operation === "complete"
+      ? svc.complete(f.companyId, f.agentId, started.run.id)
+      : operation === "cancel"
+        ? svc.cancel(f.companyId, f.agentId, started.run.id)
+        : svc.sweepExpired();
+    await Promise.allSettled([attachment, lifecycle]);
+
+    const [run, candidate] = await Promise.all([
+      db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, started.run.id)).then((rows) => rows[0]!),
+      db.select().from(issues).where(eq(issues.id, candidateIssueId)).then((rows) => rows[0]!),
+    ]);
+    expect(["succeeded", "cancelled", "timed_out"]).toContain(run.status);
+    expect(candidate.checkoutRunId).not.toBe(started.run.id);
+    expect(candidate.executionRunId).not.toBe(started.run.id);
+  });
+
   it("rejects malformed pull-run route identifiers before querying UUID columns", async () => {
     const f = await fixture();
     const actor = {

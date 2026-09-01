@@ -317,9 +317,15 @@ export function pullRunService(db: Db) {
     }
     return auditedTransaction(async (tx, publications) => {
       // External pull-run lifecycle operations use issue -> run lock order.
-      await tx.execute(
-        sql`select ${issues.id} from ${issues} where ${issues.checkoutRunId} = ${run.id} or ${issues.executionRunId} = ${run.id} order by ${issues.id} for update`,
-      );
+      const lockedIssueIds = await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(and(
+          eq(issues.companyId, companyId),
+          or(eq(issues.checkoutRunId, run.id), eq(issues.executionRunId, run.id)),
+        ))
+        .orderBy(issues.id)
+        .for("update");
       await tx.execute(
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${run.id} for update`,
       );
@@ -334,7 +340,7 @@ export function pullRunService(db: Db) {
         .from(issues)
         .where(and(
           eq(issues.companyId, companyId),
-          or(eq(issues.checkoutRunId, run.id), eq(issues.executionRunId, run.id)),
+          inArray(issues.id, lockedIssueIds.map((issue) => issue.id)),
         ))
         .orderBy(issues.id);
       if (authorization?.authorizedIssueIds) {
@@ -385,7 +391,7 @@ export function pullRunService(db: Db) {
           })
           .where(and(
             eq(issues.companyId, companyId),
-            or(eq(issues.checkoutRunId, run.id), eq(issues.executionRunId, run.id)),
+            inArray(issues.id, ownedIssues.map((issue) => issue.id)),
           ));
       }
       await logActivity(tx, {

@@ -33,9 +33,15 @@ export async function expireExternalPullRun(db: Db, runId: string, now = new Dat
   const publications: ActivityPublication[] = [];
   const expired = await db.transaction(async (rawTx) => {
     const tx = rawTx as unknown as Db;
-    await tx.execute(
-      sql`select ${issues.id} from ${issues} where ${issues.checkoutRunId} = ${runId} or ${issues.executionRunId} = ${runId} order by ${issues.id} for update`,
-    );
+    const lockedIssueIds = await tx
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(
+        eq(issues.companyId, sql`(select ${heartbeatRuns.companyId} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${runId})`),
+        or(eq(issues.checkoutRunId, runId), eq(issues.executionRunId, runId)),
+      ))
+      .orderBy(issues.id)
+      .for("update");
     await tx.execute(
       sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${runId} for update`,
     );
@@ -80,20 +86,28 @@ export async function expireExternalPullRun(db: Db, runId: string, now = new Dat
         executionRunId: issues.executionRunId,
       })
       .from(issues)
-      .where(or(eq(issues.checkoutRunId, run.id), eq(issues.executionRunId, run.id)))
+      .where(and(
+        eq(issues.companyId, run.companyId),
+        inArray(issues.id, lockedIssueIds.map((issue) => issue.id)),
+      ))
       .orderBy(issues.id);
-    await tx
-      .update(issues)
-      .set({
-        status: sql`case when ${issues.status} = 'in_progress' and ${issues.assigneeAgentId} = ${run.agentId} and (${issues.checkoutRunId} is null or ${issues.checkoutRunId} = ${run.id}) and (${issues.executionRunId} is null or ${issues.executionRunId} = ${run.id}) then 'todo' else ${issues.status} end`,
-        assigneeAgentId: sql`case when ${issues.status} = 'in_progress' and ${issues.assigneeAgentId} = ${run.agentId} and (${issues.checkoutRunId} is null or ${issues.checkoutRunId} = ${run.id}) and (${issues.executionRunId} is null or ${issues.executionRunId} = ${run.id}) then null else ${issues.assigneeAgentId} end`,
-        checkoutRunId: sql`case when ${issues.checkoutRunId} = ${run.id} then null else ${issues.checkoutRunId} end`,
-        executionRunId: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionRunId} end`,
-        executionAgentNameKey: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionAgentNameKey} end`,
-        executionLockedAt: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionLockedAt} end`,
-        updatedAt: now,
-      })
-      .where(or(eq(issues.checkoutRunId, run.id), eq(issues.executionRunId, run.id)));
+    if (ownedIssues.length > 0) {
+      await tx
+        .update(issues)
+        .set({
+          status: sql`case when ${issues.status} = 'in_progress' and ${issues.assigneeAgentId} = ${run.agentId} and (${issues.checkoutRunId} is null or ${issues.checkoutRunId} = ${run.id}) and (${issues.executionRunId} is null or ${issues.executionRunId} = ${run.id}) then 'todo' else ${issues.status} end`,
+          assigneeAgentId: sql`case when ${issues.status} = 'in_progress' and ${issues.assigneeAgentId} = ${run.agentId} and (${issues.checkoutRunId} is null or ${issues.checkoutRunId} = ${run.id}) and (${issues.executionRunId} is null or ${issues.executionRunId} = ${run.id}) then null else ${issues.assigneeAgentId} end`,
+          checkoutRunId: sql`case when ${issues.checkoutRunId} = ${run.id} then null else ${issues.checkoutRunId} end`,
+          executionRunId: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionRunId} end`,
+          executionAgentNameKey: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionAgentNameKey} end`,
+          executionLockedAt: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionLockedAt} end`,
+          updatedAt: now,
+        })
+        .where(and(
+          eq(issues.companyId, run.companyId),
+          inArray(issues.id, ownedIssues.map((issue) => issue.id)),
+        ));
+    }
 
     await logActivity(tx, {
       companyId: run.companyId,

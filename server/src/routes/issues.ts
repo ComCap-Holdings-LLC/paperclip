@@ -10826,7 +10826,12 @@ export function issueRoutes(
       finalIssueStatus: () => updated?.status,
     });
     try {
-      updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId);
+      updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId, {
+        // Agent callers may only attach the short-lived external-pull capability
+        // authenticated for this request; internal scheduler checkouts retain
+        // their existing heartbeat-run behavior.
+        requireExternalPullRun: req.actor.type === "agent",
+      });
     } catch (error) {
       if (isUniqueViolation(error, "issues_open_routine_execution_uq")) {
         res.status(409).json({

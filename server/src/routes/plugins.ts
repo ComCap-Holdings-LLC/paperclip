@@ -663,7 +663,7 @@ export function pluginRoutes(
     if (!req.actor.agentId) {
       throw forbidden("Agent authentication required");
     }
-    await issuesSvc.assertCheckoutOwner(issueId, req.actor.agentId, runId);
+    await issuesSvc.assertCheckoutOwner(issueId, req.actor.agentId, runId, { capability: "internal" });
   }
 
   async function resolvePluginAuditCompanyIds(req: Request): Promise<string[]> {

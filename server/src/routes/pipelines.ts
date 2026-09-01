@@ -807,7 +807,7 @@ async function assertIssueLinkMutationAllowed(
   if (input.issue.status !== "in_progress") return;
   const runId = req.actor.runId?.trim();
   if (!runId) throw unauthorized("Agent run id required");
-  await input.issuesSvc.assertCheckoutOwner(input.issue.id, actorAgentId, runId);
+  await input.issuesSvc.assertCheckoutOwner(input.issue.id, actorAgentId, runId, { capability: "internal" });
 }
 
 export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineService>[1] = {}) {

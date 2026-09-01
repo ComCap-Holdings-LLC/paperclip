@@ -2038,6 +2038,7 @@ export function buildHostServices(
           params.issueId,
           params.actorAgentId,
           params.actorRunId,
+          { capability: "internal" },
         );
         if (ownership.adoptedFromRunId) {
           await logPluginActivity({

@@ -6606,7 +6606,7 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
   it("lets the current assignee adopt a stale terminal checkout owner", async () => {
     const seeded = await seedOwnershipIssue({ checkoutStatus: "failed" });
 
-    const ownership = await svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId);
+    const ownership = await svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId, { capability: "internal" });
 
     expect(ownership.checkoutRunId).toBe(seeded.actorRunId);
     expect(ownership.executionRunId).toBe(seeded.actorRunId);
@@ -6616,7 +6616,7 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
   it("treats timed_out checkout owners as stale and recoverable", async () => {
     const seeded = await seedOwnershipIssue({ checkoutStatus: "timed_out" });
 
-    const ownership = await svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId);
+    const ownership = await svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId, { capability: "internal" });
 
     expect(ownership.checkoutRunId).toBe(seeded.actorRunId);
     expect(ownership.adoptedFromRunId).toBeNull();
@@ -6626,7 +6626,7 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
     const seeded = await seedOwnershipIssue({ checkoutStatus: "failed", assigneeMatchesActor: false });
 
     await expect(
-      svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId),
+      svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId, { capability: "internal" }),
     ).rejects.toMatchObject({ status: 409 });
   });
 
@@ -6634,7 +6634,7 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
     const seeded = await seedOwnershipIssue({ checkoutStatus: "running" });
 
     await expect(
-      svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId),
+      svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId, { capability: "internal" }),
     ).rejects.toMatchObject({ status: 409 });
   });
 
@@ -6642,7 +6642,7 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
     const seeded = await seedOwnershipIssue({ checkoutStatus: "failed", actorRunStatus: "succeeded" });
 
     await expect(
-      svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId),
+      svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId, { capability: "internal" }),
     ).rejects.toMatchObject({ status: 409 });
 
     const row = await db
@@ -6657,6 +6657,81 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
       checkoutRunId: null,
       executionRunId: null,
     });
+  });
+
+  it.each([
+    "missing",
+    "non_external",
+    "expired",
+    "terminal",
+    "foreign_agent",
+    "foreign_company",
+  ] as const)("rejects a %s run capability before stale-checkout adoption", async (kind) => {
+    const seeded = await seedOwnershipIssue({ checkoutStatus: "failed" });
+    let actorRunId = seeded.actorRunId;
+    if (kind === "missing") {
+      actorRunId = randomUUID();
+    } else if (kind === "expired") {
+      await db.update(heartbeatRuns).set({
+        triggerDetail: "external_pull",
+        leaseExpiresAt: new Date(Date.now() - 1_000),
+      }).where(eq(heartbeatRuns.id, actorRunId));
+    } else if (kind === "terminal") {
+      await db.update(heartbeatRuns).set({
+        triggerDetail: "external_pull",
+        leaseExpiresAt: new Date(Date.now() + 60_000),
+        status: "failed",
+        finishedAt: new Date(),
+      }).where(eq(heartbeatRuns.id, actorRunId));
+    } else if (kind === "foreign_agent") {
+      const foreignAgentId = randomUUID();
+      await db.insert(agents).values({
+        id: foreignAgentId,
+        companyId: (await db.select({ companyId: issues.companyId }).from(issues).where(eq(issues.id, seeded.issueId)).then((rows) => rows[0]!)).companyId,
+        name: "Foreign agent",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {}, runtimeConfig: {}, permissions: {},
+      });
+      await db.update(heartbeatRuns).set({
+        agentId: foreignAgentId,
+        triggerDetail: "external_pull",
+        leaseExpiresAt: new Date(Date.now() + 60_000),
+      }).where(eq(heartbeatRuns.id, actorRunId));
+    } else if (kind === "foreign_company") {
+      const foreignCompanyId = randomUUID();
+      await db.insert(companies).values({
+        id: foreignCompanyId,
+        name: "Foreign company",
+        issuePrefix: `F${foreignCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.update(heartbeatRuns).set({
+        companyId: foreignCompanyId,
+        triggerDetail: "external_pull",
+        leaseExpiresAt: new Date(Date.now() + 60_000),
+      }).where(eq(heartbeatRuns.id, actorRunId));
+    }
+
+    await expect(svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, actorRunId))
+      .rejects.toMatchObject({ status: 409 });
+    const issue = await db.select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues).where(eq(issues.id, seeded.issueId)).then((rows) => rows[0]);
+    expect(issue?.checkoutRunId).not.toBe(actorRunId);
+    expect(issue?.executionRunId).not.toBe(actorRunId);
+  });
+
+  it("rejects a non-external capability before adopting an unowned checkout", async () => {
+    const seeded = await seedOwnershipIssue({ checkoutStatus: "failed" });
+    await db.update(issues).set({ checkoutRunId: null, executionRunId: null })
+      .where(eq(issues.id, seeded.issueId));
+
+    await expect(svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId))
+      .rejects.toMatchObject({ status: 409 });
+    const issue = await db.select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues).where(eq(issues.id, seeded.issueId)).then((rows) => rows[0]);
+    expect(issue).toEqual({ checkoutRunId: null, executionRunId: null });
   });
 
   it("adopts unowned checkout after a concurrent stale-checkout clear wins the lock race", async () => {
@@ -6691,7 +6766,7 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
 
     await rowLocked.promise;
 
-    const ownershipPromise = svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId);
+    const ownershipPromise = svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId, { capability: "internal" });
     await new Promise((resolve) => setTimeout(resolve, 10));
     clearCanCommit.resolve();
     await concurrentClear;

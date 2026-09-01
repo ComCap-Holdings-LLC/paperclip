@@ -4252,7 +4252,7 @@ export function issueRoutes(
     }
     const runId = requireAgentRunId(req, res);
     if (!runId) return false;
-    const ownership = await svc.assertCheckoutOwner(issue.id, actorAgentId, runId);
+    const ownership = await svc.assertCheckoutOwner(issue.id, actorAgentId, runId, { capability: "internal" });
     if (ownership.adoptedFromRunId) {
       const actor = getActorInfo(req);
       await logActivity(db, {

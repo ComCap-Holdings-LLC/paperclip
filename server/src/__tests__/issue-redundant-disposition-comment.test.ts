@@ -73,6 +73,18 @@ describe("isNearDuplicateDispositionComment", () => {
     ).toBe(false);
   });
 
+  it("does not suppress a one-token change in a large fenced evidence block", () => {
+    const evidence = "line one\nline two\nline three\n".repeat(80);
+    const fencedEvidence = (code: number) =>
+      ["Still blocked.", "```", `${evidence}error code ${code}`, "```"].join("\n");
+    expect(
+      isNearDuplicateDispositionComment(
+        fencedEvidence(10),
+        fencedEvidence(20),
+      ),
+    ).toBe(false);
+  });
+
   it("treats empty input as not duplicate", () => {
     expect(isNearDuplicateDispositionComment("", "still blocked")).toBe(false);
     expect(isNearDuplicateDispositionComment("still blocked", "")).toBe(false);

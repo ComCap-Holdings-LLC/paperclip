@@ -1902,6 +1902,12 @@ const REDUNDANT_DISPOSITION_COMMENT_MAX_COMPARE_LENGTH = 4000;
 // wording tweak (e.g. "No new blockers." -> "No new blockers found.").
 const REDUNDANT_DISPOSITION_COMMENT_MAX_DIFFERING_TOKENS = 1;
 
+function normalizeFencedDispositionEvidence(body: string): string {
+  return [...body.matchAll(/```([\s\S]*?)```/g)]
+    .map((match) => match[1].replace(/\r\n?/g, "\n").trim().toLowerCase())
+    .join("\n---\n");
+}
+
 function normalizeDispositionCommentText(body: string): string {
   return body
     .toLowerCase()
@@ -1926,6 +1932,9 @@ function normalizeDispositionCommentText(body: string): string {
 // issue status before treating a match as redundant, which keeps the
 // heuristic's false-positive risk low.
 export function isNearDuplicateDispositionComment(a: string, b: string): boolean {
+  // Evidence is not boilerplate: even a one-token change in a fenced log or
+  // patch must reach persistence and the normal comment side effects.
+  if (normalizeFencedDispositionEvidence(a) !== normalizeFencedDispositionEvidence(b)) return false;
   const normalizedA = normalizeDispositionCommentText(a).slice(0, REDUNDANT_DISPOSITION_COMMENT_MAX_COMPARE_LENGTH);
   const normalizedB = normalizeDispositionCommentText(b).slice(0, REDUNDANT_DISPOSITION_COMMENT_MAX_COMPARE_LENGTH);
   if (!normalizedA || !normalizedB) return false;

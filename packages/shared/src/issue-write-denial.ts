@@ -237,7 +237,8 @@ export function describeIssueWriteDenial(
           `bounds runaway comment sprays and loops — it is a rate backstop, not a ` +
           `permission decision, so ${actor} is still allowed to write to ${issue}.`,
         whoCanAct:
-          `${actor} on its next heartbeat run, or ${assignee} on ${issue} directly.`,
+          `${actor} again in this heartbeat run once the oldest cross-issue write is more ` +
+          `than 60 seconds old, or ${assignee} on ${issue} directly.`,
         sanctionedPath:
           `Consolidate what is left into one comment on your own task, then retry after the ` +
           `oldest cross-issue write is more than 60 seconds old.`,

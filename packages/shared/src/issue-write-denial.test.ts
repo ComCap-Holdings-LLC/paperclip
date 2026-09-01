@@ -75,6 +75,20 @@ describe("describeIssueWriteDenial", () => {
     expect(copy.sanctionedPath).toContain("60 seconds");
   });
 
+  it("guides the current run to retry after the rolling window clears", () => {
+    const copy = describeIssueWriteDenial("cross_issue_influence_cap_exceeded", {
+      actorLabel: "Fable",
+      assigneeLabel: "CodexCoder",
+      issueIdentifier: "TASK-482",
+    });
+
+    expect(copy.whoCanAct).toContain("again in this heartbeat run");
+    expect(copy.whoCanAct).toContain("oldest cross-issue write");
+    expect(copy.whoCanAct).toContain("more than 60 seconds old");
+    expect(copy.whoCanAct).toContain("CodexCoder on TASK-482 directly");
+    expect(copy.whoCanAct).not.toContain("next heartbeat run");
+  });
+
   it("defaults the cap to the shipped limit when context omits it", () => {
     const copy = describeIssueWriteDenial("cross_issue_influence_cap_exceeded");
     expect(copy.boundary).toContain("20");

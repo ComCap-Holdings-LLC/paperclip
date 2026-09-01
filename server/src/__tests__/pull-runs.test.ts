@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { activityLog, agents, companies, createDb, heartbeatRuns, issues } from "@paperclipai/db";
 import { issueService } from "../services/issues.js";
@@ -15,6 +15,16 @@ import {
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 describeEmbeddedPostgres("external pull-run leases", () => {
   let db!: ReturnType<typeof createDb>;
@@ -73,6 +83,22 @@ describeEmbeddedPostgres("external pull-run leases", () => {
     app.use("/api", issueRoutes(db, {} as never));
     app.use(errorHandler);
     return app;
+  }
+
+  async function waitForBlockedForUpdate(tableName: string, minimumWaiters = 1) {
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      const [waiting] = await db.execute<{ waiting: boolean }>(sql`
+        SELECT count(*) >= ${minimumWaiters} AS waiting
+          FROM pg_stat_activity
+          WHERE state = 'active'
+            AND wait_event_type = 'Lock'
+            AND query ILIKE ${`%${tableName}%`}
+            AND query ILIKE '%for update%'
+      `);
+      if (waiting?.waiting) return true;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return false;
   }
 
   it("requires an agent API key and refuses a client-supplied run id", async () => {
@@ -139,6 +165,224 @@ describeEmbeddedPostgres("external pull-run leases", () => {
     expect(first.status, JSON.stringify(first.body)).toBe(201);
     expect(retry.status, JSON.stringify(retry.body)).toBe(200);
     expect(retry.body.runId).toBe(first.body.runId);
+  });
+
+  it("applies scoped issue authorization before same-agent lifecycle control", async () => {
+    const f = await fixture();
+    const svc = pullRunService(db);
+    const started = await svc.start({
+      companyId: f.companyId,
+      agentId: f.agentId,
+      issueId: f.issueId,
+      expectedStatuses: ["todo"],
+      leaseSeconds: 120,
+    });
+    const denied = await request(createApp({
+      type: "agent",
+      source: "agent_key",
+      agentId: f.agentId,
+      companyId: f.companyId,
+      keyId: randomUUID(),
+      keyScope: { kind: "skill_test", issueId: randomUUID() },
+    })).post(`/api/pull-runs/${started.run.id}/cancel`).send({});
+    expect(denied.status, JSON.stringify(denied.body)).toBe(403);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, started.run.id)))
+      .toHaveLength(1);
+  });
+
+  it.each([
+    ["heartbeat"],
+    ["complete"],
+    ["cancel"],
+  ] as const)("denies scoped lifecycle %s when another run-locked issue is outside the key scope", async (operation) => {
+    const f = await fixture();
+    const svc = pullRunService(db);
+    const started = await svc.start({
+      companyId: f.companyId,
+      agentId: f.agentId,
+      issueId: f.issueId,
+      expectedStatuses: ["todo"],
+      leaseSeconds: 120,
+    });
+    const issueBId = randomUUID();
+    await db.insert(issues).values({
+      id: issueBId,
+      companyId: f.companyId,
+      title: "Second owned issue outside scoped key",
+      status: "in_progress",
+      assigneeAgentId: f.agentId,
+      checkoutRunId: started.run.id,
+      executionRunId: started.run.id,
+    });
+
+    const denied = await request(createApp({
+      type: "agent",
+      source: "agent_key",
+      agentId: f.agentId,
+      companyId: f.companyId,
+      keyId: randomUUID(),
+      runId: started.run.id,
+      keyScope: { kind: "skill_test", issueId: f.issueId },
+    })).post(`/api/pull-runs/${started.run.id}/${operation}`).send({});
+
+    expect(denied.status, JSON.stringify(denied.body)).toBe(403);
+    const [run, issueA, issueB] = await Promise.all([
+      db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, started.run.id)).then((rows) => rows[0]!),
+      db.select().from(issues).where(eq(issues.id, f.issueId)).then((rows) => rows[0]!),
+      db.select().from(issues).where(eq(issues.id, issueBId)).then((rows) => rows[0]!),
+    ]);
+    expect(run).toMatchObject({ status: "running", finishedAt: null });
+    expect(issueA).toMatchObject({
+      status: "in_progress",
+      assigneeAgentId: f.agentId,
+      checkoutRunId: started.run.id,
+      executionRunId: started.run.id,
+    });
+    expect(issueB).toMatchObject({
+      status: "in_progress",
+      assigneeAgentId: f.agentId,
+      checkoutRunId: started.run.id,
+      executionRunId: started.run.id,
+    });
+  });
+
+  it.each([
+    ["heartbeat"],
+    ["complete"],
+    ["cancel"],
+  ] as const)("revalidates locked issue authorization before lifecycle %s mutates the run", async (operation) => {
+    const f = await fixture();
+    const svc = pullRunService(db);
+    const started = await svc.start({
+      companyId: f.companyId,
+      agentId: f.agentId,
+      issueId: f.issueId,
+      expectedStatuses: ["todo"],
+      leaseSeconds: 120,
+    });
+    const descendantIssueId = randomUUID();
+    await db.update(issues)
+      .set({ assigneeAgentId: null, updatedAt: new Date() })
+      .where(eq(issues.id, f.issueId));
+    await db.insert(issues).values({
+      id: descendantIssueId,
+      companyId: f.companyId,
+      parentId: f.issueId,
+      title: "Attached descendant",
+      status: "in_progress",
+      assigneeAgentId: null,
+      checkoutRunId: started.run.id,
+      executionRunId: started.run.id,
+    });
+    const originalLeaseExpiresAt = started.run.leaseExpiresAt?.getTime();
+    const lockDb = createDb(tempDb!.connectionString);
+    const lockReady = deferred<number>();
+    const releaseLock = deferred<void>();
+    const authorizationChange = lockDb.transaction(async (tx) => {
+      await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${descendantIssueId} for update`);
+      const [connection] = await tx.execute<{ pid: number }>(sql`select pg_backend_pid() as pid`);
+      lockReady.resolve(connection!.pid);
+      await releaseLock.promise;
+      await tx.update(issues)
+        .set({ assigneeAgentId: f.otherAgentId, updatedAt: new Date() })
+        .where(eq(issues.id, descendantIssueId));
+    });
+    const lockPid = await lockReady.promise;
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      const [connection] = await db.execute<{ state: string }>(sql`
+        select state from pg_stat_activity where pid = ${lockPid}
+      `);
+      if (connection?.state === "idle in transaction") break;
+      if (attempt === 79) throw new Error("authorization-change transaction did not become idle");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+
+    try {
+      const lifecycle = request(createApp({
+        type: "agent",
+        source: "agent_key",
+        agentId: f.agentId,
+        companyId: f.companyId,
+        runId: started.run.id,
+        keyScope: null,
+      }))
+        .post(`/api/pull-runs/${started.run.id}/${operation}`)
+        .send(operation === "heartbeat" ? { leaseSeconds: 300 } : {})
+        .then((response) => response);
+
+      expect(await waitForBlockedForUpdate("issues")).toBe(true);
+      releaseLock.resolve();
+      await authorizationChange;
+      const denied = await Promise.race([
+        lifecycle,
+        new Promise<never>((_, reject) => setTimeout(
+          () => reject(new Error("pull-run authorization revalidation timed out")),
+          5_000,
+        )),
+      ]);
+
+      expect(denied.status, JSON.stringify(denied.body)).toBe(409);
+      const [run, primaryIssue, descendantIssue, lifecycleLogs] = await Promise.all([
+        db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, started.run.id)).then((rows) => rows[0]!),
+        db.select().from(issues).where(eq(issues.id, f.issueId)).then((rows) => rows[0]!),
+        db.select().from(issues).where(eq(issues.id, descendantIssueId)).then((rows) => rows[0]!),
+        db.select({ action: activityLog.action }).from(activityLog).where(and(
+          eq(activityLog.runId, started.run.id),
+          inArray(activityLog.action, ["pull_run.heartbeat", "pull_run.completed", "pull_run.cancelled"]),
+        )),
+      ]);
+      expect(run).toMatchObject({ status: "running", finishedAt: null });
+      expect(run.leaseExpiresAt?.getTime()).toBe(originalLeaseExpiresAt);
+      expect(primaryIssue).toMatchObject({
+        status: "in_progress",
+        assigneeAgentId: null,
+        checkoutRunId: started.run.id,
+        executionRunId: started.run.id,
+      });
+      expect(descendantIssue).toMatchObject({
+        status: "in_progress",
+        assigneeAgentId: f.otherAgentId,
+        checkoutRunId: started.run.id,
+        executionRunId: started.run.id,
+      });
+      expect(lifecycleLogs).toHaveLength(0);
+    } finally {
+      releaseLock.resolve();
+      await Promise.allSettled([authorizationChange]);
+      await lockDb.$client.end();
+    }
+  });
+
+  it("does not renew a scoped heartbeat when an attached issue is outside the authorized set", async () => {
+    const f = await fixture();
+    const svc = pullRunService(db);
+    const started = await svc.start({
+      companyId: f.companyId,
+      agentId: f.agentId,
+      issueId: f.issueId,
+      expectedStatuses: ["todo"],
+      leaseSeconds: 120,
+    });
+    const issueBId = randomUUID();
+    await db.insert(issues).values({
+      id: issueBId,
+      companyId: f.companyId,
+      title: "Unauthorized attached issue",
+      status: "in_progress",
+      assigneeAgentId: f.agentId,
+      checkoutRunId: started.run.id,
+      executionRunId: started.run.id,
+    });
+
+    await expect(svc.heartbeat(f.companyId, f.agentId, started.run.id, 120, undefined, {
+      authorizedIssueIds: [f.issueId],
+    })).rejects.toMatchObject({ status: 409 });
+    const [run, heartbeatLogs] = await Promise.all([
+      db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, started.run.id)).then((rows) => rows[0]!),
+      db.select({ action: activityLog.action }).from(activityLog).where(eq(activityLog.runId, started.run.id)),
+    ]);
+    expect(run.leaseExpiresAt?.getTime()).toBe(started.run.leaseExpiresAt?.getTime());
+    expect(heartbeatLogs.map((row) => row.action)).not.toContain("pull_run.heartbeat");
   });
 
   it("server-issues a live run, atomically claims the issue, and retries idempotently", async () => {

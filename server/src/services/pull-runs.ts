@@ -30,10 +30,113 @@ export interface PullRunAuditActor {
   responsibleUserIdOverride?: string | null;
 }
 
+export interface PullRunLifecycleAuthorization {
+  /**
+   * The complete issue-lock set authorized by the route before entering the
+   * lifecycle transaction. The service revalidates it after locking the same
+   * rows so an issue cannot be attached to the run between authorization and
+   * cleanup.
+   */
+  authorizedIssueIds?: readonly string[];
+  /** Re-run route authorization against the issue rows held by this transaction. */
+  revalidateLockedIssues?: (
+    tx: Db,
+    issues: readonly PullRunLifecycleIssueAuthorizationSnapshot[],
+  ) => Promise<void>;
+}
+
+export interface PullRunLifecycleIssueAuthorizationSnapshot {
+  id: string;
+  companyId: string;
+  projectId: string | null;
+  parentId: string | null;
+  status: string;
+  assigneeAgentId: string | null;
+  assigneeUserId: string | null;
+  identifier: string | null;
+  checkoutRunId: string | null;
+  executionRunId: string | null;
+}
+
+const lifecycleIssueAuthorizationSelection = {
+  id: issues.id,
+  companyId: issues.companyId,
+  projectId: issues.projectId,
+  parentId: issues.parentId,
+  status: issues.status,
+  assigneeAgentId: issues.assigneeAgentId,
+  assigneeUserId: issues.assigneeUserId,
+  identifier: issues.identifier,
+  checkoutRunId: issues.checkoutRunId,
+  executionRunId: issues.executionRunId,
+};
+
 const DEFAULT_PULL_RUN_AUDIT_ACTOR: PullRunAuditActor = {
   actorType: "system",
   actorId: "external-pull-run-service",
 };
+
+class PullRunAttachmentSetChangedError extends Error {}
+
+function sameIssueIds(
+  first: readonly { id: string }[],
+  second: readonly { id: string }[],
+) {
+  return first.length === second.length && first.every((issue, index) => issue.id === second[index]?.id);
+}
+
+async function lifecycleAuthorizationIssueIds(
+  tx: Db,
+  companyId: string,
+  runId: string,
+  includeAncestors: boolean,
+) {
+  if (!includeAncestors) {
+    return tx
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(
+        eq(issues.companyId, companyId),
+        or(eq(issues.checkoutRunId, runId), eq(issues.executionRunId, runId)),
+      ))
+      .orderBy(issues.id);
+  }
+  return tx.execute<{ id: string }>(sql`
+    WITH RECURSIVE authorization_issues AS (
+      SELECT ${issues.id} AS id, ${issues.parentId} AS parent_id
+      FROM ${issues}
+      WHERE ${issues.companyId} = ${companyId}
+        AND (${issues.checkoutRunId} = ${runId} OR ${issues.executionRunId} = ${runId})
+      UNION
+      SELECT parent.${sql.identifier("id")} AS id, parent.${sql.identifier("parent_id")} AS parent_id
+      FROM ${issues} parent
+      JOIN authorization_issues child ON parent.${sql.identifier("id")} = child.parent_id
+      WHERE parent.${sql.identifier("company_id")} = ${companyId}
+    )
+    SELECT id FROM authorization_issues ORDER BY id
+  `);
+}
+
+async function lockLifecycleAuthorizationIssues(
+  tx: Db,
+  companyId: string,
+  runId: string,
+  includeAncestors: boolean,
+) {
+  const issueIds = await lifecycleAuthorizationIssueIds(tx, companyId, runId, includeAncestors);
+  if (issueIds.length === 0) return [];
+  const lockedIssues = await tx
+    .select(lifecycleIssueAuthorizationSelection)
+    .from(issues)
+    .where(and(eq(issues.companyId, companyId), inArray(issues.id, issueIds.map((issue) => issue.id))))
+    .orderBy(issues.id)
+    .for("update");
+  const issueIdsAfterLock = await lifecycleAuthorizationIssueIds(tx, companyId, runId, includeAncestors);
+  if (!sameIssueIds(issueIds, issueIdsAfterLock)) throw new PullRunAttachmentSetChangedError();
+  return lockedIssues.filter(
+    (issue) => issue.checkoutRunId === runId || issue.executionRunId === runId,
+  );
+}
 
 function leaseExpiry(now: Date, leaseSeconds: number) {
   return new Date(now.getTime() + leaseSeconds * 1_000);
@@ -107,14 +210,11 @@ export function pullRunService(db: Db) {
 
   async function requirePullAgent(companyId: string, agentId: string) {
     const agent = await db
-      .select({ id: agents.id, companyId: agents.companyId, executionModel: agents.executionModel })
+      .select({ id: agents.id, companyId: agents.companyId })
       .from(agents)
       .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId)))
       .then((rows) => rows[0] ?? null);
     if (!agent) throw notFound("Agent not found");
-    if (agent.executionModel !== "pull") {
-      throw forbidden("External pull runs require executionModel 'pull'");
-    }
     return agent;
   }
 
@@ -248,6 +348,7 @@ export function pullRunService(db: Db) {
     runId: string,
     leaseSeconds: number,
     auditActor?: PullRunAuditActor,
+    authorization?: PullRunLifecycleAuthorization,
   ) {
     assertLeaseSeconds(leaseSeconds);
     await requirePullAgent(companyId, agentId);
@@ -258,35 +359,74 @@ export function pullRunService(db: Db) {
       await expireExternalPullRun(db, run.id, now);
       throw conflict("Pull run lease expired");
     }
-    const updated = await auditedTransaction(async (tx, publications) => {
-      const next = await tx
-        .update(heartbeatRuns)
-        .set({ leaseExpiresAt: leaseExpiry(now, leaseSeconds), lastUsefulActionAt: now, updatedAt: now })
-        .where(and(
-          eq(heartbeatRuns.id, run.id),
-          eq(heartbeatRuns.agentId, agentId),
-          gt(heartbeatRuns.leaseExpiresAt, now),
-          inArray(heartbeatRuns.status, LIVE_PULL_RUN_STATUSES),
-        ))
-        .returning()
-        .then((rows) => rows[0] ?? null);
-      if (!next) return null;
-      await logActivity(tx, {
-        companyId,
-        ...activityActor(auditActor, agentId),
-        runId: next.id,
-        action: "pull_run.heartbeat",
-        entityType: "heartbeat_run",
-        entityId: next.id,
-        details: { leaseSeconds },
-      }, publications);
-      return next;
-    });
-    if (!updated) {
-      await expireExternalPullRun(db, run.id, new Date());
-      throw conflict("Pull run is no longer live");
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const updated = await auditedTransaction(async (tx, publications) => {
+          const lockedIssues = await lockLifecycleAuthorizationIssues(
+            tx,
+            companyId,
+            run.id,
+            Boolean(authorization?.revalidateLockedIssues),
+          );
+          await tx.execute(
+            sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${run.id} for update`,
+          );
+          const attachedIssueIdsAfterRunLock = await tx
+            .select({ id: issues.id })
+            .from(issues)
+            .where(and(
+              eq(issues.companyId, companyId),
+              or(eq(issues.checkoutRunId, run.id), eq(issues.executionRunId, run.id)),
+            ))
+            .orderBy(issues.id);
+          if (!sameIssueIds(lockedIssues, attachedIssueIdsAfterRunLock)) {
+            throw new PullRunAttachmentSetChangedError();
+          }
+          if (authorization?.authorizedIssueIds) {
+            const authorizedIssueIds = [...new Set(authorization.authorizedIssueIds)].sort();
+            const ownedIssueIds = lockedIssues.map((issue) => issue.id);
+            if (
+              authorizedIssueIds.length !== authorization.authorizedIssueIds.length
+              || authorizedIssueIds.length !== ownedIssueIds.length
+              || authorizedIssueIds.some((issueId, index) => issueId !== ownedIssueIds[index])
+            ) {
+              throw conflict("Pull run issue locks changed; retry");
+            }
+          }
+          await authorization?.revalidateLockedIssues?.(tx, lockedIssues);
+          const next = await tx
+            .update(heartbeatRuns)
+            .set({ leaseExpiresAt: leaseExpiry(now, leaseSeconds), lastUsefulActionAt: now, updatedAt: now })
+            .where(and(
+              eq(heartbeatRuns.id, run.id),
+              eq(heartbeatRuns.agentId, agentId),
+              gt(heartbeatRuns.leaseExpiresAt, now),
+              inArray(heartbeatRuns.status, LIVE_PULL_RUN_STATUSES),
+            ))
+            .returning()
+            .then((rows) => rows[0] ?? null);
+          if (!next) return null;
+          await logActivity(tx, {
+            companyId,
+            ...activityActor(auditActor, agentId),
+            runId: next.id,
+            action: "pull_run.heartbeat",
+            entityType: "heartbeat_run",
+            entityId: next.id,
+            details: { leaseSeconds },
+          }, publications);
+          return next;
+        });
+        if (!updated) {
+          await expireExternalPullRun(db, run.id, new Date());
+          throw conflict("Pull run is no longer live");
+        }
+        return updated;
+      } catch (error) {
+        if (!(error instanceof PullRunAttachmentSetChangedError) || attempt === 2) throw error;
+      }
     }
-    return updated;
+    throw conflict("Pull run attachment set changed; retry");
   }
 
   async function finish(
@@ -295,6 +435,7 @@ export function pullRunService(db: Db) {
     runId: string,
     status: "succeeded" | "cancelled",
     auditActor?: PullRunAuditActor,
+    authorization?: PullRunLifecycleAuthorization,
   ) {
     await requirePullAgent(companyId, agentId);
     const run = await loadOwnedRun(companyId, agentId, runId);
@@ -304,14 +445,45 @@ export function pullRunService(db: Db) {
       await expireExternalPullRun(db, run.id, now);
       throw conflict("Pull run lease expired");
     }
-    return auditedTransaction(async (tx, publications) => {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        return await auditedTransaction(async (tx, publications) => {
       // External pull-run lifecycle operations use issue -> run lock order.
-      await tx.execute(
-        sql`select ${issues.id} from ${issues} where ${issues.checkoutRunId} = ${run.id} or ${issues.executionRunId} = ${run.id} order by ${issues.id} for update`,
+      const ownedIssues = await lockLifecycleAuthorizationIssues(
+        tx,
+        companyId,
+        run.id,
+        Boolean(authorization?.revalidateLockedIssues),
       );
       await tx.execute(
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${run.id} for update`,
       );
+      const attachedIssueIdsAfterRunLock = await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(and(
+          eq(issues.companyId, companyId),
+          or(eq(issues.checkoutRunId, run.id), eq(issues.executionRunId, run.id)),
+        ))
+        .orderBy(issues.id);
+      // Do not lock an attachment discovered while holding the run lock: that
+      // would invert checkout's issue -> run order. Roll back and retry so the
+      // next attempt locks the complete set of issue rows first.
+      if (!sameIssueIds(ownedIssues, attachedIssueIdsAfterRunLock)) {
+        throw new PullRunAttachmentSetChangedError();
+      }
+      if (authorization?.authorizedIssueIds) {
+        const authorizedIssueIds = [...new Set(authorization.authorizedIssueIds)].sort();
+        const ownedIssueIds = ownedIssues.map((issue) => issue.id);
+        if (
+          authorizedIssueIds.length !== authorization.authorizedIssueIds.length
+          || authorizedIssueIds.length !== ownedIssueIds.length
+          || authorizedIssueIds.some((issueId, index) => issueId !== ownedIssueIds[index])
+        ) {
+          throw conflict("Pull run issue locks changed; retry");
+        }
+      }
+      await authorization?.revalidateLockedIssues?.(tx, ownedIssues);
       const updated = await tx
         .update(heartbeatRuns)
         .set({ status, finishedAt: now, leaseExpiresAt: null, updatedAt: now })
@@ -325,27 +497,12 @@ export function pullRunService(db: Db) {
         .returning()
         .then((rows) => rows[0] ?? null);
       if (!updated) throw conflict("Pull run is no longer live");
-
-      const ownedIssues = await tx
-        .select({
-          id: issues.id,
-          status: issues.status,
-          assigneeAgentId: issues.assigneeAgentId,
-          checkoutRunId: issues.checkoutRunId,
-          executionRunId: issues.executionRunId,
-        })
-        .from(issues)
-        .where(and(
-          eq(issues.companyId, companyId),
-          or(eq(issues.checkoutRunId, run.id), eq(issues.executionRunId, run.id)),
-        ))
-        .orderBy(issues.id);
-      const requeued = status === "cancelled" && ownedIssues.some((issue) =>
+      const isRequeuedIssue = (issue: typeof ownedIssues[number]) => status === "cancelled" &&
         issue.status === "in_progress"
         && issue.assigneeAgentId === agentId
         && (issue.checkoutRunId == null || issue.checkoutRunId === run.id)
-        && (issue.executionRunId == null || issue.executionRunId === run.id),
-      );
+        && (issue.executionRunId == null || issue.executionRunId === run.id);
+      const requeued = ownedIssues.some(isRequeuedIssue);
       if (ownedIssues.length > 0) {
         await tx
           .update(issues)
@@ -364,7 +521,7 @@ export function pullRunService(db: Db) {
           })
           .where(and(
             eq(issues.companyId, companyId),
-            or(eq(issues.checkoutRunId, run.id), eq(issues.executionRunId, run.id)),
+            inArray(issues.id, ownedIssues.map((issue) => issue.id)),
           ));
       }
       await logActivity(tx, {
@@ -374,23 +531,52 @@ export function pullRunService(db: Db) {
         action: status === "succeeded" ? "pull_run.completed" : "pull_run.cancelled",
         entityType: "heartbeat_run",
         entityId: updated.id,
-        issueId: ownedIssues[0]?.id ?? null,
+        issueId: null,
         details: {
-          issueId: ownedIssues[0]?.id ?? null,
+          issueIds: ownedIssues.map((issue) => issue.id),
           requeued,
         },
       }, publications);
+      for (const issue of ownedIssues) {
+        await logActivity(tx, {
+          companyId,
+          ...activityActor(auditActor, agentId),
+          runId: updated.id,
+          action: status === "succeeded" ? "pull_run.issue_completed" : "pull_run.issue_cancelled",
+          entityType: "issue",
+          entityId: issue.id,
+          issueId: issue.id,
+          details: { issueId: issue.id, requeued: isRequeuedIssue(issue) },
+        }, publications);
+      }
       return updated;
-    });
+        });
+      } catch (error) {
+        if (error instanceof PullRunAttachmentSetChangedError && attempt < 2) continue;
+        if (error instanceof PullRunAttachmentSetChangedError) throw conflict("Pull run issue locks changed; retry");
+        throw error;
+      }
+    }
+    throw conflict("Pull run issue locks changed; retry");
   }
 
   return {
     start,
     heartbeat,
     sweepExpired,
-    complete: (companyId: string, agentId: string, runId: string, auditActor?: PullRunAuditActor) =>
-      finish(companyId, agentId, runId, "succeeded", auditActor),
-    cancel: (companyId: string, agentId: string, runId: string, auditActor?: PullRunAuditActor) =>
-      finish(companyId, agentId, runId, "cancelled", auditActor),
+    complete: (
+      companyId: string,
+      agentId: string,
+      runId: string,
+      auditActor?: PullRunAuditActor,
+      authorization?: PullRunLifecycleAuthorization,
+    ) => finish(companyId, agentId, runId, "succeeded", auditActor, authorization),
+    cancel: (
+      companyId: string,
+      agentId: string,
+      runId: string,
+      auditActor?: PullRunAuditActor,
+      authorization?: PullRunLifecycleAuthorization,
+    ) => finish(companyId, agentId, runId, "cancelled", auditActor, authorization),
   };
 }

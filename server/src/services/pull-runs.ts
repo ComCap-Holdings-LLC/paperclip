@@ -357,9 +357,9 @@ export function pullRunService(db: Db) {
     await requirePullAgent(companyId, agentId);
     const run = await loadOwnedRun(companyId, agentId, runId);
     if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) throw conflict("Pull run is terminal");
-    const now = new Date();
-    if (isExpired(run, now)) {
-      await expireExternalPullRun(db, run.id, now);
+    const initialNow = new Date();
+    if (isExpired(run, initialNow)) {
+      await expireExternalPullRun(db, run.id, initialNow);
       throw conflict("Pull run lease expired");
     }
     for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -397,13 +397,18 @@ export function pullRunService(db: Db) {
             }
           }
           await authorization?.revalidateLockedIssues?.(tx, lockedIssues);
+          const transactionNow = new Date();
           const next = await tx
             .update(heartbeatRuns)
-            .set({ leaseExpiresAt: leaseExpiry(now, leaseSeconds), lastUsefulActionAt: now, updatedAt: now })
+            .set({
+              leaseExpiresAt: leaseExpiry(transactionNow, leaseSeconds),
+              lastUsefulActionAt: transactionNow,
+              updatedAt: transactionNow,
+            })
             .where(and(
               eq(heartbeatRuns.id, run.id),
               eq(heartbeatRuns.agentId, agentId),
-              gt(heartbeatRuns.leaseExpiresAt, now),
+              gt(heartbeatRuns.leaseExpiresAt, transactionNow),
               inArray(heartbeatRuns.status, LIVE_PULL_RUN_STATUSES),
             ))
             .returning()
@@ -445,9 +450,9 @@ export function pullRunService(db: Db) {
     await requirePullAgent(companyId, agentId);
     const run = await loadOwnedRun(companyId, agentId, runId);
     if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) throw conflict("Pull run is terminal");
-    const now = new Date();
-    if (isExpired(run, now)) {
-      await expireExternalPullRun(db, run.id, now);
+    const initialNow = new Date();
+    if (isExpired(run, initialNow)) {
+      await expireExternalPullRun(db, run.id, initialNow);
       throw conflict("Pull run lease expired");
     }
     for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -489,14 +494,15 @@ export function pullRunService(db: Db) {
         }
       }
       await authorization?.revalidateLockedIssues?.(tx, ownedIssues);
+      const transactionNow = new Date();
       const updated = await tx
         .update(heartbeatRuns)
-        .set({ status, finishedAt: now, leaseExpiresAt: null, updatedAt: now })
+        .set({ status, finishedAt: transactionNow, leaseExpiresAt: null, updatedAt: transactionNow })
         .where(and(
           eq(heartbeatRuns.id, run.id),
           eq(heartbeatRuns.companyId, companyId),
           eq(heartbeatRuns.agentId, agentId),
-          gt(heartbeatRuns.leaseExpiresAt, now),
+          gt(heartbeatRuns.leaseExpiresAt, transactionNow),
           inArray(heartbeatRuns.status, LIVE_PULL_RUN_STATUSES),
         ))
         .returning()
@@ -522,7 +528,7 @@ export function pullRunService(db: Db) {
             executionRunId: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionRunId} end`,
             executionAgentNameKey: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionAgentNameKey} end`,
             executionLockedAt: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionLockedAt} end`,
-            updatedAt: now,
+            updatedAt: transactionNow,
           })
           .where(and(
             eq(issues.companyId, companyId),

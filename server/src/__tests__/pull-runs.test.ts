@@ -353,6 +353,67 @@ describeEmbeddedPostgres("external pull-run leases", () => {
     }
   });
 
+  it.each([
+    ["heartbeat"],
+    ["complete"],
+    ["cancel"],
+  ] as const)("does not %s after the lease expires while waiting for an issue lock", async (operation) => {
+    const f = await fixture();
+    const svc = pullRunService(db);
+    const started = await svc.start({
+      companyId: f.companyId,
+      agentId: f.agentId,
+      issueId: f.issueId,
+      expectedStatuses: ["todo"],
+      leaseSeconds: 60,
+    });
+    const lockDb = createDb(tempDb!.connectionString);
+    const lockReady = deferred<void>();
+    const releaseLock = deferred<void>();
+    const issueLock = lockDb.transaction(async (tx) => {
+      await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${f.issueId} for update`);
+      lockReady.resolve();
+      await releaseLock.promise;
+    });
+    await lockReady.promise;
+
+    try {
+      const lifecycle = operation === "heartbeat"
+        ? svc.heartbeat(f.companyId, f.agentId, started.run.id, 120)
+        : operation === "complete"
+          ? svc.complete(f.companyId, f.agentId, started.run.id)
+          : svc.cancel(f.companyId, f.agentId, started.run.id);
+      expect(await waitForBlockedForUpdate("issues")).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      const expiredAt = new Date(Date.now() - 25);
+      await db.update(heartbeatRuns)
+        .set({ leaseExpiresAt: expiredAt })
+        .where(eq(heartbeatRuns.id, started.run.id));
+      releaseLock.resolve();
+
+      await expect(lifecycle).rejects.toMatchObject({ status: 409 });
+      const [run, lifecycleLogs] = await Promise.all([
+        db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, started.run.id)).then((rows) => rows[0]!),
+        db.select({ action: activityLog.action }).from(activityLog).where(and(
+          eq(activityLog.runId, started.run.id),
+          inArray(activityLog.action, ["pull_run.heartbeat", "pull_run.completed", "pull_run.cancelled"]),
+        )),
+      ]);
+      if (operation === "heartbeat") {
+        expect(run.status).toBe("timed_out");
+        expect(run.finishedAt).not.toBeNull();
+      } else {
+        expect(run.status).toBe("running");
+        expect(run.finishedAt).toBeNull();
+      }
+      expect(lifecycleLogs).toHaveLength(0);
+    } finally {
+      releaseLock.resolve();
+      await Promise.allSettled([issueLock]);
+      await lockDb.$client.end();
+    }
+  });
+
   it("returns conflict without renewing when heartbeat attachment stabilization exhausts its retries", async () => {
     const f = await fixture();
     const baseSvc = pullRunService(db);

@@ -224,6 +224,12 @@ import {
   type TrustPresetResolution,
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
+import {
+  PULL_RUN_LEASE_DEFAULT_SECONDS,
+  PULL_RUN_LEASE_MAX_SECONDS,
+  PULL_RUN_LEASE_MIN_SECONDS,
+  pullRunService,
+} from "../services/pull-runs.js";
 import { deliverAgentUnblockNotification } from "../services/routable-blocked.js";
 import {
   assertIssueReviewVerdictActorAllowed,
@@ -256,6 +262,16 @@ const inboxArchiveBodySchema = z.object({
 const externalObjectSummariesSchema = z.object({
   issueIds: z.array(z.string().uuid()).max(1000),
 }).strict();
+const pullRunLeaseSchema = z.object({
+  leaseSeconds: z.number().int().min(PULL_RUN_LEASE_MIN_SECONDS).max(PULL_RUN_LEASE_MAX_SECONDS)
+    .default(PULL_RUN_LEASE_DEFAULT_SECONDS),
+}).strict().default({});
+const startPullRunSchema = z.object({
+  leaseSeconds: z.number().int().min(PULL_RUN_LEASE_MIN_SECONDS).max(PULL_RUN_LEASE_MAX_SECONDS)
+    .default(PULL_RUN_LEASE_DEFAULT_SECONDS),
+  expectedStatuses: z.array(z.enum(["backlog", "todo", "in_progress"])).nonempty()
+    .default(["backlog", "todo", "in_progress"]),
+}).strict().default({});
 
 const promoteLowTrustOutputSchema = z.object({
   sourceArtifactKind: z.enum(["comment", "document", "work_product", "issue"]),
@@ -2878,6 +2894,7 @@ export function issueRoutes(
 ) {
   const router = Router();
   const svc = issueService(db);
+  const pullRuns = pullRunService(db);
   const runRedactions = createRunSecretRedactionRegistry(db);
   const access = accessService(db);
   const heartbeat = heartbeatService(db, {
@@ -10526,6 +10543,70 @@ export function issueRoutes(
 
     await queueTaskWatchdogEvaluation(existing, actor.runId);
     res.json(issue);
+  });
+
+  router.post("/issues/:id/pull-runs", validate(startPullRunSchema), async (req, res) => {
+    const actor = req.actor;
+    if (actor.type !== "agent" || actor.source !== "agent_key" || !actor.companyId || !actor.agentId) {
+      res.status(403).json({ error: "Agent API key required" });
+      return;
+    }
+    if (actor.runId) {
+      res.status(400).json({ error: "Pull-run start does not accept a client-supplied run id" });
+      return;
+    }
+    const id = req.params.id as string;
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    const result = await pullRuns.start({
+      companyId: actor.companyId,
+      agentId: actor.agentId,
+      issueId: issue.id,
+      expectedStatuses: req.body.expectedStatuses,
+      leaseSeconds: req.body.leaseSeconds,
+    });
+    res.status(result.idempotent ? 200 : 201).json({
+      runId: result.run.id,
+      status: result.run.status,
+      leaseExpiresAt: result.run.leaseExpiresAt,
+      idempotent: result.idempotent,
+      issue: result.issue,
+    });
+  });
+
+  router.post("/pull-runs/:runId/heartbeat", validate(pullRunLeaseSchema), async (req, res) => {
+    const actor = req.actor;
+    if (actor.type !== "agent" || actor.source !== "agent_key" || !actor.companyId || !actor.agentId) {
+      res.status(403).json({ error: "Agent API key required" });
+      return;
+    }
+    const run = await pullRuns.heartbeat(
+      actor.companyId,
+      actor.agentId,
+      req.params.runId as string,
+      req.body.leaseSeconds,
+    );
+    res.json({ runId: run?.id, status: run?.status, leaseExpiresAt: run?.leaseExpiresAt });
+  });
+
+  router.post("/pull-runs/:runId/complete", async (req, res) => {
+    const actor = req.actor;
+    if (actor.type !== "agent" || actor.source !== "agent_key" || !actor.companyId || !actor.agentId) {
+      res.status(403).json({ error: "Agent API key required" });
+      return;
+    }
+    const run = await pullRuns.complete(actor.companyId, actor.agentId, req.params.runId as string);
+    res.json({ runId: run.id, status: run.status, finishedAt: run.finishedAt });
+  });
+
+  router.post("/pull-runs/:runId/cancel", async (req, res) => {
+    const actor = req.actor;
+    if (actor.type !== "agent" || actor.source !== "agent_key" || !actor.companyId || !actor.agentId) {
+      res.status(403).json({ error: "Agent API key required" });
+      return;
+    }
+    const run = await pullRuns.cancel(actor.companyId, actor.agentId, req.params.runId as string);
+    res.json({ runId: run.id, status: run.status, finishedAt: run.finishedAt });
   });
 
   router.post("/issues/:id/checkout", validate(checkoutIssueSchema), async (req, res) => {

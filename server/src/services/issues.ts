@@ -775,6 +775,19 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
 }
 
 export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "interrupted", "failed", "cancelled", "timed_out"]);
+const EXTERNAL_PULL_RUN_TRIGGER = "external_pull";
+
+function heartbeatRunIsTerminalOrLeaseExpired(run: {
+  status: string;
+  triggerDetail?: string | null;
+  leaseExpiresAt?: Date | null;
+}) {
+  return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)
+    || (
+      run.triggerDetail === EXTERNAL_PULL_RUN_TRIGGER
+      && (run.leaseExpiresAt == null || run.leaseExpiresAt.getTime() <= Date.now())
+    );
+}
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
 
@@ -931,11 +944,15 @@ async function resolveAcceptedPlanClaimOwner(input: {
   }
 
   const existingOwnerRun = await input.dbOrTx
-    .select({ status: heartbeatRuns.status })
+    .select({
+      status: heartbeatRuns.status,
+      triggerDetail: heartbeatRuns.triggerDetail,
+      leaseExpiresAt: heartbeatRuns.leaseExpiresAt,
+    })
     .from(heartbeatRuns)
     .where(eq(heartbeatRuns.id, input.claim.ownerRunId))
     .then((rows) => rows[0] ?? null);
-  if (existingOwnerRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(existingOwnerRun.status)) {
+  if (existingOwnerRun && !heartbeatRunIsTerminalOrLeaseExpired(existingOwnerRun)) {
     return {
       ownerAgentId: input.claim.ownerAgentId,
       ownerUserId: input.claim.ownerUserId,
@@ -1138,12 +1155,16 @@ export async function heartbeatRunIsTerminalOrMissing(
   runId: string,
 ): Promise<boolean> {
   const run = await dbOrTx
-    .select({ status: heartbeatRuns.status })
+    .select({
+      status: heartbeatRuns.status,
+      triggerDetail: heartbeatRuns.triggerDetail,
+      leaseExpiresAt: heartbeatRuns.leaseExpiresAt,
+    })
     .from(heartbeatRuns)
     .where(eq(heartbeatRuns.id, runId))
-    .then((rows: Array<{ status: string }>) => rows[0] ?? null);
+    .then((rows) => rows[0] ?? null);
   if (!run) return true;
-  return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
+  return heartbeatRunIsTerminalOrLeaseExpired(run);
 }
 
 /**
@@ -5091,18 +5112,26 @@ export function issueService(db: Db) {
       ]);
       const [existingRun, actorRun] = await Promise.all([
         tx
-          .select({ status: heartbeatRuns.status })
+          .select({
+            status: heartbeatRuns.status,
+            triggerDetail: heartbeatRuns.triggerDetail,
+            leaseExpiresAt: heartbeatRuns.leaseExpiresAt,
+          })
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.id, input.expectedCheckoutRunId))
           .then((rows) => rows[0] ?? null),
         tx
-          .select({ status: heartbeatRuns.status })
+          .select({
+            status: heartbeatRuns.status,
+            triggerDetail: heartbeatRuns.triggerDetail,
+            leaseExpiresAt: heartbeatRuns.leaseExpiresAt,
+          })
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.id, input.actorRunId))
           .then((rows) => rows[0] ?? null),
       ]);
-      const stale = !existingRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(existingRun.status);
-      const actorLive = actorRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status);
+      const stale = !existingRun || heartbeatRunIsTerminalOrLeaseExpired(existingRun);
+      const actorLive = actorRun && !heartbeatRunIsTerminalOrLeaseExpired(actorRun);
       if (!stale || !actorLive) {
         return { adopted: null, latest: lockedIssue };
       }
@@ -5161,11 +5190,15 @@ export function issueService(db: Db) {
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.actorRunId} for update`,
       );
       const actorRun = await tx
-        .select({ status: heartbeatRuns.status })
+        .select({
+          status: heartbeatRuns.status,
+          triggerDetail: heartbeatRuns.triggerDetail,
+          leaseExpiresAt: heartbeatRuns.leaseExpiresAt,
+        })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, input.actorRunId))
         .then((rows) => rows[0] ?? null);
-      if (!actorRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status)) return null;
+      if (!actorRun || heartbeatRunIsTerminalOrLeaseExpired(actorRun)) return null;
 
       const now = new Date();
       const adopted = await tx
@@ -5214,11 +5247,15 @@ export function issueService(db: Db) {
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.executionRunId} for update`,
       );
       const run = await tx
-        .select({ status: heartbeatRuns.status })
+        .select({
+          status: heartbeatRuns.status,
+          triggerDetail: heartbeatRuns.triggerDetail,
+          leaseExpiresAt: heartbeatRuns.leaseExpiresAt,
+        })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, issue.executionRunId))
         .then((rows) => rows[0] ?? null);
-      if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
+      if (run && !heartbeatRunIsTerminalOrLeaseExpired(run)) return false;
 
       const updated = await tx
         .update(issues)
@@ -5262,22 +5299,30 @@ export function issueService(db: Db) {
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.checkoutRunId} for update`,
       );
       const run = await tx
-        .select({ status: heartbeatRuns.status })
+        .select({
+          status: heartbeatRuns.status,
+          triggerDetail: heartbeatRuns.triggerDetail,
+          leaseExpiresAt: heartbeatRuns.leaseExpiresAt,
+        })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, issue.checkoutRunId))
         .then((rows) => rows[0] ?? null);
-      if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
+      if (run && !heartbeatRunIsTerminalOrLeaseExpired(run)) return false;
 
       if (issue.executionRunId && issue.executionRunId !== issue.checkoutRunId) {
         await tx.execute(
           sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.executionRunId} for update`,
         );
         const executionRun = await tx
-          .select({ status: heartbeatRuns.status })
+          .select({
+            status: heartbeatRuns.status,
+            triggerDetail: heartbeatRuns.triggerDetail,
+            leaseExpiresAt: heartbeatRuns.leaseExpiresAt,
+          })
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.id, issue.executionRunId))
           .then((rows) => rows[0] ?? null);
-        if (executionRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(executionRun.status)) return false;
+        if (executionRun && !heartbeatRunIsTerminalOrLeaseExpired(executionRun)) return false;
       }
 
       const updated = await tx

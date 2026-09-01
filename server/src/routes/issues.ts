@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
-import { and, asc, desc, eq, inArray, isNull, notInArray } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, notInArray, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -2955,6 +2955,117 @@ export function issueRoutes(
       ? heartbeat.wakeup
       : opts.taskWatchdogEnqueueWakeup ?? undefined,
   }) ?? noopTaskWatchdogService();
+
+  async function assertPullRunIssueMutationAllowed(
+    req: Request,
+    res: Response,
+    runId: string,
+    options: { requireOwnedIssueSet?: boolean } = {},
+  ) {
+    if (req.actor.type !== "agent" || !req.actor.companyId || !req.actor.agentId) return false;
+    const run = await db
+      .select({
+        companyId: heartbeatRuns.companyId,
+        agentId: heartbeatRuns.agentId,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    if (!run || run.companyId !== req.actor.companyId || run.agentId !== req.actor.agentId) {
+      res.status(404).json({ error: "Pull run not found" });
+      return false;
+    }
+    const context = run.contextSnapshot && typeof run.contextSnapshot === "object" && !Array.isArray(run.contextSnapshot)
+      ? run.contextSnapshot as Record<string, unknown>
+      : null;
+    const issueId = typeof context?.issueId === "string"
+      ? context.issueId.trim()
+      : typeof context?.taskId === "string"
+        ? context.taskId.trim()
+        : "";
+    const issue = issueId ? await svc.getById(issueId) : null;
+    if (!issue || issue.companyId !== req.actor.companyId) {
+      res.status(404).json({ error: "Pull run not found" });
+      return false;
+    }
+    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return false;
+    if (!options.requireOwnedIssueSet) return [];
+
+    const ownedIssues = await db
+      .select({
+        id: issueRows.id,
+        companyId: issueRows.companyId,
+        projectId: issueRows.projectId,
+        parentId: issueRows.parentId,
+        status: issueRows.status,
+        assigneeAgentId: issueRows.assigneeAgentId,
+        assigneeUserId: issueRows.assigneeUserId,
+        identifier: issueRows.identifier,
+      })
+      .from(issueRows)
+      .where(and(
+        eq(issueRows.companyId, req.actor.companyId),
+        or(eq(issueRows.checkoutRunId, runId), eq(issueRows.executionRunId, runId)),
+      ))
+      .orderBy(issueRows.id);
+    for (const ownedIssue of ownedIssues) {
+      if (!(await assertAgentIssueMutationAllowed(req, res, ownedIssue))) return false;
+    }
+    return ownedIssues.map((ownedIssue) => ownedIssue.id);
+  }
+
+  function pullRunLifecycleAuthorization(req: Request, authorizedIssueIds: readonly string[]) {
+    return {
+      authorizedIssueIds,
+      revalidateLockedIssues: async (
+        tx: Db,
+        lockedIssues: readonly {
+          id: string;
+          companyId: string;
+          projectId: string | null;
+          parentId: string | null;
+          status: string;
+          assigneeAgentId: string | null;
+          assigneeUserId: string | null;
+          identifier: string | null;
+        }[],
+      ) => {
+        let denialStatus = 403;
+        let denialBody: unknown = null;
+        const denialResponse = {
+          status(status: number) {
+            denialStatus = status;
+            return this;
+          },
+          json(body: unknown) {
+            denialBody = body;
+            return this;
+          },
+        } as unknown as Response;
+        const txTaskWatchdogs = taskWatchdogFactory?.(tx, {
+          enqueueWakeup: opts.taskWatchdogEnqueueWakeup === undefined
+            ? heartbeat.wakeup
+            : opts.taskWatchdogEnqueueWakeup ?? undefined,
+        }) ?? noopTaskWatchdogService();
+        const txAccess = accessService(tx);
+        const txIssues = issueService(tx);
+        for (const lockedIssue of lockedIssues) {
+          const allowed = await assertAgentIssueMutationAllowed(req, denialResponse, lockedIssue, {
+            authorizationDb: tx,
+            authorizationAccess: txAccess,
+            authorizationIssueService: txIssues,
+            authorizationTaskWatchdogs: txTaskWatchdogs,
+          });
+          if (allowed) continue;
+          const message = denialBody && typeof denialBody === "object" && "error" in denialBody
+            ? String((denialBody as { error: unknown }).error)
+            : "Pull run issue authorization changed";
+          throw denialStatus === 409 ? conflict(message) : forbidden(message);
+        }
+      },
+    };
+  }
   const externalObjectsSvc = externalObjectService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
     enabled: async () => (await instanceSettings.getExperimental()).enableExternalObjects === true,
@@ -3898,8 +4009,9 @@ export function issueRoutes(
       status: string;
     },
     action: "issue:comment" | "issue:read" | "issue:mutate",
+    accessOverride: ReturnType<typeof accessService> = access,
   ) {
-    return access.decide({
+    return accessOverride.decide({
       actor: req.actor,
       action,
       resource: {
@@ -4094,8 +4206,9 @@ export function issueRoutes(
     actorAgentId: string,
     companyId: string,
     assigneeAgentId: string,
+    accessOverride: ReturnType<typeof accessService> = access,
   ) {
-    const decision = await access.decide({
+    const decision = await accessOverride.decide({
       actor: { type: "agent", agentId: actorAgentId, companyId },
       action: "tasks:manage_active_checkouts",
       resource: { type: "issue", companyId, assigneeAgentId },
@@ -4117,7 +4230,14 @@ export function issueRoutes(
       /** Used only to name the task in denial copy (plan §6). */
       identifier?: string | null;
     },
-    options: { allowVisibleIssueWrite?: boolean; requireCheckoutOwner?: boolean } = {},
+    options: {
+      allowVisibleIssueWrite?: boolean;
+      requireCheckoutOwner?: boolean;
+      authorizationDb?: Db;
+      authorizationAccess?: ReturnType<typeof accessService>;
+      authorizationIssueService?: ReturnType<typeof issueService>;
+      authorizationTaskWatchdogs?: Pick<ReturnType<typeof taskWatchdogService>, "revalidateMutationScope">;
+    } = {},
   ) {
     if (req.actor.type !== "agent") return true;
     const actorAgentId = req.actor.agentId;
@@ -4133,9 +4253,13 @@ export function issueRoutes(
     // watched subtree). The watchdog scope can only widen access to the watched
     // subtree; downstream status-transition, assignment, recovery, and budget
     // guards in the route handlers still apply.
-    const watchdogScope = await resolveTaskWatchdogMutationScope(db, req.actor);
+    const authorizationDb = options.authorizationDb ?? db;
+    const authorizationAccess = options.authorizationAccess ?? access;
+    const authorizationIssueService = options.authorizationIssueService ?? svc;
+    const authorizationTaskWatchdogs = options.authorizationTaskWatchdogs ?? taskWatchdogsSvc;
+    const watchdogScope = await resolveTaskWatchdogMutationScope(authorizationDb, req.actor);
     if (watchdogScope.kind !== "none") {
-      const scopeResult = await taskWatchdogScopeAllowsIssueMutation(db, watchdogScope, issue);
+      const scopeResult = await taskWatchdogScopeAllowsIssueMutation(authorizationDb, watchdogScope, issue);
       if (scopeResult.kind === "invalid") {
         res.status(403).json({
           error: scopeResult.detail,
@@ -4146,9 +4270,9 @@ export function issueRoutes(
         });
         return false;
       }
-      return assertFreshTaskWatchdogSourceMutation(res, watchdogScope, issue);
+      return assertFreshTaskWatchdogSourceMutation(res, watchdogScope, issue, authorizationTaskWatchdogs);
     }
-    const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
+    const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate", authorizationAccess);
     if (!boundaryDecision.allowed) {
       return denyIssueWrite(req, res, issue, issueWriteDenialCodeForDecision(boundaryDecision));
     }
@@ -4160,7 +4284,12 @@ export function issueRoutes(
       return true;
     }
     if (issue.assigneeAgentId !== actorAgentId) {
-      if (await hasActiveCheckoutManagementOverride(actorAgentId, issue.companyId, issue.assigneeAgentId)) {
+      if (await hasActiveCheckoutManagementOverride(
+        actorAgentId,
+        issue.companyId,
+        issue.assigneeAgentId,
+        authorizationAccess,
+      )) {
         return true;
       }
       if (issue.status === "in_progress") {
@@ -4194,10 +4323,14 @@ export function issueRoutes(
     }
     const runId = requireAgentRunId(req, res);
     if (!runId) return false;
-    const ownership = await svc.assertCheckoutOwner(issue.id, actorAgentId, runId);
+    const ownership = await authorizationIssueService.assertCheckoutOwner(
+      issue.id,
+      actorAgentId,
+      runId,
+    );
     if (ownership.adoptedFromRunId) {
       const actor = getActorInfo(req);
-      await logActivity(db, {
+      await logActivity(authorizationDb, {
         companyId: issue.companyId,
         actorType: actor.actorType,
         actorId: actor.actorId,
@@ -4221,11 +4354,12 @@ export function issueRoutes(
     res: Response,
     scope: Awaited<ReturnType<typeof resolveTaskWatchdogMutationScope>>,
     issue: { id: string },
+    taskWatchdogsOverride: Pick<ReturnType<typeof taskWatchdogService>, "revalidateMutationScope"> = taskWatchdogsSvc,
   ) {
     if (scope.kind !== "watchdog") return true;
     if (scope.watchdogIssueId && issue.id === scope.watchdogIssueId) return true;
 
-    const revalidated = await taskWatchdogsSvc.revalidateMutationScope(scope);
+    const revalidated = await taskWatchdogsOverride.revalidateMutationScope(scope);
     if (revalidated.allowed) return true;
     res.status(409).json({
       error: revalidated.reason,
@@ -10627,6 +10761,10 @@ export function issueRoutes(
       res.status(400).json({ error: "Invalid pull run id" });
       return;
     }
+    const authorizedIssueIds = await assertPullRunIssueMutationAllowed(req, res, parsedRunId.data, {
+      requireOwnedIssueSet: true,
+    });
+    if (!authorizedIssueIds) return;
     const run = await pullRuns.heartbeat(
       actor.companyId,
       actor.agentId,
@@ -10639,6 +10777,7 @@ export function issueRoutes(
         agentApiKeyId: actor.keyId,
         responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
       },
+      pullRunLifecycleAuthorization(req, authorizedIssueIds),
     );
     res.json({ runId: run.id, status: run.status, leaseExpiresAt: run.leaseExpiresAt });
   });
@@ -10654,13 +10793,17 @@ export function issueRoutes(
       res.status(400).json({ error: "Invalid pull run id" });
       return;
     }
+    const authorizedIssueIds = await assertPullRunIssueMutationAllowed(req, res, parsedRunId.data, {
+      requireOwnedIssueSet: true,
+    });
+    if (!authorizedIssueIds) return;
     const run = await pullRuns.complete(actor.companyId, actor.agentId, parsedRunId.data, {
       actorType: "agent",
       actorId: actor.agentId,
       agentId: actor.agentId,
       agentApiKeyId: actor.keyId,
       responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
-    });
+    }, pullRunLifecycleAuthorization(req, authorizedIssueIds));
     res.json({ runId: run.id, status: run.status, finishedAt: run.finishedAt });
   });
 
@@ -10675,13 +10818,17 @@ export function issueRoutes(
       res.status(400).json({ error: "Invalid pull run id" });
       return;
     }
+    const authorizedIssueIds = await assertPullRunIssueMutationAllowed(req, res, parsedRunId.data, {
+      requireOwnedIssueSet: true,
+    });
+    if (!authorizedIssueIds) return;
     const run = await pullRuns.cancel(actor.companyId, actor.agentId, parsedRunId.data, {
       actorType: "agent",
       actorId: actor.agentId,
       agentId: actor.agentId,
       agentApiKeyId: actor.keyId,
       responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
-    });
+    }, pullRunLifecycleAuthorization(req, authorizedIssueIds));
     res.json({ runId: run.id, status: run.status, finishedAt: run.finishedAt });
   });
 

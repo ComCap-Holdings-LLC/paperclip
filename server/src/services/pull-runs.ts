@@ -374,12 +374,24 @@ export function pullRunService(db: Db) {
         action: status === "succeeded" ? "pull_run.completed" : "pull_run.cancelled",
         entityType: "heartbeat_run",
         entityId: updated.id,
-        issueId: ownedIssues[0]?.id ?? null,
+        issueId: null,
         details: {
-          issueId: ownedIssues[0]?.id ?? null,
+          issueIds: ownedIssues.map((issue) => issue.id),
           requeued,
         },
       }, publications);
+      for (const issue of ownedIssues) {
+        await logActivity(tx, {
+          companyId,
+          ...activityActor(auditActor, agentId),
+          runId: updated.id,
+          action: status === "succeeded" ? "pull_run.issue_completed" : "pull_run.issue_cancelled",
+          entityType: "issue",
+          entityId: issue.id,
+          issueId: issue.id,
+          details: { issueId: issue.id, requeued },
+        }, publications);
+      }
       return updated;
     });
   }

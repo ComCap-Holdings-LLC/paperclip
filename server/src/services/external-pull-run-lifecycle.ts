@@ -104,12 +104,26 @@ export async function expireExternalPullRun(db: Db, runId: string, now = new Dat
       action: "pull_run.expired",
       entityType: "heartbeat_run",
       entityId: run.id,
-      issueId: ownedIssues[0]?.id ?? null,
+      issueId: null,
       details: {
-        issueId: ownedIssues[0]?.id ?? null,
+        issueIds: ownedIssues.map((issue) => issue.id),
         reason: "lease_expired",
       },
     }, publications);
+    for (const issue of ownedIssues) {
+      await logActivity(tx, {
+        companyId: run.companyId,
+        actorType: "system",
+        actorId: "pull-run-lease-sweeper",
+        agentId: run.agentId,
+        runId: run.id,
+        action: "pull_run.issue_expired",
+        entityType: "issue",
+        entityId: issue.id,
+        issueId: issue.id,
+        details: { issueId: issue.id, reason: "lease_expired" },
+      }, publications);
+    }
     return true;
   });
 

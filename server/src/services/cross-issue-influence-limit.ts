@@ -7,6 +7,7 @@ import { logger } from "../middleware/logger.js";
 
 export const CROSS_ISSUE_INFLUENCE_LIMIT = 20;
 export const CROSS_ISSUE_INFLUENCE_WINDOW_MS = 60_000;
+export const CROSS_ISSUE_INFLUENCE_LIFETIME_LIMIT = 200;
 export const CROSS_ISSUE_INFLUENCE_ENFORCE_AT = new Date("2026-08-11T00:00:00.000Z");
 
 const CROSS_ISSUE_INFLUENCE_ACTIVITY = "issue.cross_issue_influence_observed";
@@ -20,6 +21,8 @@ export type CrossIssueInfluenceDecision = {
   count: number;
   cap: number;
   enforceAt: string;
+  lifetimeCount: number;
+  lifetimeCap: number;
 };
 
 type DatabaseClockReader = (tx: Pick<Db, "execute">) => Promise<Date>;
@@ -79,16 +82,20 @@ function readRunSourceIssueId(contextSnapshot: unknown) {
 
 export function evaluateCrossIssueInfluenceLimit(input: {
   priorCount: number;
+  lifetimePriorCount?: number;
   observedAt: Date;
 }): CrossIssueInfluenceDecision {
   const mode = input.observedAt >= CROSS_ISSUE_INFLUENCE_ENFORCE_AT ? "enforce" : "log_only";
   const nextCount = input.priorCount + 1;
+  const lifetimeCount = (input.lifetimePriorCount ?? input.priorCount) + 1;
   return {
-    allowed: mode === "log_only" || nextCount <= CROSS_ISSUE_INFLUENCE_LIMIT,
+    allowed: mode === "log_only" || (nextCount <= CROSS_ISSUE_INFLUENCE_LIMIT && lifetimeCount <= CROSS_ISSUE_INFLUENCE_LIFETIME_LIMIT),
     mode,
     count: nextCount,
     cap: CROSS_ISSUE_INFLUENCE_LIMIT,
     enforceAt: CROSS_ISSUE_INFLUENCE_ENFORCE_AT.toISOString(),
+    lifetimeCount,
+    lifetimeCap: CROSS_ISSUE_INFLUENCE_LIFETIME_LIMIT,
   };
 }
 
@@ -165,7 +172,16 @@ export async function observeCrossIssueInfluence(
         gte(activityLog.createdAt, windowStart),
       ))
       .then((rows) => Number(rows[0]?.count ?? 0));
-    const decision = evaluateCrossIssueInfluenceLimit({ priorCount, observedAt });
+    const lifetimePriorCount = await tx
+      .select({ count: count() })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, input.companyId),
+        eq(activityLog.runId, input.runId),
+        eq(activityLog.action, CROSS_ISSUE_INFLUENCE_ACTIVITY),
+      ))
+      .then((rows) => Number(rows[0]?.count ?? 0));
+    const decision = evaluateCrossIssueInfluenceLimit({ priorCount, lifetimePriorCount, observedAt });
 
     await tx.insert(activityLog).values({
       companyId: input.companyId,
@@ -189,6 +205,8 @@ export async function observeCrossIssueInfluence(
         mode: decision.mode,
         enforceAt: decision.enforceAt,
         allowed: decision.allowed,
+        lifetimeCount: decision.lifetimeCount,
+        lifetimeCap: decision.lifetimeCap,
       },
       // Keep the persisted observation on the one database clock used for
       // the inclusive rolling window cutoff.
@@ -208,6 +226,8 @@ export async function observeCrossIssueInfluence(
       mode: decision.mode,
       enforceAt: decision.enforceAt,
       allowed: decision.allowed,
+      lifetimeCount: decision.lifetimeCount,
+      lifetimeCap: decision.lifetimeCap,
     };
     if (decision.allowed) {
       logger.info(logContext, "cross-issue influence observed");
@@ -237,6 +257,8 @@ export function crossIssueInfluenceLimitError(
       ...body.details,
       cap: decision.cap,
       count: decision.count,
+      lifetimeCap: decision.lifetimeCap,
+      lifetimeCount: decision.lifetimeCount,
       mode: decision.mode,
       enforceAt: decision.enforceAt,
     },

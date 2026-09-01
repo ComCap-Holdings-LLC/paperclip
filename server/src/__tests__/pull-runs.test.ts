@@ -258,7 +258,13 @@ describeEmbeddedPostgres("external pull-run leases", () => {
       "pull_run.started",
       "pull_run.heartbeat",
       "pull_run.completed",
+      "pull_run.issue_completed",
     ]);
+    expect(await db
+      .select({ entityId: activityLog.entityId, action: activityLog.action })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, f.issueId)))
+      .toContainEqual({ entityId: f.issueId, action: "pull_run.issue_completed" });
     await expect(svc.complete(f.companyId, f.agentId, started.run.id))
       .rejects.toMatchObject({ status: 409 });
   });
@@ -288,6 +294,11 @@ describeEmbeddedPostgres("external pull-run leases", () => {
       .from(activityLog)
       .where(eq(activityLog.runId, started.run.id)))
       .resolves.toContainEqual({ action: "pull_run.expired" });
+    await expect(db
+      .select({ entityId: activityLog.entityId, action: activityLog.action })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, f.issueId)))
+      .resolves.toContainEqual({ entityId: f.issueId, action: "pull_run.issue_expired" });
 
     await expect(svc.heartbeat(f.companyId, f.agentId, started.run.id, 120))
       .rejects.toMatchObject({ status: 409 });
@@ -308,6 +319,39 @@ describeEmbeddedPostgres("external pull-run leases", () => {
     const issue = await db.select().from(issues).where(eq(issues.id, f.issueId)).then((rows) => rows[0]!);
     expect(run.status).toBe("timed_out");
     expect(issue.checkoutRunId).toBeNull();
+  });
+
+  it("audits every issue affected by expiry", async () => {
+    const f = await fixture();
+    const svc = pullRunService(db);
+    const started = await svc.start({
+      companyId: f.companyId,
+      agentId: f.agentId,
+      issueId: f.issueId,
+      expectedStatuses: ["todo"],
+      leaseSeconds: 60,
+    });
+    const secondIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: secondIssueId,
+      companyId: f.companyId,
+      title: "Second expired issue",
+      status: "in_progress",
+      assigneeAgentId: f.agentId,
+      checkoutRunId: started.run.id,
+      executionRunId: started.run.id,
+    });
+    await db.update(heartbeatRuns)
+      .set({ leaseExpiresAt: new Date(Date.now() - 1_000) })
+      .where(eq(heartbeatRuns.id, started.run.id));
+
+    expect(await svc.sweepExpired()).toBe(1);
+    const issueActivities = await db
+      .select({ entityId: activityLog.entityId, action: activityLog.action })
+      .from(activityLog)
+      .where(eq(activityLog.runId, started.run.id));
+    expect(issueActivities.filter((row) => row.action === "pull_run.issue_expired").map((row) => row.entityId).sort())
+      .toEqual([f.issueId, secondIssueId].sort());
   });
 
   it("rolls back timeout and lock release when expiry audit persistence fails", async () => {
@@ -399,6 +443,43 @@ describeEmbeddedPostgres("external pull-run leases", () => {
     expect(cancelled.status).toBe("cancelled");
     const issue = await db.select().from(issues).where(eq(issues.id, f.issueId)).then((rows) => rows[0]!);
     expect(issue).toMatchObject({ status: "todo", assigneeAgentId: null, checkoutRunId: null, executionRunId: null });
+  });
+
+  it.each([
+    ["complete", "succeeded", "pull_run.issue_completed"],
+    ["cancel", "cancelled", "pull_run.issue_cancelled"],
+  ] as const)("audits every issue affected by %s", async (operation, expectedStatus, issueAction) => {
+    const f = await fixture();
+    const svc = pullRunService(db);
+    const started = await svc.start({
+      companyId: f.companyId,
+      agentId: f.agentId,
+      issueId: f.issueId,
+      expectedStatuses: ["todo"],
+      leaseSeconds: 120,
+    });
+    const secondIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: secondIssueId,
+      companyId: f.companyId,
+      title: "Second owned issue",
+      status: "in_progress",
+      assigneeAgentId: f.agentId,
+      checkoutRunId: started.run.id,
+      executionRunId: started.run.id,
+    });
+
+    const finished = operation === "complete"
+      ? await svc.complete(f.companyId, f.agentId, started.run.id)
+      : await svc.cancel(f.companyId, f.agentId, started.run.id);
+
+    expect(finished.status).toBe(expectedStatus);
+    const issueActivities = await db
+      .select({ entityId: activityLog.entityId, action: activityLog.action })
+      .from(activityLog)
+      .where(eq(activityLog.runId, started.run.id));
+    expect(issueActivities.filter((row) => row.action === issueAction).map((row) => row.entityId).sort())
+      .toEqual([f.issueId, secondIssueId].sort());
   });
 
   it.each([

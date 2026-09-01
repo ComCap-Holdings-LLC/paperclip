@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { PgDialect } from "drizzle-orm/pg-core";
 import {
   CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+  CROSS_ISSUE_INFLUENCE_LIFETIME_LIMIT,
   CROSS_ISSUE_INFLUENCE_LIMIT,
   crossIssueInfluenceLimitError,
   evaluateCrossIssueInfluenceLimit,
@@ -112,6 +113,20 @@ describe("cross-issue influence limit rollout", () => {
     expect(capError.error).toContain("60 seconds");
     expect(capError.details.boundary).toContain("20");
     expect(capError.details.whoCanAct).toContain("Fable");
+  });
+
+  it("fails closed at the independent lifetime ceiling even when the rolling window refills", () => {
+    const observedAt = CROSS_ISSUE_INFLUENCE_ENFORCE_AT;
+    expect(evaluateCrossIssueInfluenceLimit({
+      priorCount: 0,
+      lifetimePriorCount: CROSS_ISSUE_INFLUENCE_LIFETIME_LIMIT - 1,
+      observedAt,
+    })).toMatchObject({ allowed: true, lifetimeCount: CROSS_ISSUE_INFLUENCE_LIFETIME_LIMIT });
+    expect(evaluateCrossIssueInfluenceLimit({
+      priorCount: 0,
+      lifetimePriorCount: CROSS_ISSUE_INFLUENCE_LIFETIME_LIMIT,
+      observedAt,
+    })).toMatchObject({ allowed: false, lifetimeCount: CROSS_ISSUE_INFLUENCE_LIFETIME_LIMIT + 1 });
   });
 
   it("uses one durable counter for cross-issue comments and PATCH updates", async () => {

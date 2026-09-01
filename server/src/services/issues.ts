@@ -789,7 +789,7 @@ function heartbeatRunIsTerminal(run: {
 }) {
   return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)
     || (run.triggerDetail === EXTERNAL_PULL_RUN_TRIGGER
-      && externalPullRunIsExpired(run, new Date()));
+      && externalPullRunIsExpired({ leaseExpiresAt: run.leaseExpiresAt ?? null }, new Date()));
 }
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;

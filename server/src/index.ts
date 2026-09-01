@@ -965,10 +965,12 @@ export async function startServer(): Promise<StartedServer> {
       }));
   };
   const schedulePullRunExpirySweep = (now = new Date()) => {
-    if (heartbeatSchedulerStopped) return;
-    trackHeartbeatSchedulerWork(pullRuns.sweepExpired(now).catch((err: unknown) => {
+    if (heartbeatSchedulerStopped) return Promise.resolve();
+    const work = pullRuns.sweepExpired(now).catch((err: unknown) => {
       logger.error({ err }, "pull-run lease expiry sweep failed");
-    }));
+    });
+    trackHeartbeatSchedulerWork(work);
+    return work;
   };
 
   // External pull-run leases are a server lifecycle concern, not heartbeat
@@ -1235,7 +1237,7 @@ export async function startServer(): Promise<StartedServer> {
         trackHeartbeatSchedulerWork(decisionExecutor.sweepExpired().catch((err: unknown) => {
           logger.error({ err }, "decision expiry sweep failed");
         }));
-        schedulePullRunExpirySweep(new Date());
+        await schedulePullRunExpirySweep(new Date());
         trackHeartbeatSchedulerWork(runRetentionSweep().catch((err: unknown) => {
           logger.error({ err }, "decision retention sweep failed");
         }));

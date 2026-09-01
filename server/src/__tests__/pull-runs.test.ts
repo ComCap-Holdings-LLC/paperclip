@@ -164,6 +164,61 @@ describeEmbeddedPostgres("external pull-run leases", () => {
       .toHaveLength(1);
   });
 
+  it.each([
+    ["complete"],
+    ["cancel"],
+  ] as const)("denies scoped lifecycle %s when another run-locked issue is outside the key scope", async (operation) => {
+    const f = await fixture();
+    const svc = pullRunService(db);
+    const started = await svc.start({
+      companyId: f.companyId,
+      agentId: f.agentId,
+      issueId: f.issueId,
+      expectedStatuses: ["todo"],
+      leaseSeconds: 120,
+    });
+    const issueBId = randomUUID();
+    await db.insert(issues).values({
+      id: issueBId,
+      companyId: f.companyId,
+      title: "Second owned issue outside scoped key",
+      status: "in_progress",
+      assigneeAgentId: f.agentId,
+      checkoutRunId: started.run.id,
+      executionRunId: started.run.id,
+    });
+
+    const denied = await request(createApp({
+      type: "agent",
+      source: "agent_key",
+      agentId: f.agentId,
+      companyId: f.companyId,
+      keyId: randomUUID(),
+      runId: started.run.id,
+      keyScope: { kind: "skill_test", issueId: f.issueId },
+    })).post(`/api/pull-runs/${started.run.id}/${operation}`).send({});
+
+    expect(denied.status, JSON.stringify(denied.body)).toBe(403);
+    const [run, issueA, issueB] = await Promise.all([
+      db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, started.run.id)).then((rows) => rows[0]!),
+      db.select().from(issues).where(eq(issues.id, f.issueId)).then((rows) => rows[0]!),
+      db.select().from(issues).where(eq(issues.id, issueBId)).then((rows) => rows[0]!),
+    ]);
+    expect(run).toMatchObject({ status: "running", finishedAt: null });
+    expect(issueA).toMatchObject({
+      status: "in_progress",
+      assigneeAgentId: f.agentId,
+      checkoutRunId: started.run.id,
+      executionRunId: started.run.id,
+    });
+    expect(issueB).toMatchObject({
+      status: "in_progress",
+      assigneeAgentId: f.agentId,
+      checkoutRunId: started.run.id,
+      executionRunId: started.run.id,
+    });
+  });
+
   it("server-issues a live run, atomically claims the issue, and retries idempotently", async () => {
     const f = await fixture();
     const svc = pullRunService(db);

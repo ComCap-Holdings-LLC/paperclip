@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
-import { and, asc, desc, eq, inArray, isNull, notInArray } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, notInArray, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -2901,6 +2901,7 @@ export function issueRoutes(
     req: Request,
     res: Response,
     runId: string,
+    options: { requireOwnedIssueSet?: boolean } = {},
   ) {
     if (req.actor.type !== "agent" || !req.actor.companyId || !req.actor.agentId) return false;
     const run = await db
@@ -2928,7 +2929,30 @@ export function issueRoutes(
     // Lifecycle control is an issue mutation: apply the same scoped-key and
     // ownership boundary as the issue mutation routes before changing either
     // the run or its checkout.
-    return assertAgentIssueMutationAllowed(req, res, issue);
+    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return false;
+    if (!options.requireOwnedIssueSet) return [];
+
+    const ownedIssues = await db
+      .select({
+        id: issueRows.id,
+        companyId: issueRows.companyId,
+        projectId: issueRows.projectId,
+        parentId: issueRows.parentId,
+        status: issueRows.status,
+        assigneeAgentId: issueRows.assigneeAgentId,
+        assigneeUserId: issueRows.assigneeUserId,
+        identifier: issueRows.identifier,
+      })
+      .from(issueRows)
+      .where(and(
+        eq(issueRows.companyId, req.actor.companyId),
+        or(eq(issueRows.checkoutRunId, runId), eq(issueRows.executionRunId, runId)),
+      ))
+      .orderBy(issueRows.id);
+    for (const ownedIssue of ownedIssues) {
+      if (!(await assertAgentIssueMutationAllowed(req, res, ownedIssue))) return false;
+    }
+    return ownedIssues.map((ownedIssue) => ownedIssue.id);
   }
   const runRedactions = createRunSecretRedactionRegistry(db);
   const access = accessService(db);
@@ -10689,14 +10713,17 @@ export function issueRoutes(
       res.status(400).json({ error: "Invalid pull run id" });
       return;
     }
-    if (!(await assertPullRunIssueMutationAllowed(req, res, parsedRunId.data))) return;
+    const authorizedIssueIds = await assertPullRunIssueMutationAllowed(req, res, parsedRunId.data, {
+      requireOwnedIssueSet: true,
+    });
+    if (!authorizedIssueIds) return;
     const run = await pullRuns.complete(actor.companyId, actor.agentId, parsedRunId.data, {
       actorType: "agent",
       actorId: actor.agentId,
       agentId: actor.agentId,
       agentApiKeyId: actor.keyId,
       responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
-    });
+    }, { authorizedIssueIds });
     res.json({ runId: run.id, status: run.status, finishedAt: run.finishedAt });
   });
 
@@ -10711,14 +10738,17 @@ export function issueRoutes(
       res.status(400).json({ error: "Invalid pull run id" });
       return;
     }
-    if (!(await assertPullRunIssueMutationAllowed(req, res, parsedRunId.data))) return;
+    const authorizedIssueIds = await assertPullRunIssueMutationAllowed(req, res, parsedRunId.data, {
+      requireOwnedIssueSet: true,
+    });
+    if (!authorizedIssueIds) return;
     const run = await pullRuns.cancel(actor.companyId, actor.agentId, parsedRunId.data, {
       actorType: "agent",
       actorId: actor.agentId,
       agentId: actor.agentId,
       agentApiKeyId: actor.keyId,
       responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
-    });
+    }, { authorizedIssueIds });
     res.json({ runId: run.id, status: run.status, finishedAt: run.finishedAt });
   });
 

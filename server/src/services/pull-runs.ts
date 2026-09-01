@@ -30,6 +30,16 @@ export interface PullRunAuditActor {
   responsibleUserIdOverride?: string | null;
 }
 
+export interface PullRunLifecycleAuthorization {
+  /**
+   * The complete issue-lock set authorized by the route before entering the
+   * lifecycle transaction. The service revalidates it after locking the same
+   * rows so an issue cannot be attached to the run between authorization and
+   * cleanup.
+   */
+  authorizedIssueIds?: readonly string[];
+}
+
 const DEFAULT_PULL_RUN_AUDIT_ACTOR: PullRunAuditActor = {
   actorType: "system",
   actorId: "external-pull-run-service",
@@ -295,6 +305,7 @@ export function pullRunService(db: Db) {
     runId: string,
     status: "succeeded" | "cancelled",
     auditActor?: PullRunAuditActor,
+    authorization?: PullRunLifecycleAuthorization,
   ) {
     await requirePullAgent(companyId, agentId);
     const run = await loadOwnedRun(companyId, agentId, runId);
@@ -312,20 +323,6 @@ export function pullRunService(db: Db) {
       await tx.execute(
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${run.id} for update`,
       );
-      const updated = await tx
-        .update(heartbeatRuns)
-        .set({ status, finishedAt: now, leaseExpiresAt: null, updatedAt: now })
-        .where(and(
-          eq(heartbeatRuns.id, run.id),
-          eq(heartbeatRuns.companyId, companyId),
-          eq(heartbeatRuns.agentId, agentId),
-          gt(heartbeatRuns.leaseExpiresAt, now),
-          inArray(heartbeatRuns.status, LIVE_PULL_RUN_STATUSES),
-        ))
-        .returning()
-        .then((rows) => rows[0] ?? null);
-      if (!updated) throw conflict("Pull run is no longer live");
-
       const ownedIssues = await tx
         .select({
           id: issues.id,
@@ -340,6 +337,30 @@ export function pullRunService(db: Db) {
           or(eq(issues.checkoutRunId, run.id), eq(issues.executionRunId, run.id)),
         ))
         .orderBy(issues.id);
+      if (authorization?.authorizedIssueIds) {
+        const authorizedIssueIds = [...new Set(authorization.authorizedIssueIds)].sort();
+        const ownedIssueIds = ownedIssues.map((issue) => issue.id);
+        if (
+          authorizedIssueIds.length !== authorization.authorizedIssueIds.length
+          || authorizedIssueIds.length !== ownedIssueIds.length
+          || authorizedIssueIds.some((issueId, index) => issueId !== ownedIssueIds[index])
+        ) {
+          throw conflict("Pull run issue locks changed; retry");
+        }
+      }
+      const updated = await tx
+        .update(heartbeatRuns)
+        .set({ status, finishedAt: now, leaseExpiresAt: null, updatedAt: now })
+        .where(and(
+          eq(heartbeatRuns.id, run.id),
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.agentId, agentId),
+          gt(heartbeatRuns.leaseExpiresAt, now),
+          inArray(heartbeatRuns.status, LIVE_PULL_RUN_STATUSES),
+        ))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!updated) throw conflict("Pull run is no longer live");
       const requeued = status === "cancelled" && ownedIssues.some((issue) =>
         issue.status === "in_progress"
         && issue.assigneeAgentId === agentId
@@ -400,9 +421,19 @@ export function pullRunService(db: Db) {
     start,
     heartbeat,
     sweepExpired,
-    complete: (companyId: string, agentId: string, runId: string, auditActor?: PullRunAuditActor) =>
-      finish(companyId, agentId, runId, "succeeded", auditActor),
-    cancel: (companyId: string, agentId: string, runId: string, auditActor?: PullRunAuditActor) =>
-      finish(companyId, agentId, runId, "cancelled", auditActor),
+    complete: (
+      companyId: string,
+      agentId: string,
+      runId: string,
+      auditActor?: PullRunAuditActor,
+      authorization?: PullRunLifecycleAuthorization,
+    ) => finish(companyId, agentId, runId, "succeeded", auditActor, authorization),
+    cancel: (
+      companyId: string,
+      agentId: string,
+      runId: string,
+      auditActor?: PullRunAuditActor,
+      authorization?: PullRunLifecycleAuthorization,
+    ) => finish(companyId, agentId, runId, "cancelled", auditActor, authorization),
   };
 }

@@ -532,4 +532,39 @@ describeEmbeddedPostgres("external pull-run leases", () => {
       ? { status: "in_progress", assigneeAgentId: f.agentId, checkoutRunId: null, executionRunId: otherRunId }
       : { status: "todo", assigneeAgentId: null, checkoutRunId: null, executionRunId: null });
   });
+
+  it.each([
+    ["cancel", async (svc: ReturnType<typeof pullRunService>, companyId: string, agentId: string, runId: string) => svc.cancel(companyId, agentId, runId)],
+    ["expire", async (svc: ReturnType<typeof pullRunService>, _companyId: string, _agentId: string, runId: string) => {
+      await expect(svc.sweepExpired()).resolves.toBe(1);
+    }],
+  ] as const)("%s keeps an unrelated unlocked in-progress issue untouched", async (operation, act) => {
+    const f = await fixture();
+    const svc = pullRunService(db);
+    const started = await svc.start({
+      companyId: f.companyId,
+      agentId: f.agentId,
+      issueId: f.issueId,
+      expectedStatuses: ["todo"],
+      leaseSeconds: 120,
+    });
+    const unrelatedIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: unrelatedIssueId,
+      companyId: f.companyId,
+      title: "Unrelated unlocked issue",
+      status: "in_progress",
+      assigneeAgentId: f.agentId,
+    });
+    if (operation === "expire") {
+      await db.update(heartbeatRuns)
+        .set({ leaseExpiresAt: new Date(Date.now() - 1_000) })
+        .where(eq(heartbeatRuns.id, started.run.id));
+    }
+
+    await act(svc, f.companyId, f.agentId, started.run.id);
+
+    const unrelatedIssue = await db.select().from(issues).where(eq(issues.id, unrelatedIssueId)).then((rows) => rows[0]!);
+    expect(unrelatedIssue).toMatchObject({ status: "in_progress", assigneeAgentId: f.agentId, checkoutRunId: null, executionRunId: null });
+  });
 });

@@ -1527,6 +1527,13 @@
       "when": 1788253200000,
       "tag": "0219_pull_run_lease",
       "breakpoints": true
+    },
+    {
+      "idx": 220,
+      "version": "7",
+      "when": 1788313222923,
+      "tag": "0220_heartbeat_context_paperclip_issue_index",
+      "breakpoints": true
     }
   ]
 }

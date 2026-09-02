@@ -4366,11 +4366,7 @@ export function issueRoutes(
       details: {
         watchedIssueId: scope.watchedIssueId,
         watchdogId: scope.watchdogId,
-        runStopFingerprint: scope.stopFingerprint,
-        currentState: revalidated.classification?.state ?? null,
-        currentStopFingerprint: revalidated.classification && "stopFingerprint" in revalidated.classification
-          ? revalidated.classification.stopFingerprint
-          : null,
+        expectedAuthorityEpoch: scope.authorityEpoch,
       },
     });
     return false;

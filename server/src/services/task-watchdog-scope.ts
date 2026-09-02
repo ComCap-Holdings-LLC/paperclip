@@ -27,6 +27,7 @@ export type TaskWatchdogMutationScope =
       companyId: string;
       watchedIssueId: string;
       watchdogIssueId: string | null;
+      authorityEpoch: number | null;
       stopFingerprint: string | null;
     };
 
@@ -38,12 +39,18 @@ function readString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
+function readNonNegativeInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
 function readTaskWatchdogContext(contextSnapshot: unknown) {
   const context = isPlainRecord(contextSnapshot) ? contextSnapshot : null;
   const taskWatchdog = isPlainRecord(context?.taskWatchdog) ? context.taskWatchdog : null;
   if (!taskWatchdog && context?.taskWatchdog !== true) return null;
   return {
     watchedIssueId: readString(taskWatchdog?.watchedIssueId) ?? readString(context?.watchedIssueId),
+    authorityEpoch: readNonNegativeInteger(taskWatchdog?.authorityEpoch)
+      ?? readNonNegativeInteger(context?.authorityEpoch),
     stopFingerprint: readString(taskWatchdog?.stopFingerprint) ?? readString(context?.stopFingerprint),
   };
 }
@@ -117,6 +124,7 @@ export async function resolveTaskWatchdogMutationScope(
     companyId: watchdog.companyId,
     watchedIssueId: watchdog.issueId,
     watchdogIssueId: watchdog.watchdogIssueId ?? null,
+    authorityEpoch: taskWatchdog.authorityEpoch,
     stopFingerprint: taskWatchdog.stopFingerprint,
   };
 }

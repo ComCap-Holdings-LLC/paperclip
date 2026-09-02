@@ -31,6 +31,7 @@ function watchdog(overrides: Partial<IssueWatchdogSummary> = {}): IssueWatchdogS
     lastTriggeredAt: null,
     lastCompletedAt: null,
     triggerCount: 0,
+    authorityEpoch: 0,
     createdAt: new Date(Date.now() - 60 * 60_000),
     updatedAt: new Date(Date.now() - 60 * 60_000),
     ...overrides,

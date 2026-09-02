@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { index, integer, jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
+import { bigint, index, integer, jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
 import { agents } from "./agents.js";
 import { companies } from "./companies.js";
 import { heartbeatRuns } from "./heartbeat_runs.js";
@@ -15,6 +15,7 @@ export const issueWatchdogs = pgTable(
     instructions: text("instructions"),
     status: text("status").notNull().default("active"),
     watchdogIssueId: uuid("watchdog_issue_id").references(() => issues.id, { onDelete: "set null" }),
+    authorityEpoch: bigint("authority_epoch", { mode: "number" }).notNull().default(0),
     lastObservedFingerprint: text("last_observed_fingerprint"),
     lastReviewedFingerprint: text("last_reviewed_fingerprint"),
     lastObservedStopSnapshot: jsonb("last_observed_stop_snapshot"),

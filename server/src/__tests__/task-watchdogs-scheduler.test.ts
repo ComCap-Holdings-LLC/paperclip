@@ -549,7 +549,7 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     expect(wakes.length).toBe(2);
   });
 
-  it("keeps watchdog mutation scope valid across metadata-only source evidence", async () => {
+  it("invalidates watchdog mutation scope when source evidence changes", async () => {
     const companyId = await seedCompany();
     const sourceId = await seedIssue(companyId, { identifier: "WDOG-REVALIDATE", status: "blocked" });
     const agentId = await seedAgent(companyId);
@@ -559,6 +559,7 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     await service.reconcileTaskWatchdogs({ companyId });
     const [watchdog] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.issueId, sourceId));
     const originalFingerprint = watchdog!.lastObservedFingerprint!;
+    const originalAuthorityEpoch = watchdog!.authorityEpoch;
     expect(originalFingerprint).toMatch(/^task_watchdog_stop:/);
 
     const later = new Date(Date.now() + 60_000);
@@ -578,18 +579,33 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
       watchdogId: watchdog!.id,
       companyId,
       watchedIssueId: sourceId,
+      authorityEpoch: originalAuthorityEpoch,
       stopFingerprint: originalFingerprint,
     });
 
-    expect(revalidated.allowed).toBe(true);
-    expect(revalidated.classification?.state).toBe("stopped");
-    if (revalidated.classification?.state !== "stopped") throw new Error("Expected stopped classification");
-    expect(revalidated.classification.stopFingerprint).toBe(originalFingerprint);
-    expect(revalidated.classification.stoppedLeaves[0]).toMatchObject({
-      latestCommentAt: later.toISOString(),
-      latestDocumentAt: new Date(later.getTime() + 1_000).toISOString(),
-      latestWorkProductAt: new Date(later.getTime() + 2_000).toISOString(),
-    });
+    expect(revalidated.allowed).toBe(false);
+    expect(revalidated.reason).toContain("authority changed");
+    const [updated] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.id, watchdog!.id));
+    expect(updated!.authorityEpoch).toBe(originalAuthorityEpoch + 3);
+  });
+
+  it("bumps watchdog authority for both old and new ancestry when an issue moves", async () => {
+    const companyId = await seedCompany();
+    const oldRootId = await seedIssue(companyId, { identifier: "WDOG-OLD-ROOT" });
+    const newRootId = await seedIssue(companyId, { identifier: "WDOG-NEW-ROOT" });
+    const childId = await seedIssue(companyId, { identifier: "WDOG-MOVED", parentId: oldRootId });
+    const agentId = await seedAgent(companyId);
+    const oldWatchdog = await seedWatchdog(companyId, oldRootId, agentId);
+    const newWatchdog = await seedWatchdog(companyId, newRootId, agentId);
+
+    await db.update(issues).set({ parentId: newRootId }).where(eq(issues.id, childId));
+
+    const [updatedOld, updatedNew] = await Promise.all([
+      db.select().from(issueWatchdogs).where(eq(issueWatchdogs.id, oldWatchdog!.id)).then((rows) => rows[0]!),
+      db.select().from(issueWatchdogs).where(eq(issueWatchdogs.id, newWatchdog!.id)).then((rows) => rows[0]!),
+    ]);
+    expect(updatedOld.authorityEpoch).toBe(1);
+    expect(updatedNew.authorityEpoch).toBe(1);
   });
 
   it("surfaces pending interaction kinds and approval ids in the wake and watchdog comment", async () => {
@@ -668,6 +684,7 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     await service.reconcileTaskWatchdogs({ companyId });
     const [watchdog] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.issueId, sourceId));
     const originalFingerprint = watchdog!.lastObservedFingerprint!;
+    const originalAuthorityEpoch = watchdog!.authorityEpoch;
     await db.insert(heartbeatRuns).values({
       companyId,
       agentId,
@@ -681,12 +698,14 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
       watchdogId: watchdog!.id,
       companyId,
       watchedIssueId: sourceId,
+      authorityEpoch: originalAuthorityEpoch,
       stopFingerprint: originalFingerprint,
     });
 
     expect(revalidated.allowed).toBe(false);
-    expect(revalidated.reason).toContain("now has a live");
-    expect(revalidated.classification?.state).toBe("live");
+    expect(revalidated.reason).toContain("authority changed");
+    const [updated] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.id, watchdog!.id));
+    expect(updated!.authorityEpoch).toBe(originalAuthorityEpoch + 1);
   });
 
   it("does not raise a stopped-subtree review while a freshly-created assigned issue's first run is starting", async () => {

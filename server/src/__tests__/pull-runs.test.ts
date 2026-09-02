@@ -3,7 +3,16 @@ import express from "express";
 import request from "supertest";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { activityLog, agents, companies, createDb, heartbeatRuns, issues } from "@paperclipai/db";
+import {
+  activityLog,
+  agents,
+  companies,
+  createDb,
+  heartbeatRuns,
+  issueComments,
+  issues,
+  issueWatchdogs,
+} from "@paperclipai/db";
 import { issueService } from "../services/issues.js";
 import { pullRunService } from "../services/pull-runs.js";
 import { errorHandler } from "../middleware/index.js";
@@ -94,6 +103,21 @@ describeEmbeddedPostgres("external pull-run leases", () => {
             AND wait_event_type = 'Lock'
             AND query ILIKE ${`%${tableName}%`}
             AND query ILIKE '%for update%'
+      `);
+      if (waiting?.waiting) return true;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return false;
+  }
+
+  async function waitForBlockedQuery(queryFragment: string) {
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      const [waiting] = await db.execute<{ waiting: boolean }>(sql`
+        SELECT count(*) >= 1 AS waiting
+          FROM pg_stat_activity
+          WHERE state = 'active'
+            AND wait_event_type = 'Lock'
+            AND query ILIKE ${`%${queryFragment}%`}
       `);
       if (waiting?.waiting) return true;
       await new Promise((resolve) => setTimeout(resolve, 25));
@@ -350,6 +374,116 @@ describeEmbeddedPostgres("external pull-run leases", () => {
       releaseLock.resolve();
       await Promise.allSettled([authorizationChange]);
       await lockDb.$client.end();
+    }
+  });
+
+  it.each([
+    ["heartbeat"],
+    ["complete"],
+    ["cancel"],
+  ] as const)("denies lifecycle %s when watchdog authority changes before the epoch lock", async (operation) => {
+    const f = await fixture();
+    const svc = pullRunService(db);
+    const started = await svc.start({
+      companyId: f.companyId,
+      agentId: f.agentId,
+      issueId: f.issueId,
+      expectedStatuses: ["todo"],
+      leaseSeconds: 120,
+    });
+    await db.update(heartbeatRuns).set({
+      contextSnapshot: {
+        issueId: f.issueId,
+        source: "task_watchdog",
+        taskWatchdog: {
+          watchedIssueId: f.issueId,
+          authorityEpoch: 0,
+          stopFingerprint: "task_watchdog_stop:test",
+        },
+      },
+    }).where(eq(heartbeatRuns.id, started.run.id));
+    const [watchdog] = await db.insert(issueWatchdogs).values({
+      companyId: f.companyId,
+      issueId: f.issueId,
+      watchdogAgentId: f.agentId,
+    }).returning();
+
+    const originalLeaseExpiresAt = started.run.leaseExpiresAt?.getTime();
+    const lockDb = createDb(tempDb!.connectionString);
+    const mutationDb = createDb(tempDb!.connectionString);
+    const lockReady = deferred<void>();
+    const releaseLock = deferred<void>();
+    const authorityLock = lockDb.transaction(async (tx) => {
+      await tx.execute(sql`
+        SELECT ${issueWatchdogs.id}
+          FROM ${issueWatchdogs}
+         WHERE ${issueWatchdogs.id} = ${watchdog!.id}
+         FOR UPDATE
+      `);
+      lockReady.resolve();
+      await releaseLock.promise;
+    });
+    await lockReady.promise;
+    const classifierMutation = (async () => mutationDb.insert(issueComments).values({
+      companyId: f.companyId,
+      issueId: f.issueId,
+      authorType: "agent",
+      authorAgentId: f.otherAgentId,
+      body: "Authority changed while lifecycle authorization was in flight.",
+    }))();
+
+    try {
+      expect(await waitForBlockedQuery("insert into \"issue_comments\"")).toBe(true);
+      const lifecycle = request(createApp({
+        type: "agent",
+        source: "agent_key",
+        agentId: f.agentId,
+        companyId: f.companyId,
+        runId: started.run.id,
+        keyScope: null,
+      }))
+        .post(`/api/pull-runs/${started.run.id}/${operation}`)
+        .send(operation === "heartbeat" ? { leaseSeconds: 300 } : {})
+        .then((response) => response);
+
+      expect(await waitForBlockedForUpdate("issue_watchdogs")).toBe(true);
+      releaseLock.resolve();
+      await classifierMutation;
+      const denied = await Promise.race([
+        lifecycle,
+        new Promise<never>((_, reject) => setTimeout(
+          () => reject(new Error("watchdog authority epoch revalidation timed out")),
+          5_000,
+        )),
+      ]);
+
+      expect(denied.status, JSON.stringify(denied.body)).toBe(409);
+      expect(denied.body).toMatchObject({
+        details: { watchdogId: watchdog!.id, expectedAuthorityEpoch: 0 },
+      });
+      const [run, issue, updatedWatchdog, lifecycleLogs] = await Promise.all([
+        db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, started.run.id)).then((rows) => rows[0]!),
+        db.select().from(issues).where(eq(issues.id, f.issueId)).then((rows) => rows[0]!),
+        db.select().from(issueWatchdogs).where(eq(issueWatchdogs.id, watchdog!.id)).then((rows) => rows[0]!),
+        db.select({ action: activityLog.action }).from(activityLog).where(and(
+          eq(activityLog.runId, started.run.id),
+          inArray(activityLog.action, ["pull_run.heartbeat", "pull_run.completed", "pull_run.cancelled"]),
+        )),
+      ]);
+      expect(run).toMatchObject({ status: "running", finishedAt: null });
+      expect(run.leaseExpiresAt?.getTime()).toBe(originalLeaseExpiresAt);
+      expect(issue).toMatchObject({
+        status: "in_progress",
+        assigneeAgentId: f.agentId,
+        checkoutRunId: started.run.id,
+        executionRunId: started.run.id,
+      });
+      expect(updatedWatchdog.authorityEpoch).toBe(1);
+      expect(lifecycleLogs).toHaveLength(0);
+    } finally {
+      releaseLock.resolve();
+      await Promise.allSettled([authorityLock, classifierMutation]);
+      await Promise.all([lockDb.$client.end(), mutationDb.$client.end()]);
     }
   });
 

@@ -34,14 +34,27 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Test commitperclip review scripts
+        run: node --test .github/scripts/tests/*.test.mjs
+
       - name: Generate commitperclip token
         id: token
         run: |
           TOKEN=$(node .github/scripts/get-bot-token.mjs)
           echo "::add-mask::$TOKEN"
           echo "value=$TOKEN" >> $GITHUB_OUTPUT
+          # Mode is a direct function of whether COMMITPERCLIP_KEY was supplied,
+          # not something the script needs to echo back over the same stdout
+          # channel as the (masked) token itself. See get-bot-token.mjs
+          # resolveBotToken() for what each mode can and cannot authorize.
+          if [ -n "${COMMITPERCLIP_KEY:-}" ]; then
+            echo "mode=app" >> $GITHUB_OUTPUT
+          else
+            echo "mode=fallback" >> $GITHUB_OUTPUT
+          fi
         env:
           COMMITPERCLIP_KEY: ${{ secrets.COMMITPERCLIP_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run quality gates
         id: quality
@@ -64,6 +77,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          COMMITPERCLIP_TOKEN_MODE: ${{ steps.token.outputs.mode }}
 
       - name: Fail if quality gates failed
         if: >-

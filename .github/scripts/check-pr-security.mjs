@@ -2,10 +2,17 @@
 /**
  * check-pr-security.mjs
  * Runs 6 security checks against a PR diff. Never posts public comments.
- * Creates a draft security advisory in the repo if any check fires.
+ * With an App-level token (COMMITPERCLIP_TOKEN_MODE=app) it creates a
+ * private draft security advisory with the details and posts a non-blocking
+ * ("neutral") check-run pointing at it. Without one (COMMITPERCLIP_TOKEN_MODE
+ * unset or 'fallback' — the workflow GITHUB_TOKEN, which cannot create
+ * advisories) it instead fails the check-run generically ("action_required",
+ * no details) so the flag is still visible to maintainers instead of
+ * silently passing. See get-bot-token.mjs / COM-13395.
  *
- * Env: GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR
- * Exit: always 0 — security flags are silent, never block the PR visibly.
+ * Env: GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR, COMMITPERCLIP_TOKEN_MODE
+ * Exit: always 0 — the script itself never fails the job; the check-run
+ * conclusion (not the process exit code) is what carries the signal.
  */
 import { fileURLToPath } from 'node:url';
 import { ghFetch } from './get-bot-token.mjs';
@@ -273,11 +280,23 @@ export async function findExistingDraftAdvisory(fetchImpl, token, repo, prNumber
   return null;
 }
 
-export async function postSecurityCheckRun(fetchImpl, token, repo, headSha, hasFlags) {
-  await fetchImpl(`/repos/${repo}/check-runs`, token, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(hasFlags ? {
+export async function postSecurityCheckRun(fetchImpl, token, repo, headSha, hasFlags, options = {}) {
+  const { restricted = false } = options;
+
+  let body;
+  if (!hasFlags) {
+    body = {
+      name: 'security-review',
+      head_sha: headSha,
+      status: 'completed',
+      conclusion: 'success',
+      output: {
+        title: 'Security Review Passed',
+        summary: 'No security concerns detected.',
+      },
+    };
+  } else if (!restricted) {
+    body = {
       name: 'security-review',
       head_sha: headSha,
       // `completed/neutral` instead of `in_progress` so the check doesn't put
@@ -291,16 +310,35 @@ export async function postSecurityCheckRun(fetchImpl, token, repo, headSha, hasF
         title: 'Security Review Recommended',
         summary: 'Draft advisory filed for maintainer review. Not a merge block — review the advisory at your leisure.',
       },
-    } : {
+    };
+  } else {
+    // No App-level token (COMMITPERCLIP_TOKEN_MODE=fallback, see
+    // get-bot-token.mjs): the workflow GITHUB_TOKEN cannot create a private
+    // draft security-advisory (that endpoint requires
+    // repository_advisories:write, which is App/PAT-only), so there is no
+    // durable private signal to point maintainers at. Fail the check instead
+    // of silently passing — a visible, detail-free flag beats no signal at
+    // all. Output stays generic on purpose: this is a public check output on
+    // a PR that may be from an untrusted fork.
+    body = {
       name: 'security-review',
       head_sha: headSha,
       status: 'completed',
-      conclusion: 'success',
+      conclusion: 'action_required',
       output: {
-        title: 'Security Review Passed',
-        summary: 'No security concerns detected.',
+        title: 'Security Review Restricted — Manual Check Required',
+        summary:
+          'This PR triggered one or more security checks, but no App-level token was ' +
+          'available to file a private draft advisory with the details (see COM-13395). ' +
+          'A maintainer must review the diff manually before merging.',
       },
-    }),
+    };
+  }
+
+  await fetchImpl(`/repos/${repo}/check-runs`, token, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
   });
 }
 
@@ -372,12 +410,23 @@ async function main() {
     ...scanSensitivePaths(files),
   ];
 
-  if (allFlags.length > 0) {
+  // 'app' = commitperclip App installation token, can create private draft
+  // advisories. 'fallback' (or unset, e.g. local/manual runs) = workflow
+  // GITHUB_TOKEN, which structurally cannot — see get-bot-token.mjs.
+  const appMode = process.env.COMMITPERCLIP_TOKEN_MODE === 'app';
+
+  if (allFlags.length > 0 && appMode) {
     console.error(`[security] ${allFlags.length} flag(s) detected — creating draft advisory and pending check run`);
     await Promise.all([
       syncDraftAdvisory(ghFetch, GH_TOKEN, GH_REPO, prNumber, pr.title, allFlags),
       postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, true),
     ]);
+  } else if (allFlags.length > 0) {
+    console.error(
+      `[security] ${allFlags.length} flag(s) detected but COMMITPERCLIP_TOKEN_MODE is not 'app' — ` +
+      'cannot file a private draft advisory; failing the check-run instead of passing silently.'
+    );
+    await postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, true, { restricted: true });
   } else {
     console.log('[security] all clear');
     await postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, false);

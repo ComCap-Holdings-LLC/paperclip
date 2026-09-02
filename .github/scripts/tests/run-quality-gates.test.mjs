@@ -30,6 +30,18 @@ test('findExistingComment: paginates until it finds the commitperclip comment', 
   ]);
 });
 
+test('findExistingComment: finds its own prior comment when posted as github-actions[bot] (COMMITPERCLIP_TOKEN_MODE=fallback)', async () => {
+  const comment = await findExistingComment(async () => ([
+    {
+      id: 5,
+      user: { login: 'github-actions[bot]' },
+      body: 'All checks passing.\n\n— commitperclip',
+    },
+  ]), 'token', 'paperclipai/paperclip', 6469);
+
+  assert.equal(comment.id, 5);
+});
+
 test('findExistingComment: returns null when no signed comment exists', async () => {
   const comment = await findExistingComment(async () => ([
     {

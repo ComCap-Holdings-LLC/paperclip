@@ -223,6 +223,35 @@ test('postSecurityCheckRun: uses the injected fetch implementation', async () =>
   });
 });
 
+test('postSecurityCheckRun: restricted mode fails the check generically, without flag details, when there is no App token', async () => {
+  const calls = [];
+
+  await postSecurityCheckRun(async (path, token, options) => {
+    calls.push({ path, options });
+    return { ok: true };
+  }, 'token', 'paperclipai/paperclip', 'deadbeef', true, { restricted: true });
+
+  assert.equal(calls.length, 1);
+  const body = JSON.parse(calls[0].options.body);
+  assert.equal(body.conclusion, 'action_required');
+  assert.equal(body.name, 'security-review');
+  // Public output must stay generic — no file names, patterns, or check
+  // names, since this posts on PRs from untrusted forks.
+  assert.doesNotMatch(JSON.stringify(body.output), /secret-scan|ci-tampering|sensitive-path/);
+});
+
+test('postSecurityCheckRun: restricted has no effect when there are no flags', async () => {
+  const calls = [];
+
+  await postSecurityCheckRun(async (path, token, options) => {
+    calls.push({ path, options });
+    return { ok: true };
+  }, 'token', 'paperclipai/paperclip', 'deadbeef', false, { restricted: true });
+
+  const body = JSON.parse(calls[0].options.body);
+  assert.equal(body.conclusion, 'success');
+});
+
 test('validateSensitivePaths: checks paths against the resolved base ref instead of master', async () => {
   const seenPaths = [];
   const stale = await validateSensitivePaths(

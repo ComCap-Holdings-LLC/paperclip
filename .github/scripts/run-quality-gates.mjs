@@ -54,10 +54,12 @@ export async function findExistingComment(fetchFromGitHub, token, repo, prNumber
       token
     );
 
-    const existing = comments.find(
-      c => (c.user.login === 'commitperclip[bot]' || c.user.login === 'commitperclip') &&
-           c.body.includes(COMMENT_SIGNATURE)
-    );
+    // Match on the signature alone, not the commenting identity. In
+    // COMMITPERCLIP_TOKEN_MODE=fallback (see get-bot-token.mjs) this posts
+    // as github-actions[bot], not commitperclip[bot]/commitperclip — an
+    // identity-gated match would never find its own prior comment and would
+    // post a fresh duplicate on every push instead of updating in place.
+    const existing = comments.find(c => c.body.includes(COMMENT_SIGNATURE));
     if (existing) return existing;
 
     if (comments.length < 100) return null;

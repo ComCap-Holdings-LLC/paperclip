@@ -4366,11 +4366,7 @@ export function issueRoutes(
       details: {
         watchedIssueId: scope.watchedIssueId,
         watchdogId: scope.watchdogId,
-        runStopFingerprint: scope.stopFingerprint,
-        currentState: revalidated.classification?.state ?? null,
-        currentStopFingerprint: revalidated.classification && "stopFingerprint" in revalidated.classification
-          ? revalidated.classification.stopFingerprint
-          : null,
+        expectedAuthorityEpoch: scope.authorityEpoch,
       },
     });
     return false;
@@ -6620,8 +6616,8 @@ export function issueRoutes(
     const issue = await getAccessibleResource(req, res, getIssueById(req, id), "Issue not found");
     if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
-    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (await rejectTaskWatchdogConfigMutation(req, res)) return;
+    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
 
     const actor = getActorInfo(req);
@@ -6661,8 +6657,8 @@ export function issueRoutes(
     const issue = await getAccessibleResource(req, res, getIssueById(req, id), "Issue not found");
     if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
-    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (await rejectTaskWatchdogConfigMutation(req, res)) return;
+    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
 
     const actor = getActorInfo(req);

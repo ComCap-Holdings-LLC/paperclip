@@ -67,6 +67,7 @@ describe("buildIssuePropertiesPanelKey", () => {
           lastTriggeredAt: null,
           lastCompletedAt: null,
           triggerCount: 0,
+          authorityEpoch: 0,
           createdAt: new Date("2026-04-12T12:01:00.000Z"),
           updatedAt: new Date("2026-04-12T12:01:00.000Z"),
         },

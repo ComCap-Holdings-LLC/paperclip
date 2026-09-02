@@ -1836,7 +1836,13 @@ describe("agent issue mutation checkout ownership", () => {
         id: watchdogRunId,
         companyId,
         agentId: peerAgentId,
-        contextSnapshot: { taskWatchdog: { watchedIssueId, stopFingerprint: "task_watchdog_stop:test" } },
+        contextSnapshot: {
+          taskWatchdog: {
+            watchedIssueId,
+            authorityEpoch: 7,
+            stopFingerprint: "task_watchdog_stop:test",
+          },
+        },
       }];
       const watchdogRows = options.watchdogRows ?? [{
         id: "dddddddd-dddd-4ddd-8ddd-ddddddddddde",
@@ -1845,6 +1851,7 @@ describe("agent issue mutation checkout ownership", () => {
         watchdogAgentId: peerAgentId,
         watchdogIssueId: options.watchdogIssueId ?? watchdogReportIssueId,
         status: "active",
+        authorityEpoch: 7,
       }];
       const ancestryRows = [{
         id: "ancestry",

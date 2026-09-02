@@ -743,6 +743,7 @@ export interface IssueWatchdogSummary {
   instructions: string | null;
   status: IssueWatchdogStatus;
   watchdogIssueId: string | null;
+  authorityEpoch: number;
   lastObservedFingerprint: string | null;
   lastReviewedFingerprint: string | null;
   lastTriggeredAt: Date | null;

@@ -241,6 +241,7 @@ export function summarizeIssueWatchdog(row: IssueWatchdogRow): IssueWatchdogSumm
     instructions: row.instructions,
     status: row.status as IssueWatchdogSummary["status"],
     watchdogIssueId: row.watchdogIssueId,
+    authorityEpoch: row.authorityEpoch,
     lastObservedFingerprint: row.lastObservedFingerprint,
     lastReviewedFingerprint: row.lastReviewedFingerprint,
     lastTriggeredAt: row.lastTriggeredAt,
@@ -691,6 +692,7 @@ function watchdogWakeContext(input: {
       watchedIssueId: input.sourceIssue.id,
       watchedIssueIdentifier: input.sourceIssue.identifier,
       watchedIssueTitle: input.sourceIssue.title,
+      authorityEpoch: input.watchdog.authorityEpoch,
       stopFingerprint: input.classification.stopFingerprint,
       pendingInteractions: input.classification.pendingInteractionsByIssueId,
       pendingApprovals: Object.fromEntries(Object.entries(input.classification.stopSnapshot.waitsByIssueId)
@@ -1616,12 +1618,13 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     watchdogId: string;
     companyId: string;
     watchedIssueId: string;
+    authorityEpoch: number | null;
     stopFingerprint: string | null;
   }) {
-    if (!scope.stopFingerprint) {
+    if (scope.authorityEpoch == null) {
       return {
         allowed: false as const,
-        reason: "Task-watchdog run context is missing the stopped fingerprint required for mutation revalidation.",
+        reason: "Task-watchdog run context is missing the authority epoch required for mutation revalidation.",
       };
     }
 
@@ -1634,6 +1637,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         eq(issueWatchdogs.issueId, scope.watchedIssueId),
         eq(issueWatchdogs.status, "active"),
       ))
+      .for("update")
       .then((rows) => rows[0] ?? null);
     if (!watchdog) {
       return {
@@ -1642,18 +1646,13 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       };
     }
 
-    const input = await collectClassifierInput(watchdog.companyId, watchdog);
-    const classification = classifyTaskWatchdogSubtree(input);
-    if (classification.state === "stopped" && classification.stopFingerprint === scope.stopFingerprint) {
-      return { allowed: true as const, classification };
+    if (watchdog.authorityEpoch === scope.authorityEpoch) {
+      return { allowed: true as const };
     }
 
     return {
       allowed: false as const,
-      reason: classification.state === "stopped"
-        ? "Task-watchdog review is stale because the watched subtree stop fingerprint changed; refresh the source state before mutating it."
-        : "Task-watchdog review is stale because the watched subtree now has a live, waiting, already-reviewed, or not-applicable path; refresh the source state before mutating it.",
-      classification,
+      reason: "Task-watchdog review is stale because watched-subtree authority changed; refresh the source state before mutating it.",
     };
   }
 

@@ -16,7 +16,11 @@ permissions:
 jobs:
   review:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Was 5; +1 for the new script-test step (its own 1-minute step timeout
+    # bounds the worst case, this just keeps the shared job budget from
+    # being squeezed for every other step — Dependency Review, token
+    # generation, quality/security gates — on a slow or cold runner).
+    timeout-minutes: 6
     steps:
       - name: Checkout base branch (never PR code)
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -44,6 +48,11 @@ jobs:
         # Actions' default fail-fast — that would trade a loud, scoped signal
         # for a silent, repo-wide one.
         continue-on-error: true
+        # Local run is well under 1s; this bounds the case where a test
+        # regresses into a real network call instead of its mocked fetch
+        # implementation and hangs, which continue-on-error alone would not
+        # catch (it only suppresses a nonzero exit, not runtime).
+        timeout-minutes: 1
 
       - name: Generate commitperclip token
         id: token

@@ -129,7 +129,11 @@ export async function resolveBotToken({
   if (!privateKey) {
     if (!fallbackToken) {
       throw new Error(
-        'ERROR: Neither COMMITPERCLIP_KEY nor GITHUB_TOKEN is set. At least one is required.'
+        'ERROR: Neither COMMITPERCLIP_KEY nor GITHUB_TOKEN is set. At least one is required.\n' +
+        'In Actions this workflow always provides GITHUB_TOKEN — seeing this there means the ' +
+        'env: block was edited or removed. Running locally: either export GITHUB_TOKEN (a plain ' +
+        'PAT is enough for the fallback path), or export COMMITPERCLIP_KEY="$(cat ' +
+        '~/.config/commitperclip/private-key.pem)" for the App path.'
       );
     }
     return { token: fallbackToken, mode: 'fallback' };

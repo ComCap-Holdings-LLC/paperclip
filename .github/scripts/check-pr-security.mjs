@@ -6,9 +6,11 @@
  * private draft security advisory with the details and posts a non-blocking
  * ("neutral") check-run pointing at it. Without one (COMMITPERCLIP_TOKEN_MODE
  * unset or 'fallback' — the workflow GITHUB_TOKEN, which cannot create
- * advisories) it instead fails the check-run generically ("action_required",
- * no details) so the flag is still visible to maintainers instead of
- * silently passing. See get-bot-token.mjs / COM-13395.
+ * advisories) it posts the SAME "neutral" (non-blocking) check-run
+ * conclusion, generic and detail-free, so a flag stays visible instead of
+ * silently passing as "success" — but do not read "neutral" as a hard
+ * merge gate in either mode: this check has never blocked a PR by itself,
+ * with or without an App token. See get-bot-token.mjs / COM-13395.
  *
  * Env: GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR, COMMITPERCLIP_TOKEN_MODE
  * Exit: always 0 — the script itself never fails the job; the check-run
@@ -436,17 +438,21 @@ async function main() {
     console.error(`[security] ${allFlags.length} flag(s) detected — creating draft advisory and pending check run`);
     await Promise.all([
       syncDraftAdvisory(ghFetch, GH_TOKEN, GH_REPO, prNumber, pr.title, allFlags),
-      postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, true),
+      postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, plan.hasFlags, { restricted: plan.restricted }),
     ]);
   } else if (plan.hasFlags) {
     console.error(
       `[security] ${allFlags.length} flag(s) detected but COMMITPERCLIP_TOKEN_MODE is not 'app' — ` +
       'cannot file a private draft advisory; flagging the check-run instead of passing silently.'
     );
-    await postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, true, { restricted: true });
+    // Read plan.restricted, not a hardcoded `true`: planSecurityResponse is
+    // the single source of truth this branching exists to protect (see its
+    // own docstring) — re-deriving the value here would let the two silently
+    // drift if planSecurityResponse ever grows a third outcome.
+    await postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, plan.hasFlags, { restricted: plan.restricted });
   } else {
     console.log('[security] all clear');
-    await postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, false);
+    await postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, plan.hasFlags);
   }
 
   // Always exit 0 — security flags are silent, never block the PR publicly

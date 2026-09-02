@@ -9090,6 +9090,9 @@ export function issueRoutes(
       interrupt: interruptRequested,
       hiddenAt: hiddenAtRaw,
       onBehalfOfUserId: _requestedOnBehalfOfUserId,
+      // COM-12697: CAS guard, not a persisted field -- pulled out here so it
+      // never lands in updateFields/patch, same treatment as the others above.
+      expectedStatuses: requestedExpectedStatuses,
       ...updateFields
     } = req.body;
     const reviewPolicyChangeRequested =
@@ -9522,6 +9525,9 @@ export function issueRoutes(
       ...updateFields,
       actorAgentId: actor.agentId ?? null,
       actorUserId: actor.actorType === "user" ? actor.actorId : null,
+      // string[], matching checkout's existing expectedStatuses convention
+      // (svc.checkout takes string[], not the narrower IssueStatus[]).
+      expectedStatuses: requestedExpectedStatuses,
     };
     const shouldCollectCompletionPublication =
       actor.actorType === "user" && existing.status !== "done" && updateFields.status === "done";

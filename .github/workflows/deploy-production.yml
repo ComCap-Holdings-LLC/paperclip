@@ -1,0 +1,52 @@
+name: Deploy production
+
+on:
+  workflow_run:
+    workflows:
+      - Docker
+    types:
+      - completed
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: comcap-paperclip-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      (github.event.workflow_run.event == 'push' ||
+      github.event.workflow_run.event == 'workflow_dispatch') &&
+      github.event.workflow_run.head_branch == 'master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Configure production SSH identity
+        env:
+          DEPLOY_KEY: ${{ secrets.PAPERCLIP_DEPLOY_KEY }}
+          DEPLOY_HOST_KEY: ${{ secrets.PAPERCLIP_DEPLOY_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$HOME/.ssh"
+          install -m 0600 /dev/null "$HOME/.ssh/paperclip_deploy"
+          printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/paperclip_deploy"
+          printf '%s\n' "$DEPLOY_HOST_KEY" > "$HOME/.ssh/known_hosts"
+
+      - name: Deploy immutable commit image
+        env:
+          DEPLOY_HOST: ${{ secrets.PAPERCLIP_DEPLOY_HOST }}
+          DEPLOY_SHA: ${{ github.event.workflow_run.head_sha }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]]
+          printf '%s\n' "$GHCR_TOKEN" | ssh \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -i "$HOME/.ssh/paperclip_deploy" \
+            "root@${DEPLOY_HOST}" \
+            "deploy ${DEPLOY_SHA}"

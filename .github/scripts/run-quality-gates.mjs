@@ -54,12 +54,20 @@ export async function findExistingComment(fetchFromGitHub, token, repo, prNumber
       token
     );
 
-    // Match on the signature alone, not the commenting identity. In
-    // COMMITPERCLIP_TOKEN_MODE=fallback (see get-bot-token.mjs) this posts
-    // as github-actions[bot], not commitperclip[bot]/commitperclip — an
-    // identity-gated match would never find its own prior comment and would
-    // post a fresh duplicate on every push instead of updating in place.
-    const existing = comments.find(c => c.body.includes(COMMENT_SIGNATURE));
+    // Identity gate stays mandatory — this is a public repo, the workflow
+    // runs on pull_request_target (untrusted fork PRs), and COMMENT_SIGNATURE
+    // is a public string any commenter can copy. Matching on signature alone
+    // lets anyone post an ordinary comment containing it and have their
+    // comment silently PATCHed by the bot's own token on the next push. Add
+    // github-actions[bot] rather than dropping the gate: in
+    // COMMITPERCLIP_TOKEN_MODE=fallback (see get-bot-token.mjs) this posts as
+    // github-actions[bot], not commitperclip[bot]/commitperclip, and an
+    // identity check scoped only to the App identities would never find its
+    // own prior comment and would post a fresh duplicate on every push.
+    const BOT_LOGINS = new Set(['commitperclip[bot]', 'commitperclip', 'github-actions[bot]']);
+    const existing = comments.find(
+      c => BOT_LOGINS.has(c.user.login) && c.body.includes(COMMENT_SIGNATURE)
+    );
     if (existing) return existing;
 
     if (comments.length < 100) return null;

@@ -1,15 +1,19 @@
 #!/usr/bin/env node
 /**
  * get-bot-token.mjs
- * Generates a short-lived GitHub installation token for the commitperclip app.
- * Reads COMMITPERCLIP_KEY env var (PEM content of private key).
- * Prints the token to stdout.
+ * Generates a short-lived GitHub installation token for the commitperclip app,
+ * or falls back to the workflow's own GITHUB_TOKEN when COMMITPERCLIP_KEY is
+ * unset — see resolveBotToken() below. Prints the token to stdout and, when
+ * $GITHUB_OUTPUT is set, appends `mode=app` or `mode=fallback` there too (the
+ * one place that decision is computed — callers read it back via
+ * steps.token.outputs.mode rather than re-deriving it).
  *
  * Also exports: generateJWT(privateKey), ghFetch(path, token, options)
  * These are used by all other gate scripts.
  */
 import { createSign } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { appendFileSync } from 'node:fs';
 
 const APP_ID = '3718661';
 const OWNER_PATTERN = /^[a-zA-Z0-9_.-]+$/;
@@ -162,7 +166,13 @@ async function main() {
     );
   }
 
-  const { token } = await resolveBotToken({ privateKey, fallbackToken, repo, owner });
+  const { token, mode } = await resolveBotToken({ privateKey, fallbackToken, repo, owner });
+
+  const githubOutput = process.env.GITHUB_OUTPUT;
+  if (githubOutput) {
+    appendFileSync(githubOutput, `mode=${mode}\n`);
+  }
+
   process.stdout.write(token);
 }
 

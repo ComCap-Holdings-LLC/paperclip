@@ -35,7 +35,15 @@ jobs:
           node-version: '20'
 
       - name: Test commitperclip review scripts
+        id: scripts_test
         run: node --test .github/scripts/tests/*.test.mjs
+        # Same continue-on-error contract as the gate steps below: a test
+        # failure must still surface (see "Fail if commitperclip scripts
+        # failed their own tests" at the end of this job), but it must not
+        # skip the quality/security gate steps for every other open PR via
+        # Actions' default fail-fast — that would trade a loud, scoped signal
+        # for a silent, repo-wide one.
+        continue-on-error: true
 
       - name: Generate commitperclip token
         id: token
@@ -43,15 +51,10 @@ jobs:
           TOKEN=$(node .github/scripts/get-bot-token.mjs)
           echo "::add-mask::$TOKEN"
           echo "value=$TOKEN" >> $GITHUB_OUTPUT
-          # Mode is a direct function of whether COMMITPERCLIP_KEY was supplied,
-          # not something the script needs to echo back over the same stdout
-          # channel as the (masked) token itself. See get-bot-token.mjs
-          # resolveBotToken() for what each mode can and cannot authorize.
-          if [ -n "${COMMITPERCLIP_KEY:-}" ]; then
-            echo "mode=app" >> $GITHUB_OUTPUT
-          else
-            echo "mode=fallback" >> $GITHUB_OUTPUT
-          fi
+        # get-bot-token.mjs's main() also appends `mode=app|fallback` to
+        # $GITHUB_OUTPUT itself (single-sourced from resolveBotToken()'s
+        # return value, not recomputed in this step) — GITHUB_OUTPUT is
+        # already ambient in every Actions step, nothing to wire up here.
         env:
           COMMITPERCLIP_KEY: ${{ secrets.COMMITPERCLIP_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -85,4 +88,11 @@ jobs:
           steps.quality.outcome == 'failure'
         run: |
           echo "One or more quality gates failed. See commitperclip comment on the PR for details."
+          exit 1
+
+      - name: Fail if commitperclip's own scripts failed their tests
+        if: steps.scripts_test.outcome == 'failure'
+        run: |
+          echo "The commitperclip review scripts failed their own test suite (.github/scripts/tests/*.test.mjs)."
+          echo "Quality/security gate results above ran anyway but may be unreliable — fix the regression before trusting them."
           exit 1

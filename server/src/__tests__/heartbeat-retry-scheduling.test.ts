@@ -2141,6 +2141,40 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     }
   });
 
+  it("preserves failure diagnostics on the scheduled retry run", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-07-24T11:00:00.000Z");
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "hermes_gateway_run_failed",
+      errorFamily: "transient_upstream",
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ stderrExcerpt: "gateway stderr tail" })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+    expect(scheduled.run).toMatchObject({
+      status: "scheduled_retry",
+      error: "upstream overload",
+      errorCode: "hermes_gateway_run_failed",
+      stderrExcerpt: "gateway stderr tail",
+    });
+  });
+
   it("schedules a recovery continuation for codex harness crashes", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

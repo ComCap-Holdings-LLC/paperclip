@@ -596,6 +596,7 @@ export interface IssueScheduledRetry {
   retryExhaustedReason?: string | null;
   error?: string | null;
   errorCode?: string | null;
+  stderrExcerpt?: string | null;
 }
 
 export type IssueRetryNowOutcome =

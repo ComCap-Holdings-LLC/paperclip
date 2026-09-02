@@ -11596,6 +11596,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           scheduledRetryAt: schedule.dueAt,
           scheduledRetryAttempt: schedule.attempt,
           scheduledRetryReason: retryReason,
+          // Keep the triggering failure inspectable while this row is the
+          // issue's active execution run. Issue reads project diagnostics from
+          // the scheduled row, not from retryOfRunId.
+          error: run.error,
+          errorCode: run.errorCode,
+          stderrExcerpt: run.stderrExcerpt,
           continuationAttempt: readContinuationAttempt(retryContextSnapshot.livenessContinuationAttempt),
           updatedAt: now,
         })

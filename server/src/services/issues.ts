@@ -608,6 +608,7 @@ type IssueScheduledRetryRow = {
   retryExhaustedReason?: string | null;
   error?: string | null;
   errorCode?: string | null;
+  stderrExcerpt?: string | null;
 };
 type IssueWithLabels = IssueRow & {
   labels: IssueLabelRow[];
@@ -4406,6 +4407,7 @@ export function issueService(db: Db) {
         scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
         error: heartbeatRuns.error,
         errorCode: heartbeatRuns.errorCode,
+        stderrExcerpt: heartbeatRuns.stderrExcerpt,
       })
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))

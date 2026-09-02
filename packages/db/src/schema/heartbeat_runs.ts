@@ -105,5 +105,13 @@ export const heartbeatRuns = pgTable(
       sql`(${table.contextSnapshot} ->> 'taskKey')`,
       table.createdAt.desc(),
     ),
+    // COM-12977: applied directly to paperclip-eu on 2026-08-29 (COM-12939) to fix
+    // full parallel seq scans on this lookup path; ported into a tracked migration
+    // (0220) after being found live-only.
+    companyCtxPaperclipIssueCreatedIdx: index("heartbeat_runs_company_ctx_paperclip_issue_id_idx").on(
+      table.companyId,
+      sql`((${table.contextSnapshot} -> 'paperclipIssue') ->> 'id')`,
+      table.createdAt.desc(),
+    ),
   }),
 );

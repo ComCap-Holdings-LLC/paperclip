@@ -25,6 +25,7 @@ d("heartbeat context_snapshot expression index migration", () => {
     const idx = await sql`SELECT indexname FROM pg_indexes WHERE tablename IN ('heartbeat_runs','agent_wakeup_requests')`;
     const names = idx.map((r) => r.indexname as string);
     expect(names).toContain("heartbeat_runs_company_ctx_issue_created_idx");
+    expect(names).toContain("heartbeat_runs_company_ctx_paperclip_issue_id_idx");
     expect(names).toContain("heartbeat_runs_company_ctx_task_created_idx");
     expect(names).toContain("heartbeat_runs_company_ctx_taskkey_created_idx");
     expect(names).toContain("agent_wakeup_requests_company_payload_issue_idx");
@@ -35,6 +36,47 @@ d("heartbeat context_snapshot expression index migration", () => {
     );
     const planText = plan.map((r) => Object.values(r)[0]).join("\n");
     expect(planText).toContain("heartbeat_runs_company_ctx_issue_created_idx");
+
+    // valuesForIssue() uses this exact OR predicate when redacting run secrets.
+    // Give the planner a bounded, production-shaped distribution; an empty
+    // table prefers one broad company index plus a filter instead of BitmapOr.
+    await sql.unsafe(`
+      INSERT INTO companies (id, name, issue_prefix)
+      VALUES ('00000000-0000-0000-0000-000000000001', 'Index plan test', 'IDX')
+    `);
+    await sql.unsafe(`
+      INSERT INTO agents (id, company_id, name)
+      VALUES (
+        '00000000-0000-0000-0000-000000000002',
+        '00000000-0000-0000-0000-000000000001',
+        'Index plan agent'
+      )
+    `);
+    await sql.unsafe(`
+      INSERT INTO heartbeat_runs (company_id, agent_id, context_snapshot)
+      SELECT
+        '00000000-0000-0000-0000-000000000001',
+        '00000000-0000-0000-0000-000000000002',
+        CASE WHEN n % 2 = 0
+          THEN jsonb_build_object('issueId', 'other-' || n)
+          ELSE jsonb_build_object('paperclipIssue', jsonb_build_object('id', 'other-' || n))
+        END
+      FROM generate_series(1, 2000) AS n
+    `);
+    await sql.unsafe(`
+      INSERT INTO heartbeat_runs (company_id, agent_id, context_snapshot)
+      VALUES
+        ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002', '{"issueId":"x"}'),
+        ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002', '{"paperclipIssue":{"id":"x"}}')
+    `);
+    await sql.unsafe("ANALYZE heartbeat_runs");
+    const issueLookupPlan = await sql.unsafe(
+      "EXPLAIN SELECT context_snapshot FROM heartbeat_runs WHERE company_id = '00000000-0000-0000-0000-000000000001' AND (context_snapshot ->> 'issueId' = 'x' OR context_snapshot -> 'paperclipIssue' ->> 'id' = 'x')",
+    );
+    const issueLookupText = issueLookupPlan.map((r) => Object.values(r)[0]).join("\n");
+    expect(issueLookupText).toContain("BitmapOr");
+    expect(issueLookupText).toContain("heartbeat_runs_company_ctx_issue_created_idx");
+    expect(issueLookupText).toContain("heartbeat_runs_company_ctx_paperclip_issue_id_idx");
 
     const taskPlan = await sql.unsafe(
       "EXPLAIN SELECT id FROM heartbeat_runs WHERE company_id = '00000000-0000-0000-0000-000000000001' AND context_snapshot ->> 'taskId' = 'x' ORDER BY created_at DESC, id DESC LIMIT 1",
@@ -63,6 +105,7 @@ d("heartbeat context_snapshot expression index migration", () => {
     for (const migration of [
       "./migrations/0209_heartbeat_context_snapshot_indexes.sql",
       "./migrations/0210_heartbeat_context_taskkey_index.sql",
+      "./migrations/0220_heartbeat_context_paperclip_issue_index.sql",
     ]) {
       const migrationSql = await readFile(
         fileURLToPath(new URL(migration, import.meta.url)),

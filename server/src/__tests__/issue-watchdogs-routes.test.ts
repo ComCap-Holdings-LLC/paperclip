@@ -195,6 +195,7 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
     watchdogAgentId: string;
     watchedIssueId: string;
     watchdogIssueId: string;
+    includeAuthorityEpoch?: boolean;
   }) {
     await db.insert(issueWatchdogs).values({
       companyId: input.companyId,
@@ -205,7 +206,10 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
     });
     await taskWatchdogService(db).reconcileTaskWatchdogs({ companyId: input.companyId });
     const [watchdog] = await db
-      .select({ lastObservedFingerprint: issueWatchdogs.lastObservedFingerprint })
+      .select({
+        authorityEpoch: issueWatchdogs.authorityEpoch,
+        lastObservedFingerprint: issueWatchdogs.lastObservedFingerprint,
+      })
       .from(issueWatchdogs)
       .where(and(eq(issueWatchdogs.companyId, input.companyId), eq(issueWatchdogs.issueId, input.watchedIssueId)));
     const runId = randomUUID();
@@ -220,6 +224,7 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
           watchedIssueId: input.watchedIssueId,
           watchedIssueIdentifier: "WDOG-ROOT",
           watchedIssueTitle: "Watched root",
+          ...(input.includeAuthorityEpoch === false ? {} : { authorityEpoch: watchdog?.authorityEpoch }),
           stopFingerprint: watchdog?.lastObservedFingerprint,
         },
       },
@@ -516,6 +521,42 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
       .send({ title: "Allowed watched child" });
     expect(allowedChild.status, JSON.stringify(allowedChild.body)).toBe(201);
     expect(allowedChild.body.parentId).toBe(watchedChildId);
+  });
+
+  it("rejects watchdog configuration mutations before authority-epoch revalidation", async () => {
+    const companyId = await seedCompany();
+    const watchdogAgentId = await seedAgent(companyId);
+    const watchedIssueId = await seedIssue(companyId);
+    const watchdogIssueId = await seedIssue(companyId, {
+      parentId: watchedIssueId,
+      assigneeAgentId: watchdogAgentId,
+      originKind: "task_watchdog",
+      originId: watchedIssueId,
+    });
+    const runId = await seedWatchdogRun({
+      companyId,
+      watchdogAgentId,
+      watchedIssueId,
+      watchdogIssueId,
+      includeAuthorityEpoch: false,
+    });
+    const app = createApp(companyId, {
+      type: "agent",
+      agentId: watchdogAgentId,
+      companyId,
+      runId,
+      source: "agent_jwt",
+    });
+
+    const upsert = await request(app)
+      .put(`/api/issues/${watchedIssueId}/watchdog`)
+      .send({ agentId: watchdogAgentId, instructions: "Forbidden update" });
+    expect(upsert.status, JSON.stringify(upsert.body)).toBe(403);
+    expect(upsert.body.error).toBe("Task-watchdog runs cannot change watchdog configuration.");
+
+    const removal = await request(app).delete(`/api/issues/${watchedIssueId}/watchdog`);
+    expect(removal.status, JSON.stringify(removal.body)).toBe(403);
+    expect(removal.body.error).toBe("Task-watchdog runs cannot change watchdog configuration.");
   });
 
   it("routes watchdog-discovered product bugs outside the watched source tree with evidence links", async () => {

@@ -2,10 +2,19 @@
 /**
  * check-pr-security.mjs
  * Runs 6 security checks against a PR diff. Never posts public comments.
- * Creates a draft security advisory in the repo if any check fires.
+ * With an App-level token (COMMITPERCLIP_TOKEN_MODE=app) it creates a
+ * private draft security advisory with the details and posts a non-blocking
+ * ("neutral") check-run pointing at it. Without one (COMMITPERCLIP_TOKEN_MODE
+ * unset or 'fallback' — the workflow GITHUB_TOKEN, which cannot create
+ * advisories) it posts the SAME "neutral" (non-blocking) check-run
+ * conclusion, generic and detail-free, so a flag stays visible instead of
+ * silently passing as "success" — but do not read "neutral" as a hard
+ * merge gate in either mode: this check has never blocked a PR by itself,
+ * with or without an App token. See get-bot-token.mjs / COM-13395.
  *
- * Env: GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR
- * Exit: always 0 — security flags are silent, never block the PR visibly.
+ * Env: GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR, COMMITPERCLIP_TOKEN_MODE
+ * Exit: always 0 — the script itself never fails the job; the check-run
+ * conclusion (not the process exit code) is what carries the signal.
  */
 import { fileURLToPath } from 'node:url';
 import { ghFetch } from './get-bot-token.mjs';
@@ -273,11 +282,36 @@ export async function findExistingDraftAdvisory(fetchImpl, token, repo, prNumber
   return null;
 }
 
-export async function postSecurityCheckRun(fetchImpl, token, repo, headSha, hasFlags) {
-  await fetchImpl(`/repos/${repo}/check-runs`, token, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(hasFlags ? {
+// Pure routing decision, split out and exported so a mistake here (e.g. an
+// inverted comparison) shows up as a direct unit-test failure instead of
+// only being reachable through main()'s untested env-var wiring. Unknown or
+// missing tokenMode deliberately routes the same as 'fallback' — never
+// treat an unrecognized value as App-capable.
+export function planSecurityResponse(flagCount, tokenMode) {
+  if (flagCount === 0) {
+    return { hasFlags: false, restricted: false, createAdvisory: false };
+  }
+  const appMode = tokenMode === 'app';
+  return { hasFlags: true, restricted: !appMode, createAdvisory: appMode };
+}
+
+export async function postSecurityCheckRun(fetchImpl, token, repo, headSha, hasFlags, options = {}) {
+  const { restricted = false } = options;
+
+  let body;
+  if (!hasFlags) {
+    body = {
+      name: 'security-review',
+      head_sha: headSha,
+      status: 'completed',
+      conclusion: 'success',
+      output: {
+        title: 'Security Review Passed',
+        summary: 'No security concerns detected.',
+      },
+    };
+  } else if (!restricted) {
+    body = {
       name: 'security-review',
       head_sha: headSha,
       // `completed/neutral` instead of `in_progress` so the check doesn't put
@@ -291,16 +325,42 @@ export async function postSecurityCheckRun(fetchImpl, token, repo, headSha, hasF
         title: 'Security Review Recommended',
         summary: 'Draft advisory filed for maintainer review. Not a merge block — review the advisory at your leisure.',
       },
-    } : {
+    };
+  } else {
+    // No App-level token (COMMITPERCLIP_TOKEN_MODE=fallback, see
+    // get-bot-token.mjs): the workflow GITHUB_TOKEN cannot create a private
+    // draft security-advisory (that endpoint requires
+    // repository_advisories:write, which is App/PAT-only), so there is no
+    // durable private signal to point maintainers at.
+    //
+    // Conclusion stays 'neutral' — the SAME severity as the app-mode flagged
+    // case above, not louder. scanCITampering alone flags every changed
+    // .github/workflows/* file unconditionally (including this workflow's
+    // own routine future edits), same as it always has; an 'action_required'
+    // conclusion here would turn every ordinary CI-config PR into what reads
+    // as a blocking alarm while COMMITPERCLIP_KEY remains unset repo-wide,
+    // which is exactly the kind of noise that trains maintainers to ignore
+    // the signal. The meaningful change from silently passing is 'success'
+    // -> 'neutral' with an honest summary; output stays generic since this
+    // is a public check output on a PR that may be from an untrusted fork.
+    body = {
       name: 'security-review',
       head_sha: headSha,
       status: 'completed',
-      conclusion: 'success',
+      conclusion: 'neutral',
       output: {
-        title: 'Security Review Passed',
-        summary: 'No security concerns detected.',
+        title: 'Security Review Recommended (restricted)',
+        summary:
+          'One or more security checks triggered, but no App-level token was available to file ' +
+          'a private draft advisory with the details (see COM-13395). Review the diff manually.',
       },
-    }),
+    };
+  }
+
+  await fetchImpl(`/repos/${repo}/check-runs`, token, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
   });
 }
 
@@ -372,15 +432,27 @@ async function main() {
     ...scanSensitivePaths(files),
   ];
 
-  if (allFlags.length > 0) {
+  const plan = planSecurityResponse(allFlags.length, process.env.COMMITPERCLIP_TOKEN_MODE);
+
+  if (plan.createAdvisory) {
     console.error(`[security] ${allFlags.length} flag(s) detected — creating draft advisory and pending check run`);
     await Promise.all([
       syncDraftAdvisory(ghFetch, GH_TOKEN, GH_REPO, prNumber, pr.title, allFlags),
-      postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, true),
+      postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, plan.hasFlags, { restricted: plan.restricted }),
     ]);
+  } else if (plan.hasFlags) {
+    console.error(
+      `[security] ${allFlags.length} flag(s) detected but COMMITPERCLIP_TOKEN_MODE is not 'app' — ` +
+      'cannot file a private draft advisory; flagging the check-run instead of passing silently.'
+    );
+    // Read plan.restricted, not a hardcoded `true`: planSecurityResponse is
+    // the single source of truth this branching exists to protect (see its
+    // own docstring) — re-deriving the value here would let the two silently
+    // drift if planSecurityResponse ever grows a third outcome.
+    await postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, plan.hasFlags, { restricted: plan.restricted });
   } else {
     console.log('[security] all clear');
-    await postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, false);
+    await postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, plan.hasFlags);
   }
 
   // Always exit 0 — security flags are silent, never block the PR publicly

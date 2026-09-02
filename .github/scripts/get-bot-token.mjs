@@ -1,15 +1,19 @@
 #!/usr/bin/env node
 /**
  * get-bot-token.mjs
- * Generates a short-lived GitHub installation token for the commitperclip app.
- * Reads COMMITPERCLIP_KEY env var (PEM content of private key).
- * Prints the token to stdout.
+ * Generates a short-lived GitHub installation token for the commitperclip app,
+ * or falls back to the workflow's own GITHUB_TOKEN when COMMITPERCLIP_KEY is
+ * unset — see resolveBotToken() below. Prints the token to stdout and, when
+ * $GITHUB_OUTPUT is set, appends `mode=app` or `mode=fallback` there too (the
+ * one place that decision is computed — callers read it back via
+ * steps.token.outputs.mode rather than re-deriving it).
  *
  * Also exports: generateJWT(privateKey), ghFetch(path, token, options)
  * These are used by all other gate scripts.
  */
 import { createSign } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { appendFileSync } from 'node:fs';
 
 const APP_ID = '3718661';
 const OWNER_PATTERN = /^[a-zA-Z0-9_.-]+$/;
@@ -99,29 +103,78 @@ export async function resolveInstallationId(fetchInstallation, token, repo, owne
   );
 }
 
-async function main() {
-  const privateKey = process.env.COMMITPERCLIP_KEY;
+// Resolves the token this workflow authenticates with, and which MODE it got:
+//   'app'      — commitperclip GitHub App installation token. Can authorize
+//                everything, including private draft security advisories.
+//   'fallback' — the workflow's own GITHUB_TOKEN. Scoped to whatever
+//                `permissions:` the workflow declares (PR comments, check-runs).
+//                It CANNOT create repository security advisories — that
+//                endpoint requires repository_advisories:write, which is only
+//                grantable to a GitHub App installation or a PAT with that
+//                scope, never to the ambient Actions token. Callers (see
+//                check-pr-security.mjs) must check `mode` before attempting
+//                anything App-only and degrade instead of failing/crashing.
+//
+// A ComCap-owned commitperclip App is the eventual fix for 'fallback' mode
+// (COM-13395); creating one is blocked on GitHub sudo-mode/passkey setup as
+// of 2026-09-01, and copying the upstream paperclipai App's private key is
+// not an authorized ComCap repair — the App is owned by upstream, not us.
+export async function resolveBotToken({
+  privateKey,
+  fallbackToken,
+  repo,
+  owner,
+  fetchInstallation = ghFetch,
+} = {}) {
   if (!privateKey) {
-    console.error('ERROR: COMMITPERCLIP_KEY env var not set.');
-    console.error('Add to ~/.bash_profile: export COMMITPERCLIP_KEY="$(cat ~/.config/commitperclip/private-key.pem)"');
-    process.exit(1);
+    if (!fallbackToken) {
+      throw new Error(
+        'ERROR: Neither COMMITPERCLIP_KEY nor GITHUB_TOKEN is set. At least one is required.\n' +
+        'In Actions this workflow always provides GITHUB_TOKEN — seeing this there means the ' +
+        'env: block was edited or removed. Running locally: either export GITHUB_TOKEN (a plain ' +
+        'PAT is enough for the fallback path), or export COMMITPERCLIP_KEY="$(cat ' +
+        '~/.config/commitperclip/private-key.pem)" for the App path.'
+      );
+    }
+    return { token: fallbackToken, mode: 'fallback' };
   }
 
   const jwt = generateJWT(privateKey);
-  const repo = process.env.GH_REPO ?? process.env.GITHUB_REPOSITORY;
-  const owner = process.env.GITHUB_REPOSITORY_OWNER ?? repo?.split('/')[0];
+  const installationId = await resolveInstallationId(fetchInstallation, jwt, repo, owner);
 
-  const installationId = await resolveInstallationId(ghFetch, jwt, repo, owner);
-
-  const { token } = await ghFetch(
+  const { token } = await fetchInstallation(
     `/app/installations/${installationId}/access_tokens`,
     jwt,
     { method: 'POST', headers: { 'Content-Type': 'application/json' } }
   );
 
   if (!token) {
-    console.error('ERROR: Failed to get installation token from GitHub API.');
-    process.exit(1);
+    throw new Error('ERROR: Failed to get installation token from GitHub API.');
+  }
+
+  return { token, mode: 'app' };
+}
+
+async function main() {
+  const privateKey = process.env.COMMITPERCLIP_KEY;
+  const fallbackToken = process.env.GITHUB_TOKEN;
+  const repo = process.env.GH_REPO ?? process.env.GITHUB_REPOSITORY;
+  const owner = process.env.GITHUB_REPOSITORY_OWNER ?? repo?.split('/')[0];
+
+  if (!privateKey) {
+    console.error(
+      'WARN: COMMITPERCLIP_KEY not set — falling back to the workflow GITHUB_TOKEN. ' +
+      'Quality-gate comments and check-runs still work; private draft security-advisory ' +
+      'creation does not (see check-pr-security.mjs) and the security-review check will ' +
+      'report "restricted" instead of silently passing when it finds something.'
+    );
+  }
+
+  const { token, mode } = await resolveBotToken({ privateKey, fallbackToken, repo, owner });
+
+  const githubOutput = process.env.GITHUB_OUTPUT;
+  if (githubOutput) {
+    appendFileSync(githubOutput, `mode=${mode}\n`);
   }
 
   process.stdout.write(token);

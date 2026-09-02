@@ -16,7 +16,11 @@ permissions:
 jobs:
   review:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Was 5; +1 for the new script-test step (its own 1-minute step timeout
+    # bounds the worst case, this just keeps the shared job budget from
+    # being squeezed for every other step — Dependency Review, token
+    # generation, quality/security gates — on a slow or cold runner).
+    timeout-minutes: 6
     steps:
       - name: Checkout base branch (never PR code)
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -34,14 +38,35 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Test commitperclip review scripts
+        id: scripts_test
+        run: node --test .github/scripts/tests/*.test.mjs
+        # Same continue-on-error contract as the gate steps below: a test
+        # failure must still surface (see "Fail if commitperclip scripts
+        # failed their own tests" at the end of this job), but it must not
+        # skip the quality/security gate steps for every other open PR via
+        # Actions' default fail-fast — that would trade a loud, scoped signal
+        # for a silent, repo-wide one.
+        continue-on-error: true
+        # Local run is well under 1s; this bounds the case where a test
+        # regresses into a real network call instead of its mocked fetch
+        # implementation and hangs, which continue-on-error alone would not
+        # catch (it only suppresses a nonzero exit, not runtime).
+        timeout-minutes: 1
+
       - name: Generate commitperclip token
         id: token
         run: |
           TOKEN=$(node .github/scripts/get-bot-token.mjs)
           echo "::add-mask::$TOKEN"
           echo "value=$TOKEN" >> $GITHUB_OUTPUT
+        # get-bot-token.mjs's main() also appends `mode=app|fallback` to
+        # $GITHUB_OUTPUT itself (single-sourced from resolveBotToken()'s
+        # return value, not recomputed in this step) — GITHUB_OUTPUT is
+        # already ambient in every Actions step, nothing to wire up here.
         env:
           COMMITPERCLIP_KEY: ${{ secrets.COMMITPERCLIP_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run quality gates
         id: quality
@@ -64,6 +89,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          COMMITPERCLIP_TOKEN_MODE: ${{ steps.token.outputs.mode }}
 
       - name: Fail if quality gates failed
         if: >-
@@ -71,4 +97,11 @@ jobs:
           steps.quality.outcome == 'failure'
         run: |
           echo "One or more quality gates failed. See commitperclip comment on the PR for details."
+          exit 1
+
+      - name: Fail if commitperclip's own scripts failed their tests
+        if: steps.scripts_test.outcome == 'failure'
+        run: |
+          echo "The commitperclip review scripts failed their own test suite (.github/scripts/tests/*.test.mjs)."
+          echo "Quality/security gate results above ran anyway but may be unreliable — fix the regression before trusting them."
           exit 1

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   buildAdvisoryPayload,
   findExistingDraftAdvisory,
+  planSecurityResponse,
   postSecurityCheckRun,
   scanSecrets,
   scanCITampering,
@@ -15,6 +16,30 @@ import {
   validateSensitivePaths,
 } from '../check-pr-security.mjs';
 import { ghFetch } from '../get-bot-token.mjs';
+
+// ── planSecurityResponse ─────────────────────────────────────────────────────
+
+test('planSecurityResponse: no flags never creates an advisory or restricts, regardless of token mode', () => {
+  assert.deepEqual(planSecurityResponse(0, 'app'), { hasFlags: false, restricted: false, createAdvisory: false });
+  assert.deepEqual(planSecurityResponse(0, 'fallback'), { hasFlags: false, restricted: false, createAdvisory: false });
+  assert.deepEqual(planSecurityResponse(0, undefined), { hasFlags: false, restricted: false, createAdvisory: false });
+});
+
+test('planSecurityResponse: flags with an App token create a private advisory, unrestricted', () => {
+  assert.deepEqual(planSecurityResponse(3, 'app'), { hasFlags: true, restricted: false, createAdvisory: true });
+});
+
+test('planSecurityResponse: flags with COMMITPERCLIP_TOKEN_MODE=fallback are restricted, no advisory', () => {
+  assert.deepEqual(planSecurityResponse(3, 'fallback'), { hasFlags: true, restricted: true, createAdvisory: false });
+});
+
+test('planSecurityResponse: flags with an unset/unrecognized token mode default to restricted, never App-capable', () => {
+  // The safe default matters more than the exact string: an unset env var,
+  // a typo'd value, or a future third mode must never be silently treated
+  // as 'app' and attempt an advisory creation the token can't authorize.
+  assert.deepEqual(planSecurityResponse(3, undefined), { hasFlags: true, restricted: true, createAdvisory: false });
+  assert.deepEqual(planSecurityResponse(3, 'garbage'), { hasFlags: true, restricted: true, createAdvisory: false });
+});
 
 // ── scanSecrets ──────────────────────────────────────────────────────────────
 
@@ -221,6 +246,41 @@ test('postSecurityCheckRun: uses the injected fetch implementation', async () =>
       summary: 'Draft advisory filed for maintainer review. Not a merge block — review the advisory at your leisure.',
     },
   });
+});
+
+test('postSecurityCheckRun: restricted mode flags at the same severity as the app-mode case, without flag details, when there is no App token', async () => {
+  const calls = [];
+
+  await postSecurityCheckRun(async (path, token, options) => {
+    calls.push({ path, options });
+    return { ok: true };
+  }, 'token', 'paperclipai/paperclip', 'deadbeef', true, { restricted: true });
+
+  assert.equal(calls.length, 1);
+  const body = JSON.parse(calls[0].options.body);
+  // Same conclusion as the non-restricted flagged case ('neutral') — this is
+  // an honesty change (there is no private advisory to point at), not a
+  // severity escalation. scanCITampering flags every changed workflow file
+  // unconditionally, including this workflow's own future routine edits;
+  // an escalated conclusion here would make every ordinary CI-config PR
+  // look like a blocking alarm for as long as COMMITPERCLIP_KEY is unset.
+  assert.equal(body.conclusion, 'neutral');
+  assert.equal(body.name, 'security-review');
+  // Public output must stay generic — no file names, patterns, or check
+  // names, since this posts on PRs from untrusted forks.
+  assert.doesNotMatch(JSON.stringify(body.output), /secret-scan|ci-tampering|sensitive-path/);
+});
+
+test('postSecurityCheckRun: restricted has no effect when there are no flags', async () => {
+  const calls = [];
+
+  await postSecurityCheckRun(async (path, token, options) => {
+    calls.push({ path, options });
+    return { ok: true };
+  }, 'token', 'paperclipai/paperclip', 'deadbeef', false, { restricted: true });
+
+  const body = JSON.parse(calls[0].options.body);
+  assert.equal(body.conclusion, 'success');
 });
 
 test('validateSensitivePaths: checks paths against the resolved base ref instead of master', async () => {

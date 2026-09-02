@@ -91,6 +91,7 @@ export type PullAgentLifecycleReportInput = z.infer<typeof pullAgentLifecycleRep
 
 export const createAgentSchema = z.object({
   name: z.string().min(1),
+  executionModel: z.enum(["dispatch", "pull"]).optional(),
   role: z.enum(AGENT_ROLES).optional().default("general"),
   title: z.string().optional().nullable(),
   icon: z.enum(AGENT_ICON_NAMES).optional().nullable(),

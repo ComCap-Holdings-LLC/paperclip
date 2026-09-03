@@ -2141,7 +2141,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     }
   });
 
-  it("preserves failure diagnostics on the scheduled retry run", async () => {
+  it("preserves failure diagnostics while scheduled and clears them on promotion", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const runId = randomUUID();
@@ -2172,6 +2172,17 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       error: "upstream overload",
       errorCode: "hermes_gateway_run_failed",
       stderrExcerpt: "gateway stderr tail",
+    });
+
+    const promotion = await heartbeat.promoteDueScheduledRetries(scheduled.dueAt);
+    expect(promotion).toEqual({ promoted: 1, runIds: [scheduled.run.id] });
+
+    const promoted = await heartbeat.getRun(scheduled.run.id);
+    expect(promoted).toMatchObject({
+      status: "queued",
+      error: null,
+      errorCode: null,
+      stderrExcerpt: null,
     });
   });
 

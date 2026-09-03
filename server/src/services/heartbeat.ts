@@ -11114,6 +11114,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .update(heartbeatRuns)
       .set({
         status: "queued",
+        // Diagnostics copied from the failed source run are useful while the
+        // retry is waiting, but become stale as soon as this row represents a
+        // new live attempt.
+        error: null,
+        errorCode: null,
+        stderrExcerpt: null,
         updatedAt: now,
       })
       .where(

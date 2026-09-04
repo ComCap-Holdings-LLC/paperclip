@@ -173,6 +173,9 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       scheduledRetryAt,
       scheduledRetryAttempt: 2,
       scheduledRetryReason: "transient_failure",
+      error: "transient upstream error",
+      errorCode: "hermes_gateway_run_failed",
+      stderrExcerpt: "gateway stderr tail",
       contextSnapshot: {
         issueId,
         wakeReason: "bounded_transient_heartbeat_retry",
@@ -219,6 +222,9 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       retryOfRunId: sourceRunId,
       scheduledRetryAttempt: 2,
       scheduledRetryReason: "transient_failure",
+      error: "transient upstream error",
+      errorCode: "hermes_gateway_run_failed",
+      stderrExcerpt: "gateway stderr tail",
     });
     expect(res.body.scheduledRetry.scheduledRetryAt).toBe(scheduledRetryAt.toISOString());
   });

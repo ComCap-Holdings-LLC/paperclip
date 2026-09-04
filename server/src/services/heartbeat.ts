@@ -11114,6 +11114,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .update(heartbeatRuns)
       .set({
         status: "queued",
+        // Diagnostics copied from the failed source run are useful while the
+        // retry is waiting, but become stale as soon as this row represents a
+        // new live attempt.
+        error: null,
+        errorCode: null,
+        stderrExcerpt: null,
         updatedAt: now,
       })
       .where(
@@ -11596,6 +11602,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           scheduledRetryAt: schedule.dueAt,
           scheduledRetryAttempt: schedule.attempt,
           scheduledRetryReason: retryReason,
+          // Keep the triggering failure inspectable while this row is the
+          // issue's active execution run. Issue reads project diagnostics from
+          // the scheduled row, not from retryOfRunId.
+          error: run.error,
+          errorCode: run.errorCode,
+          stderrExcerpt: run.stderrExcerpt,
           continuationAttempt: readContinuationAttempt(retryContextSnapshot.livenessContinuationAttempt),
           updatedAt: now,
         })

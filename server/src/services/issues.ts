@@ -8706,7 +8706,7 @@ export function issueService(db: Db) {
         run.externalExecutorExpectedVersion !== input.expectedExecutionVersion - 1 ||
         run.externalExecutorVisible !== true ||
         run.externalExecutorHoldId !== null ||
-        run.status !== "running"
+        !["running", "interrupted", "timed_out"].includes(run.status)
       ) {
         throw conflict("External executor terminal update does not own the active run", {
           issueId: input.issueId,
@@ -8823,7 +8823,11 @@ export function issueService(db: Db) {
           error: input.error ?? null,
           updatedAt: now,
         })
-        .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")))
+        // A lease teardown can fence the issue binding while marking the
+        // heartbeat run interrupted/timed_out. The same run-key/version CAS
+        // may still report its result; do not let it overwrite an intentional
+        // cancellation or another concurrent terminal outcome.
+        .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, run.status)))
         .returning({ id: heartbeatRuns.id })
         .then((rows) => rows[0] ?? null);
       if (!terminalized) throw conflict("External executor run was terminalized concurrently", { issueId: input.issueId });

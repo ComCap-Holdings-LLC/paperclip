@@ -1093,6 +1093,48 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     expect(run).toEqual({ status: "timed_out" });
   });
 
+  it("lets the fenced executor report after lease teardown terminalized its run", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    const runKey = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Late external executor result after lease teardown",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+    const app = createApp(agentActor(companyId, agentId, currentRunId));
+    const checkout = await request(app).post(`/api/issues/${issueId}/external-executor/checkout`).send({
+      runKey,
+      expectedExecutionVersion: 0,
+      expectedStatuses: ["todo"],
+    });
+    expect(checkout.status, JSON.stringify(checkout.body)).toBe(201);
+
+    const externalRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, checkout.body.run.id))
+      .then((rows) => rows[0]!);
+    await heartbeatService(db).terminalizeRunOnLeaseRelease(externalRun);
+
+    const terminal = await request(app).post(`/api/issues/${issueId}/external-executor/terminal`).send({
+      runKey,
+      expectedExecutionVersion: 1,
+      issueStatus: "done",
+      outcome: "succeeded",
+    });
+    expect(terminal.status, JSON.stringify(terminal.body)).toBe(200);
+    const run = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, checkout.body.run.id))
+      .then((rows) => rows[0]);
+    expect(run).toEqual({ status: "succeeded" });
+  });
+
   it("lets board recovery repair corrupt secondary locks for the exact external run", async () => {
     const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
     const issueId = randomUUID();
@@ -1253,6 +1295,41 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         currentStageType: "review",
       },
     });
+  });
+
+  it("records a successful unconfigured review handoff as succeeded", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    const runKey = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Successful review handoff",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+    const app = createApp(agentActor(companyId, agentId, currentRunId));
+    const checkout = await request(app).post(`/api/issues/${issueId}/external-executor/checkout`).send({
+      runKey,
+      expectedExecutionVersion: 0,
+      expectedStatuses: ["in_progress"],
+    });
+    expect(checkout.status, JSON.stringify(checkout.body)).toBe(201);
+
+    const terminal = await request(app).post(`/api/issues/${issueId}/external-executor/terminal`).send({
+      runKey,
+      expectedExecutionVersion: 1,
+      issueStatus: "in_review",
+      outcome: "succeeded",
+    });
+    expect(terminal.status, JSON.stringify(terminal.body)).toBe(200);
+    const run = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, checkout.body.run.id))
+      .then((rows) => rows[0]);
+    expect(run).toEqual({ status: "succeeded" });
   });
 
   it("does not let an external executor enter blocked without an unblock path", async () => {

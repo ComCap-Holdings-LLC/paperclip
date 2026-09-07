@@ -610,9 +610,6 @@ export const externalExecutorTerminalSchema = z.object({
   if (value.issueStatus === "cancelled" && value.outcome !== "cancelled") {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["outcome"], message: "cancelled requires a cancelled outcome" });
   }
-  if (["todo", "blocked", "in_review"].includes(value.issueStatus) && value.outcome !== "failed") {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["outcome"], message: "non-terminal issue statuses require a failed outcome" });
-  }
 });
 
 export type ExternalExecutorTerminal = z.infer<typeof externalExecutorTerminalSchema>;

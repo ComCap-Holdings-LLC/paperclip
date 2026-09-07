@@ -2499,7 +2499,7 @@ registry.registerPath({
   summary: "Terminally resolve the bound external executor run with CAS",
   description: "Requires the agent that owns the bound run. Stale, foreign, unregistered, and already-resolved runs return conflict.",
   request: { params: z.object({ id: z.string() }), body: jsonBody(externalExecutorTerminalSchema) },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict, 422: r.unprocessable },
 });
 
 registry.registerPath({

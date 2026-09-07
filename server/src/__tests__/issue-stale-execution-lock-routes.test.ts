@@ -1047,7 +1047,11 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     // External executors have no local process handle. The local orphan reaper
     // must leave the registered run running so its owner can still terminalize
     // it, while the binding remains fenced from ordinary checkout.
-    await heartbeatService(db).reapOrphanedRuns();
+    await db
+      .update(heartbeatRuns)
+      .set({ updatedAt: new Date("2000-01-01T00:00:00.000Z") })
+      .where(eq(heartbeatRuns.id, checkout.body.run.id));
+    await heartbeatService(db).reapOrphanedRuns({ staleThresholdMs: 1 });
     const afterReap = await db
       .select({
         externalExecutorRunId: issues.externalExecutorRunId,
@@ -1089,6 +1093,66 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     expect(run).toEqual({ status: "timed_out" });
   });
 
+  it("lets board recovery repair corrupt secondary locks for the exact external run", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    const runKey = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "External executor secondary-lock repair",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+    const app = createApp(agentActor(companyId, agentId, currentRunId));
+    const checkout = await request(app).post(`/api/issues/${issueId}/external-executor/checkout`).send({
+      runKey,
+      expectedExecutionVersion: 0,
+      expectedStatuses: ["todo"],
+    });
+    expect(checkout.status, JSON.stringify(checkout.body)).toBe(201);
+
+    // Simulate a partial persistence failure after the authoritative external
+    // binding committed. Generic lifecycle routes remain fenced by that
+    // binding, so only the board's run-key/version-bound recovery can repair it.
+    await db
+      .update(issues)
+      .set({ checkoutRunId: null, executionRunId: null })
+      .where(eq(issues.id, issueId));
+    const ordinaryCheckout = await request(app).post(`/api/issues/${issueId}/checkout`).send({
+      agentId,
+      expectedStatuses: ["todo", "in_progress"],
+    });
+    expect(ordinaryCheckout.status).toBe(409);
+
+    const recovered = await request(createApp(boardActor(companyId)))
+      .post(`/api/issues/${issueId}/external-executor/recover`)
+      .send({ runKey, expectedExecutionVersion: 1, reason: "repair corrupt secondary locks" });
+    expect(recovered.status, JSON.stringify(recovered.body)).toBe(200);
+    expect(recovered.body).toMatchObject({
+      issue: {
+        status: "todo",
+        externalExecutorRunId: null,
+        checkoutRunId: null,
+        executionRunId: null,
+        executionVersion: 2,
+      },
+      repairedSecondaryLocks: true,
+    });
+    const audit = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.external_executor_recovered"))
+      .then((rows) => rows[0]);
+    expect(audit?.details).toMatchObject({
+      externalExecutorRunId: checkout.body.run.id,
+      runKey,
+      expectedExecutionVersion: 1,
+      repairedSecondaryLocks: true,
+    });
+  });
+
   it("does not let an external executor bypass a pending review on terminal success", async () => {
     const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
     const issueId = randomUUID();
@@ -1128,6 +1192,67 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     });
     expect(terminal.status, JSON.stringify(terminal.body)).toBe(422);
     expect(terminal.body.error).toMatch(/review|approval/i);
+  });
+
+  it("starts the configured review policy instead of terminalizing directly", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const reviewerAgentId = randomUUID();
+    const issueId = randomUUID();
+    const stageId = randomUUID();
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId,
+      name: "ReviewAgent",
+      role: "reviewer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "External terminal execution policy",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: randomUUID(), type: "agent", agentId: reviewerAgentId }],
+        }],
+      },
+    });
+    const app = createApp(agentActor(companyId, agentId, currentRunId));
+    const runKey = randomUUID();
+    const checkout = await request(app).post(`/api/issues/${issueId}/external-executor/checkout`).send({
+      runKey,
+      expectedExecutionVersion: 0,
+      expectedStatuses: ["in_progress"],
+    });
+    expect(checkout.status, JSON.stringify(checkout.body)).toBe(201);
+
+    const terminal = await request(app).post(`/api/issues/${issueId}/external-executor/terminal`).send({
+      runKey,
+      expectedExecutionVersion: 1,
+      issueStatus: "done",
+      outcome: "succeeded",
+    });
+    expect(terminal.status, JSON.stringify(terminal.body)).toBe(200);
+    expect(terminal.body.issue).toMatchObject({
+      status: "in_review",
+      assigneeAgentId: reviewerAgentId,
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageType: "review",
+      },
+    });
   });
 
   it("does not let an external executor enter blocked without an unblock path", async () => {

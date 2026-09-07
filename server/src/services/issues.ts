@@ -88,6 +88,7 @@ import {
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import {
+  applyIssueExecutionPolicyTransition,
   buildInitialIssueMonitorFields,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
@@ -8770,13 +8771,28 @@ export function issueService(db: Db) {
         }
       }
 
+      const executionPolicy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
+      const executionPolicyTransition = applyIssueExecutionPolicyTransition({
+        issue,
+        policy: executionPolicy,
+        previousPolicy: executionPolicy,
+        requestedStatus: input.issueStatus,
+        requestedAssigneePatch: {},
+        actor: { agentId: input.agentId },
+      });
+      const effectiveIssueStatus = typeof executionPolicyTransition.patch.status === "string"
+        ? executionPolicyTransition.patch.status
+        : input.issueStatus;
       const now = new Date();
-      const statusPatch = applyStatusSideEffects(input.issueStatus, {});
+      const statusPatch = applyStatusSideEffects(effectiveIssueStatus, {});
       const updated = await tx
         .update(issues)
         .set({
+          ...(executionPolicyTransition.patch as Partial<typeof issues.$inferInsert>),
           ...statusPatch,
-          status: input.issueStatus,
+          status: effectiveIssueStatus,
+          ...(effectiveIssueStatus !== "done" ? { completedAt: null } : {}),
+          ...(effectiveIssueStatus !== "cancelled" ? { cancelledAt: null } : {}),
           checkoutRunId: null,
           executionRunId: null,
           externalExecutorRunId: null,
@@ -8859,6 +8875,10 @@ export function issueService(db: Db) {
           runStatus: run?.status ?? null,
         });
       }
+      // The external binding is the authoritative fence. Secondary execution
+      // locks can be absent after a partial persistence failure, but recovery
+      // still requires this exact issue, run key, and execution version above.
+      const repairedSecondaryLocks = issue.checkoutRunId !== runId || issue.executionRunId !== runId;
       const now = new Date();
       const updated = await tx
         .update(issues)
@@ -8874,10 +8894,9 @@ export function issueService(db: Db) {
         })
         .where(and(
           eq(issues.id, input.issueId),
+          eq(issues.companyId, input.companyId),
           eq(issues.executionVersion, input.expectedExecutionVersion),
           eq(issues.externalExecutorRunId, runId),
-          eq(issues.executionRunId, runId),
-          eq(issues.checkoutRunId, runId),
         ))
         .returning()
         .then((rows) => rows[0] ?? null);
@@ -8892,7 +8911,12 @@ export function issueService(db: Db) {
         if (!recovered) throw conflict("External executor run changed during recovery", { issueId: input.issueId });
       }
       const [enriched] = await withIssueLabels(tx, [updated]);
-      return { issue: enriched, runId, executionVersion: updated.executionVersion };
+      return {
+        issue: enriched,
+        runId,
+        executionVersion: updated.executionVersion,
+        repairedSecondaryLocks,
+      };
     }),
 
     release: async (id: string, actorAgentId?: string, actorRunId?: string | null) =>

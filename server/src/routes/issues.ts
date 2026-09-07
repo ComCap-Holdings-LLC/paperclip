@@ -10799,7 +10799,7 @@ export function issueRoutes(
     if (!issue) return;
     const result = await svc.recoverExternalExecutorRun({ issueId: id, companyId: issue.companyId, runKey: req.body.runKey, expectedExecutionVersion: req.body.expectedExecutionVersion, reason: req.body.reason });
     const actor = getActorInfo(req);
-    await logActivity(db, { companyId: issue.companyId, actorType: actor.actorType, actorId: actor.actorId, agentId: actor.agentId, runId: result.runId, action: "issue.external_executor_recovered", entityType: "issue", entityId: issue.id, details: { externalExecutorRunId: result.runId, runKey: req.body.runKey, expectedExecutionVersion: req.body.expectedExecutionVersion, executionVersion: result.executionVersion } });
+    await logActivity(db, { companyId: issue.companyId, actorType: actor.actorType, actorId: actor.actorId, agentId: actor.agentId, runId: result.runId, action: "issue.external_executor_recovered", entityType: "issue", entityId: issue.id, details: { externalExecutorRunId: result.runId, runKey: req.body.runKey, expectedExecutionVersion: req.body.expectedExecutionVersion, executionVersion: result.executionVersion, repairedSecondaryLocks: result.repairedSecondaryLocks } });
     res.json(result);
   });
 

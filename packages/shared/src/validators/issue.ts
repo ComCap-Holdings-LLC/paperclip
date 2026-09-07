@@ -589,6 +589,42 @@ export const checkoutIssueSchema = z.object({
 
 export type CheckoutIssue = z.infer<typeof checkoutIssueSchema>;
 
+export const externalExecutorCheckoutSchema = z.object({
+  runKey: z.string().uuid(),
+  expectedExecutionVersion: z.number().int().min(0),
+  expectedStatuses: z.array(z.enum(ISSUE_STATUSES)).nonempty(),
+}).strict();
+
+export type ExternalExecutorCheckout = z.infer<typeof externalExecutorCheckoutSchema>;
+
+export const externalExecutorTerminalSchema = z.object({
+  runKey: z.string().uuid(),
+  expectedExecutionVersion: z.number().int().min(0),
+  issueStatus: z.enum(["todo", "blocked", "in_review", "done", "cancelled"]),
+  outcome: z.enum(["succeeded", "failed", "cancelled"]),
+  error: z.string().trim().min(1).max(4_000).optional().nullable(),
+}).strict().superRefine((value, ctx) => {
+  if (value.issueStatus === "done" && value.outcome !== "succeeded") {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["outcome"], message: "done requires a succeeded outcome" });
+  }
+  if (value.issueStatus === "cancelled" && value.outcome !== "cancelled") {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["outcome"], message: "cancelled requires a cancelled outcome" });
+  }
+  if (["todo", "blocked", "in_review"].includes(value.issueStatus) && value.outcome !== "failed") {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["outcome"], message: "non-terminal issue statuses require a failed outcome" });
+  }
+});
+
+export type ExternalExecutorTerminal = z.infer<typeof externalExecutorTerminalSchema>;
+
+export const externalExecutorRecoverySchema = z.object({
+  runKey: z.string().uuid(),
+  expectedExecutionVersion: z.number().int().min(0),
+  reason: z.string().trim().min(1).max(4_000),
+}).strict();
+
+export type ExternalExecutorRecovery = z.infer<typeof externalExecutorRecoverySchema>;
+
 const commentMetadataLabelSchema = z.string().trim().min(1).max(120);
 const commentMetadataTextSchema = z.string().trim().min(1).max(2000);
 

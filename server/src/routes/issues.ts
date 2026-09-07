@@ -40,6 +40,9 @@ import {
   createIssueLabelSchema,
   createAcceptedPlanDecompositionSchema,
   checkoutIssueSchema,
+  externalExecutorCheckoutSchema,
+  externalExecutorRecoverySchema,
+  externalExecutorTerminalSchema,
   createDocumentAnnotationCommentSchema,
   createDocumentAnnotationThreadSchema,
   createChildIssueSchema,
@@ -10678,6 +10681,127 @@ export function issueRoutes(
 
     await queueTaskWatchdogEvaluation(existing, actor.runId);
     res.json(issue);
+  });
+
+  async function requireExternalExecutorAgent(
+    req: Request,
+    res: Response,
+    issue: NonNullable<Awaited<ReturnType<typeof svc.getById>>>,
+  ) {
+    if (req.actor.type !== "agent" || req.actor.source !== "agent_key" || !req.actor.companyId || !req.actor.agentId) {
+      res.status(403).json({ error: "External executor endpoints require an agent API key" });
+      return null;
+    }
+    const decision = await decideIssueAccess(req, issue, "issue:mutate");
+    if (!decision.allowed) {
+      await denyIssueWrite(req, res, issue, issueWriteDenialCodeForDecision(decision));
+      return null;
+    }
+    if (issue.assigneeAgentId && issue.assigneeAgentId !== req.actor.agentId) {
+      res.status(403).json({ error: "Only the issue assignee may operate its external executor run" });
+      return null;
+    }
+    return req.actor.agentId;
+  }
+
+  router.post("/issues/:id/external-executor/checkout", validate(externalExecutorCheckoutSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    const agentId = await requireExternalExecutorAgent(req, res, issue);
+    if (!agentId) return;
+    if (issue.projectId) {
+      const project = await projectsSvc.getById(issue.projectId);
+      if (project?.pausedAt) {
+        res.status(409).json({ error: "Project is paused" });
+        return;
+      }
+    }
+    if (issue.assigneeAgentId !== agentId) {
+      await assertCanAssignTasks(req, issue.companyId, {
+        issueId: issue.id,
+        projectId: issue.projectId ?? null,
+        parentIssueId: issue.parentId ?? null,
+        assigneeAgentId: agentId,
+        assigneeUserId: null,
+      });
+    }
+    const result = await svc.externalExecutorCheckout({
+      issueId: id,
+      companyId: issue.companyId,
+      agentId,
+      runKey: req.body.runKey,
+      expectedExecutionVersion: req.body.expectedExecutionVersion,
+      expectedStatuses: req.body.expectedStatuses,
+    });
+    const actor = getActorInfo(req);
+    if (!result.idempotent) {
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: result.run.id,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.external_executor_checked_out",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          externalExecutorRunId: result.run.id,
+          runKey: req.body.runKey,
+          expectedExecutionVersion: req.body.expectedExecutionVersion,
+          boundExecutionVersion: result.run.executionVersion,
+          holdId: result.run.holdId,
+        },
+      });
+    }
+    res.status(result.idempotent ? 200 : 201).json(result);
+  });
+
+  router.post("/issues/:id/external-executor/terminal", validate(externalExecutorTerminalSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    const agentId = await requireExternalExecutorAgent(req, res, issue);
+    if (!agentId) return;
+    const result = await svc.terminalExternalExecutorRun({
+      issueId: id,
+      companyId: issue.companyId,
+      agentId,
+      runKey: req.body.runKey,
+      expectedExecutionVersion: req.body.expectedExecutionVersion,
+      issueStatus: req.body.issueStatus,
+      outcome: req.body.outcome,
+      error: req.body.error,
+    });
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: result.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action: "issue.external_executor_terminalized",
+      entityType: "issue",
+      entityId: issue.id,
+      details: { externalExecutorRunId: result.runId, runKey: req.body.runKey, expectedExecutionVersion: req.body.expectedExecutionVersion, executionVersion: result.executionVersion, issueStatus: req.body.issueStatus, outcome: req.body.outcome },
+    });
+    res.json(result);
+  });
+
+  router.post("/issues/:id/external-executor/recover", validate(externalExecutorRecoverySchema), async (req, res) => {
+    if (req.actor.type !== "board" || !req.actor.userId) {
+      res.status(403).json({ error: "Board user context required" });
+      return;
+    }
+    const id = req.params.id as string;
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    const result = await svc.recoverExternalExecutorRun({ issueId: id, companyId: issue.companyId, runKey: req.body.runKey, expectedExecutionVersion: req.body.expectedExecutionVersion, reason: req.body.reason });
+    const actor = getActorInfo(req);
+    await logActivity(db, { companyId: issue.companyId, actorType: actor.actorType, actorId: actor.actorId, agentId: actor.agentId, runId: result.runId, action: "issue.external_executor_recovered", entityType: "issue", entityId: issue.id, details: { externalExecutorRunId: result.runId, runKey: req.body.runKey, expectedExecutionVersion: req.body.expectedExecutionVersion, executionVersion: result.executionVersion } });
+    res.json(result);
   });
 
   router.post("/issues/:id/pull-runs", validate(startPullRunSchema), async (req, res) => {

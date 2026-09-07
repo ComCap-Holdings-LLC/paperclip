@@ -36,6 +36,9 @@ import {
   createIssueLabelSchema,
   addIssueCommentSchema,
   checkoutIssueSchema,
+  externalExecutorCheckoutSchema,
+  externalExecutorRecoverySchema,
+  externalExecutorTerminalSchema,
   linkIssueApprovalSchema,
   createIssueWorkProductSchema,
   updateIssueWorkProductSchema,
@@ -2477,6 +2480,36 @@ registry.registerPath({
     body: jsonBody(checkoutIssueSchema),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/external-executor/checkout",
+  tags: ["issues"],
+  summary: "Atomically bind an external executor run to an issue",
+  description: "Requires an agent API key. The run key and execution version form the idempotency and compare-and-swap contract.",
+  request: { params: z.object({ id: z.string() }), body: jsonBody(externalExecutorCheckoutSchema) },
+  responses: { 200: r.ok(), 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/external-executor/terminal",
+  tags: ["issues"],
+  summary: "Terminally resolve the bound external executor run with CAS",
+  description: "Requires the agent that owns the bound run. Stale, foreign, unregistered, and already-resolved runs return conflict.",
+  request: { params: z.object({ id: z.string() }), body: jsonBody(externalExecutorTerminalSchema) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/external-executor/recover",
+  tags: ["issues"],
+  summary: "Recover a crashed external executor run with CAS",
+  description: "Requires board-user context and the exact active run key and execution version.",
+  request: { params: z.object({ id: z.string() }), body: jsonBody(externalExecutorRecoverySchema) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
 });
 
 registry.registerPath({

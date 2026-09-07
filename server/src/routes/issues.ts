@@ -10650,6 +10650,12 @@ export function issueRoutes(
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
+    if (existing.externalExecutorRunId) {
+      res.status(409).json({
+        error: "An active external executor run must use its terminal or recovery compare-and-swap endpoint",
+      });
+      return;
+    }
     const attachments = await svc.listAttachments(id);
 
     const issue = await svc.remove(id);
@@ -10688,7 +10694,7 @@ export function issueRoutes(
     res: Response,
     issue: NonNullable<Awaited<ReturnType<typeof svc.getById>>>,
   ) {
-    if (req.actor.type !== "agent" || req.actor.source !== "agent_key" || !req.actor.companyId || !req.actor.agentId) {
+    if (req.actor.type !== "agent" || !req.actor.agentId) {
       res.status(403).json({ error: "External executor endpoints require an agent API key" });
       return null;
     }
@@ -10710,13 +10716,6 @@ export function issueRoutes(
     if (!issue) return;
     const agentId = await requireExternalExecutorAgent(req, res, issue);
     if (!agentId) return;
-    if (issue.projectId) {
-      const project = await projectsSvc.getById(issue.projectId);
-      if (project?.pausedAt) {
-        res.status(409).json({ error: "Project is paused" });
-        return;
-      }
-    }
     if (issue.assigneeAgentId !== agentId) {
       await assertCanAssignTasks(req, issue.companyId, {
         issueId: issue.id,

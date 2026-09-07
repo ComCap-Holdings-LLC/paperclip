@@ -13413,6 +13413,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const reaped: string[] = [];
 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
+      // External executors are registered server-side but have no local child
+      // process handle. They remain live until their run-key/version-bound
+      // terminal CAS or an explicit board recovery; the local process-loss
+      // reaper must never infer failure from the missing handle.
+      if (run.externalExecutorRunKey) continue;
       if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
 
       // Apply staleness threshold to avoid false positives
@@ -16690,6 +16695,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     run: typeof heartbeatRuns.$inferSelect,
     options: { suppressImmediateRecovery?: boolean } = {},
   ) {
+    // External executor locks have a separate, run-key/version-bound terminal
+    // protocol. Reapers, shutdown recovery, and agent-pause cleanup can mark a
+    // heartbeat run terminal, but must never clear or promote its issue lock.
+    // A board actor can explicitly recover that exact binding instead.
+    if (run.externalExecutorRunKey) {
+      logger.warn(
+        { runId: run.id, companyId: run.companyId, externalExecutorIssueId: run.externalExecutorIssueId },
+        "generic heartbeat finalization left external executor binding for explicit recovery",
+      );
+      return null;
+    }
     const runContext = parseObject(run.contextSnapshot);
     const contextIssueId = readNonEmptyString(runContext.issueId);
     const taskKey = deriveTaskKeyWithHeartbeatFallback(runContext, null);

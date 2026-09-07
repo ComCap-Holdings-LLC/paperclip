@@ -8,12 +8,14 @@ import {
   agents,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueTreeHoldMembers,
   issueTreeHolds,
   issueRelations,
   issues,
+  projects,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -22,6 +24,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { issueTreeControlService } from "../services/issue-tree-control.js";
+import { heartbeatService } from "../services/heartbeat.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -50,7 +53,9 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     await db.delete(issueTreeHoldMembers);
     await db.delete(issueTreeHolds);
     await db.delete(issues);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
+    await db.delete(projects);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -639,6 +644,122 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     expect(executorRuns).toHaveLength(1);
   });
 
+  it("keeps a duplicate external checkout idempotent after its project is paused", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const projectId = randomUUID();
+    const issueId = randomUUID();
+    const runKey = randomUUID();
+    await db.insert(projects).values({ id: projectId, companyId, name: "Executor project" });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      projectId,
+      title: "External executor retry after pause",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    const app = createApp(agentActor(companyId, agentId, currentRunId));
+    const checkout = await request(app).post(`/api/issues/${issueId}/external-executor/checkout`).send({
+      runKey,
+      expectedExecutionVersion: 0,
+      expectedStatuses: ["todo"],
+    });
+    expect(checkout.status, JSON.stringify(checkout.body)).toBe(201);
+
+    await db
+      .update(projects)
+      .set({ pausedAt: new Date(), pauseReason: "manual safety pause" })
+      .where(eq(projects.id, projectId));
+    const retry = await request(app).post(`/api/issues/${issueId}/external-executor/checkout`).send({
+      runKey,
+      expectedExecutionVersion: 0,
+      expectedStatuses: ["todo"],
+    });
+    expect(retry.status, JSON.stringify(retry.body)).toBe(200);
+    expect(retry.body).toMatchObject({ idempotent: true, run: { id: checkout.body.run.id } });
+  });
+
+  it("rejects a new external checkout while its project is paused", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const projectId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paused executor project",
+      pausedAt: new Date(),
+      pauseReason: "manual safety pause",
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      projectId,
+      title: "External executor cannot start",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    const response = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${issueId}/external-executor/checkout`)
+      .send({ runKey: randomUUID(), expectedExecutionVersion: 0, expectedStatuses: ["todo"] });
+    expect(response.status).toBe(409);
+    expect(response.body.error).toMatch(/project is paused/i);
+  });
+
+  it("rejects an external checkout while an unresolved blocker exists without creating a run", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const blockerIssueId = randomUUID();
+    const blockedIssueId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: blockerIssueId,
+        companyId,
+        title: "Unresolved prerequisite",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+      },
+      {
+        id: blockedIssueId,
+        companyId,
+        title: "Blocked external executor issue",
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: agentId,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+    });
+
+    const response = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${blockedIssueId}/external-executor/checkout`)
+      .send({ runKey: randomUUID(), expectedExecutionVersion: 0, expectedStatuses: ["todo"] });
+
+    expect(response.status).toBe(422);
+    expect(response.body).toMatchObject({
+      error: "Issue is blocked by unresolved blockers",
+      details: { unresolvedBlockerIssueIds: [blockerIssueId] },
+    });
+    const issue = await db
+      .select({ executionVersion: issues.executionVersion, externalExecutorRunId: issues.externalExecutorRunId })
+      .from(issues)
+      .where(eq(issues.id, blockedIssueId))
+      .then((rows) => rows[0]);
+    expect(issue).toEqual({ executionVersion: 0, externalExecutorRunId: null });
+    const runs = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.externalExecutorIssueId, blockedIssueId));
+    expect(runs).toHaveLength(0);
+  });
+
   it("rejects stale, foreign, and generic terminal mutations while accepting only the bound executor CAS", async () => {
     const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
     const foreignAgentId = randomUUID();
@@ -684,6 +805,8 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       .post(`/api/issues/${issueId}/admin/force-release`)
       .send({ clearAssignee: true });
     expect(forceRelease.status).toBe(409);
+    const deleteAttempt = await request(createApp(boardActor(companyId))).delete(`/api/issues/${issueId}`);
+    expect(deleteAttempt.status).toBe(409);
     const unregistered = await request(app).post(`/api/issues/${issueId}/external-executor/terminal`).send({
       runKey: randomUUID(),
       expectedExecutionVersion: 1,
@@ -899,5 +1022,141 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       .where(eq(heartbeatRuns.id, checkout.body.run.id))
       .then((rows) => rows[0]);
     expect(run).toEqual({ status: "timed_out" });
+  });
+
+  it("keeps a healthy external binding running until board recovery", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    const runKey = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "External executor process-loss fence",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+    const app = createApp(agentActor(companyId, agentId, currentRunId));
+    const checkout = await request(app).post(`/api/issues/${issueId}/external-executor/checkout`).send({
+      runKey,
+      expectedExecutionVersion: 0,
+      expectedStatuses: ["todo"],
+    });
+    expect(checkout.status, JSON.stringify(checkout.body)).toBe(201);
+
+    // External executors have no local process handle. The local orphan reaper
+    // must leave the registered run running so its owner can still terminalize
+    // it, while the binding remains fenced from ordinary checkout.
+    await heartbeatService(db).reapOrphanedRuns();
+    const afterReap = await db
+      .select({
+        externalExecutorRunId: issues.externalExecutorRunId,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionVersion: issues.executionVersion,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(afterReap).toEqual({
+      externalExecutorRunId: checkout.body.run.id,
+      checkoutRunId: checkout.body.run.id,
+      executionRunId: checkout.body.run.id,
+      executionVersion: 1,
+    });
+    const stillRunning = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, checkout.body.run.id))
+      .then((rows) => rows[0]);
+    expect(stillRunning).toEqual({ status: "running" });
+
+    const ordinaryCheckout = await request(app).post(`/api/issues/${issueId}/checkout`).send({
+      agentId,
+      expectedStatuses: ["todo", "in_progress"],
+    });
+    expect(ordinaryCheckout.status).toBe(409);
+
+    const recovered = await request(createApp(boardActor(companyId)))
+      .post(`/api/issues/${issueId}/external-executor/recover`)
+      .send({ runKey, expectedExecutionVersion: 1, reason: "orphaned executor process after server restart" });
+    expect(recovered.status, JSON.stringify(recovered.body)).toBe(200);
+    const run = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, checkout.body.run.id))
+      .then((rows) => rows[0]);
+    expect(run).toEqual({ status: "timed_out" });
+  });
+
+  it("does not let an external executor bypass a pending review on terminal success", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "External review governance",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      executionState: {
+        status: "pending",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: { type: "user", userId: "reviewer" },
+        returnAssignee: { type: "agent", agentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    });
+    const app = createApp(agentActor(companyId, agentId, currentRunId));
+    const runKey = randomUUID();
+    const checkout = await request(app).post(`/api/issues/${issueId}/external-executor/checkout`).send({
+      runKey,
+      expectedExecutionVersion: 0,
+      expectedStatuses: ["in_progress"],
+    });
+    expect(checkout.status, JSON.stringify(checkout.body)).toBe(201);
+
+    const terminal = await request(app).post(`/api/issues/${issueId}/external-executor/terminal`).send({
+      runKey,
+      expectedExecutionVersion: 1,
+      issueStatus: "done",
+      outcome: "succeeded",
+    });
+    expect(terminal.status, JSON.stringify(terminal.body)).toBe(422);
+    expect(terminal.body.error).toMatch(/review|approval/i);
+  });
+
+  it("does not let an external executor enter blocked without an unblock path", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "External blocked governance",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+    const app = createApp(agentActor(companyId, agentId, currentRunId));
+    const runKey = randomUUID();
+    const checkout = await request(app).post(`/api/issues/${issueId}/external-executor/checkout`).send({
+      runKey,
+      expectedExecutionVersion: 0,
+      expectedStatuses: ["todo"],
+    });
+    expect(checkout.status, JSON.stringify(checkout.body)).toBe(201);
+
+    const terminal = await request(app).post(`/api/issues/${issueId}/external-executor/terminal`).send({
+      runKey,
+      expectedExecutionVersion: 1,
+      issueStatus: "blocked",
+      outcome: "failed",
+    });
+    expect(terminal.status, JSON.stringify(terminal.body)).toBe(422);
+    expect(terminal.body.error).toMatch(/blocked|unblock/i);
   });
 });

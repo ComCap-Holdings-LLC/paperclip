@@ -54,4 +54,3 @@ must not become a bypass for the agent-only executor endpoints.
 | Migration and type safety | migration generator and TypeScript checks |
 | Independent review | COM-14406; pending fresh Sol/xhigh and Grok review |
 | Production positive/negative readback | pending deployment of reviewed revision |
-

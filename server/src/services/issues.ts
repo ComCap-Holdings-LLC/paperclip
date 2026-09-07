@@ -87,7 +87,11 @@ import {
   type ParsedExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
-import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
+import {
+  buildInitialIssueMonitorFields,
+  normalizeIssueExecutionPolicy,
+  parseIssueExecutionState,
+} from "./issue-execution-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
@@ -95,6 +99,7 @@ import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallbac
 import { getRunLogStore } from "./run-log-store.js";
 import { getDefaultCompanyGoal } from "./goals.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
+import { budgetService } from "./budgets.js";
 import { DEFAULT_INSERT_CHUNK_ROWS, insertRowsInChunks } from "./batch-insert.js";
 import type {
   ImportIssueRow,
@@ -5088,6 +5093,7 @@ export function issueService(db: Db) {
           assigneeAgentId: issues.assigneeAgentId,
           checkoutRunId: issues.checkoutRunId,
           executionRunId: issues.executionRunId,
+          externalExecutorRunId: issues.externalExecutorRunId,
         })
         .from(issues)
         .where(eq(issues.id, input.issueId))
@@ -5098,6 +5104,7 @@ export function issueService(db: Db) {
       }
 
       if (
+        lockedIssue.externalExecutorRunId ||
         lockedIssue.status !== "in_progress" ||
         lockedIssue.assigneeAgentId !== input.actorAgentId ||
         lockedIssue.checkoutRunId !== input.expectedCheckoutRunId
@@ -5149,6 +5156,7 @@ export function issueService(db: Db) {
             eq(issues.status, "in_progress"),
             eq(issues.assigneeAgentId, input.actorAgentId),
             eq(issues.checkoutRunId, input.expectedCheckoutRunId),
+            isNull(issues.externalExecutorRunId),
           ),
         )
         .returning({
@@ -5218,6 +5226,7 @@ export function issueService(db: Db) {
             eq(issues.assigneeAgentId, input.actorAgentId),
             isNull(issues.checkoutRunId),
             or(isNull(issues.executionRunId), eq(issues.executionRunId, input.actorRunId)),
+            isNull(issues.externalExecutorRunId),
           ),
         )
         .returning({
@@ -5247,11 +5256,14 @@ export function issueService(db: Db) {
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
       );
       const issue = await tx
-        .select({ executionRunId: issues.executionRunId })
+        .select({ executionRunId: issues.executionRunId, externalExecutorRunId: issues.externalExecutorRunId })
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
-      if (!issue?.executionRunId) return false;
+      // An external executor binding is cleared only by its terminal or board
+      // recovery CAS. Generic stale-run cleanup must not make that binding
+      // adoptable by an ordinary executor after a process restart.
+      if (!issue?.executionRunId || issue.externalExecutorRunId) return false;
 
       await tx.execute(
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.executionRunId} for update`,
@@ -5305,11 +5317,15 @@ export function issueService(db: Db) {
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
       );
       const issue = await tx
-        .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+        .select({
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+          externalExecutorRunId: issues.externalExecutorRunId,
+        })
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
-      if (!issue?.checkoutRunId) return false;
+      if (!issue?.checkoutRunId || issue.externalExecutorRunId) return false;
 
       await tx.execute(
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.checkoutRunId} for update`,
@@ -8004,6 +8020,18 @@ export function issueService(db: Db) {
 
     remove: (id: string) =>
       db.transaction(async (tx) => {
+        await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} for update`);
+        const boundIssue = await tx
+          .select({ id: issues.id, externalExecutorRunId: issues.externalExecutorRunId })
+          .from(issues)
+          .where(eq(issues.id, id))
+          .then((rows) => rows[0] ?? null);
+        if (boundIssue?.externalExecutorRunId) {
+          throw conflict("External executor owns this issue until terminal CAS or explicit recovery", {
+            issueId: boundIssue.id,
+            externalExecutorRunId: boundIssue.externalExecutorRunId,
+          });
+        }
         const attachmentAssetIds = await tx
           .select({ assetId: issueAttachments.assetId })
           .from(issueAttachments)
@@ -8117,6 +8145,7 @@ export function issueService(db: Db) {
             inArray(issues.status, expectedStatuses),
             or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
             executionLockCondition,
+            isNull(issues.externalExecutorRunId),
           ),
         )
         .returning()
@@ -8134,12 +8163,20 @@ export function issueService(db: Db) {
           assigneeAgentId: issues.assigneeAgentId,
           checkoutRunId: issues.checkoutRunId,
           executionRunId: issues.executionRunId,
+          externalExecutorRunId: issues.externalExecutorRunId,
         })
         .from(issues)
         .where(eq(issues.id, id))
         .then((rows) => rows[0] ?? null);
 
       if (!current) throw notFound("Issue not found");
+
+      if (current.externalExecutorRunId) {
+        throw conflict("External executor owns this issue until terminal CAS or explicit recovery", {
+          issueId: current.id,
+          externalExecutorRunId: current.externalExecutorRunId,
+        });
+      }
 
       if (
         current.assigneeAgentId === agentId &&
@@ -8162,6 +8199,7 @@ export function issueService(db: Db) {
               eq(issues.assigneeAgentId, agentId),
               isNull(issues.checkoutRunId),
               or(isNull(issues.executionRunId), eq(issues.executionRunId, checkoutRunId)),
+              isNull(issues.externalExecutorRunId),
             ),
           )
           .returning()
@@ -8223,6 +8261,7 @@ export function issueService(db: Db) {
                 inArray(issues.status, expectedStatuses),
                 eq(issues.executionRunId, current.executionRunId),
                 or(isNull(issues.assigneeAgentId), eq(issues.assigneeAgentId, agentId)),
+                isNull(issues.externalExecutorRunId),
               ),
             )
             .returning()
@@ -8266,6 +8305,7 @@ export function issueService(db: Db) {
             assigneeAgentId: issues.assigneeAgentId,
             checkoutRunId: issues.checkoutRunId,
             executionRunId: issues.executionRunId,
+            externalExecutorRunId: issues.externalExecutorRunId,
           })
           .from(issues)
           .where(eq(issues.id, id))
@@ -8273,6 +8313,12 @@ export function issueService(db: Db) {
       const current = await loadCurrent();
 
       if (!current) throw notFound("Issue not found");
+      if (current.externalExecutorRunId) {
+        throw conflict("External executor owns this issue until terminal CAS or explicit recovery", {
+          issueId: current.id,
+          externalExecutorRunId: current.externalExecutorRunId,
+        });
+      }
 
       const resolveSameRunOwnership = (candidate: {
         id: string;
@@ -8463,6 +8509,35 @@ export function issueService(db: Db) {
           };
         }
 
+        if (issue.projectId) {
+          await tx.execute(sql`select ${projects.id} from ${projects} where ${projects.id} = ${issue.projectId} for update`);
+          const project = await tx
+            .select({ pausedAt: projects.pausedAt, pauseReason: projects.pauseReason })
+            .from(projects)
+            .where(and(eq(projects.id, issue.projectId), eq(projects.companyId, input.companyId)))
+            .then((rows) => rows[0] ?? null);
+          if (project?.pausedAt) {
+            throw conflict(
+              project.pauseReason === "budget"
+                ? "Project is paused because its budget hard-stop was reached"
+                : "Project is paused",
+              { issueId: issue.id, projectId: issue.projectId },
+            );
+          }
+        }
+
+        const budgetBlock = await budgetService(tx as unknown as Db).getInvocationBlock(
+          input.companyId,
+          input.agentId,
+          { issueId: issue.id, projectId: issue.projectId },
+        );
+        if (budgetBlock) {
+          throw conflict("External executor checkout blocked by budget policy", {
+            issueId: issue.id,
+            ...budgetBlock,
+          });
+        }
+
         if (!input.expectedStatuses.includes(issue.status)) {
           throw conflict("Issue checkout conflict", {
             issueId: issue.id,
@@ -8475,6 +8550,13 @@ export function issueService(db: Db) {
             issueId: issue.id,
             expectedExecutionVersion: input.expectedExecutionVersion,
             actualExecutionVersion: issue.executionVersion,
+          });
+        }
+        const dependencyReadiness = await listIssueDependencyReadinessMap(tx as unknown as Db, input.companyId, [issue.id]);
+        const readiness = dependencyReadiness.get(issue.id);
+        if ((readiness?.unresolvedBlockerIssueIds.length ?? 0) > 0) {
+          throw unprocessable("Issue is blocked by unresolved blockers", {
+            unresolvedBlockerIssueIds: readiness!.unresolvedBlockerIssueIds,
           });
         }
         if (
@@ -8631,6 +8713,63 @@ export function issueService(db: Db) {
         });
       }
 
+      const pendingExecutionReview = parseIssueExecutionState(issue.executionState)?.status === "pending";
+      const [pendingInteraction, pendingApproval] = await Promise.all([
+        tx
+          .select({ id: issueThreadInteractions.id })
+          .from(issueThreadInteractions)
+          .where(and(
+            eq(issueThreadInteractions.companyId, input.companyId),
+            eq(issueThreadInteractions.issueId, input.issueId),
+            eq(issueThreadInteractions.status, "pending"),
+          ))
+          .limit(1)
+          .then((rows) => rows[0] ?? null),
+        tx
+          .select({ id: approvals.id })
+          .from(issueApprovals)
+          .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+          .where(and(
+            eq(issueApprovals.companyId, input.companyId),
+            eq(issueApprovals.issueId, input.issueId),
+            eq(approvals.status, "pending"),
+          ))
+          .limit(1)
+          .then((rows) => rows[0] ?? null),
+      ]);
+      if (
+        input.issueStatus === "done" &&
+        (pendingExecutionReview || pendingInteraction || pendingApproval)
+      ) {
+        throw unprocessable("External executor cannot complete an issue while review or approval is pending");
+      }
+      if (input.issueStatus === "blocked" && !issue.unblockDescriptor && !pendingInteraction && !pendingApproval) {
+        const blockerIds = await tx
+          .select({ id: issueRelations.issueId })
+          .from(issueRelations)
+          .where(and(
+            eq(issueRelations.companyId, input.companyId),
+            eq(issueRelations.relatedIssueId, input.issueId),
+            eq(issueRelations.type, "blocks"),
+          ))
+          .then((rows) => rows.map((row) => row.id));
+        const unresolvedBlocker = blockerIds.length > 0
+          ? await tx
+            .select({ id: issues.id })
+            .from(issues)
+            .where(and(
+              eq(issues.companyId, input.companyId),
+              inArray(issues.id, blockerIds),
+              ne(issues.status, "done"),
+            ))
+            .limit(1)
+            .then((rows) => rows[0] ?? null)
+          : null;
+        if (!unresolvedBlocker) {
+          throw unprocessable("Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor");
+        }
+      }
+
       const now = new Date();
       const statusPatch = applyStatusSideEffects(input.issueStatus, {});
       const updated = await tx
@@ -8708,9 +8847,17 @@ export function issueService(db: Db) {
         run.externalExecutorExpectedVersion !== input.expectedExecutionVersion - 1 ||
         run.externalExecutorVisible !== true ||
         run.externalExecutorHoldId !== null ||
-        run.status !== "running"
+        !["running", "failed", "interrupted", "cancelled", "timed_out"].includes(run.status)
       ) {
-        throw conflict("External executor recovery does not match the active run", { issueId: input.issueId });
+        throw conflict("External executor recovery does not match the active run", {
+          issueId: input.issueId,
+          runKeyMatches: run?.externalExecutorRunKey === input.runKey,
+          issueMatches: run?.externalExecutorIssueId === input.issueId,
+          expectedVersionMatches: run?.externalExecutorExpectedVersion === input.expectedExecutionVersion - 1,
+          visible: run?.externalExecutorVisible ?? null,
+          holdId: run?.externalExecutorHoldId ?? null,
+          runStatus: run?.status ?? null,
+        });
       }
       const now = new Date();
       const updated = await tx
@@ -8735,13 +8882,15 @@ export function issueService(db: Db) {
         .returning()
         .then((rows) => rows[0] ?? null);
       if (!updated) throw conflict("External executor recovery compare-and-swap lost", { issueId: input.issueId });
-      const recovered = await tx
-        .update(heartbeatRuns)
-        .set({ status: "timed_out", finishedAt: now, error: input.reason, updatedAt: now })
-        .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")))
-        .returning({ id: heartbeatRuns.id })
-        .then((rows) => rows[0] ?? null);
-      if (!recovered) throw conflict("External executor run changed during recovery", { issueId: input.issueId });
+      if (run.status === "running") {
+        const recovered = await tx
+          .update(heartbeatRuns)
+          .set({ status: "timed_out", finishedAt: now, error: input.reason, updatedAt: now })
+          .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")))
+          .returning({ id: heartbeatRuns.id })
+          .then((rows) => rows[0] ?? null);
+        if (!recovered) throw conflict("External executor run changed during recovery", { issueId: input.issueId });
+      }
       const [enriched] = await withIssueLabels(tx, [updated]);
       return { issue: enriched, runId, executionVersion: updated.executionVersion };
     }),

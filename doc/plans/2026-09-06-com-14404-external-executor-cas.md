@@ -30,8 +30,8 @@ lost run.
 
 Existing checkouts remain compatible: new issue fields default to no external
 run and version zero.  New nullable heartbeat fields leave prior heartbeat
-records valid.  Migration 0219 adds the run/version binding and unique index;
-0220 adds the persisted visibility snapshot.
+records valid.  Migration 0221 adds the run/version binding and unique index,
+after the existing 0219 lease and 0220 watchdog-authority-epoch migrations.
 
 Generic issue lifecycle mutation, normal release, admin force-release, and
 tree pause/cancel/release/restore all acquire the issue-row fence.  They reject
@@ -52,5 +52,5 @@ must not become a bypass for the agent-only executor endpoints.
 | Stale, foreign, generic, force-release terminal denial | focused route negative controls |
 | One terminal CAS winner | focused route concurrency test |
 | Migration and type safety | migration generator and TypeScript checks |
-| Independent review | COM-14406; pending fresh Sol/xhigh and Grok review |
+| Independent review | COM-14406; pending the applicable two-distinct-high-reasoning review gate |
 | Production positive/negative readback | pending deployment of reviewed revision |

@@ -707,7 +707,11 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
           sourceIssueId: source.id,
           title: "Scoped alias finding",
           exhaustIdentity,
-          exhaustAliases: [{ kind: "identity_v1", value: alias }, { kind: "legacy_hash", value: "d603cce66164f3f9" }],
+          exhaustAliases: [
+            { kind: "identity_v1", value: alias },
+            { kind: "legacy_hash", value: "d603cce66164f3f9" },
+            { kind: "identity_v1", value: alias },
+          ],
           deliveryFingerprint,
           idempotencyKey: "scoped-alias-key",
         })
@@ -729,6 +733,35 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
         workParentId: parent.id,
         deliveryFingerprint,
       });
+      const persistedAliases = Array.from(await db.execute(sql<{
+        value: string;
+        delivery_fingerprint: string | null;
+      }>`
+        select value, delivery_fingerprint
+        from exhaust_issue_aliases
+        where issue_id = ${created.body.id}::uuid
+        order by value
+      `));
+      expect(persistedAliases).toHaveLength(2);
+      expect(persistedAliases.every((row) => row.delivery_fingerprint === deliveryFingerprint)).toBe(true);
+
+      const mismatchedAlias = `exhaust-finding:v1:sha256:${"9".repeat(64)}`;
+      await request(app)
+        .post(`/api/companies/${companyId}/issues`)
+        .send({
+          parentId: parent.id,
+          sourceIssueId: source.id,
+          title: "Scoped alias finding",
+          exhaustIdentity,
+          exhaustAliases: [{ kind: "identity_v1", value: mismatchedAlias }],
+          deliveryFingerprint,
+          idempotencyKey: "scoped-alias-mismatch-key",
+        })
+        .expect(409);
+      await request(app)
+        .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
+        .query({ kind: "identity_v1", value: mismatchedAlias, sourceIssueId: source.id, workParentId: parent.id })
+        .expect(404, { code: "EXHAUST_ALIAS_NOT_FOUND", error: "Exhaust alias not found" });
 
       await request(app)
         .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
@@ -762,11 +795,55 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
         .query({ kind: "legacy_hash", value: alias, sourceIssueId: source.id, workParentId: parent.id })
         .expect(409, { code: "EXHAUST_ALIAS_AMBIGUOUS", error: "Exhaust alias is ambiguous" });
 
-      await db.execute(sql`update exhaust_alias_backfill_state set status = 'failed', last_error = 'injected' where company_id = ${companyId}`);
+      await db.execute(sql`
+        update exhaust_alias_backfill_state
+        set status = 'failed',
+            attempt_count = 1,
+            next_retry_at = now() + interval '1 hour',
+            last_error = 'injected transient failure'
+        where company_id = ${companyId}
+      `);
+      const [beforeRetry] = Array.from(await db.execute(sql<{ processed_count: number }>`
+        select processed_count
+        from exhaust_alias_backfill_state
+        where company_id = ${companyId}::uuid
+      `));
       await request(app)
         .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
         .query({ kind: "legacy_hash", value: "aaaaaaaaaaaaaaaa", sourceIssueId: source.id, workParentId: parent.id })
         .expect(503, { code: "EXHAUST_ALIAS_NOT_READY", error: "Exhaust alias index is not ready" });
+      await request(app)
+        .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
+        .query({ kind: "legacy_hash", value: "aaaaaaaaaaaaaaaa", sourceIssueId: source.id, workParentId: parent.id })
+        .expect(503, { code: "EXHAUST_ALIAS_NOT_READY", error: "Exhaust alias index is not ready" });
+      const [immediateRetry] = Array.from(await db.execute(sql<{
+        status: string;
+        processed_count: number;
+      }>`
+        select status, processed_count
+        from exhaust_alias_backfill_state
+        where company_id = ${companyId}::uuid
+      `));
+      expect(immediateRetry).toEqual({ status: "failed", processed_count: beforeRetry.processed_count });
+
+      await db.execute(sql`
+        update exhaust_alias_backfill_state
+        set next_retry_at = now() - interval '1 second'
+        where company_id = ${companyId}::uuid
+      `);
+      await request(app)
+        .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
+        .query({ kind: "legacy_hash", value: "aaaaaaaaaaaaaaaa", sourceIssueId: source.id, workParentId: parent.id })
+        .expect(404, { code: "EXHAUST_ALIAS_NOT_FOUND", error: "Exhaust alias not found" });
+      const [recoveredState] = Array.from(await db.execute(sql<{
+        status: string;
+        last_error: string | null;
+      }>`
+        select status, last_error
+        from exhaust_alias_backfill_state
+        where company_id = ${companyId}::uuid
+      `));
+      expect(recoveredState).toEqual({ status: "complete", last_error: null });
     });
 
     it("backfills only an explicit structured control block and validates alias input", async () => {

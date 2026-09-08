@@ -30,10 +30,13 @@ CREATE TABLE "exhaust_alias_backfill_state" (
   "status" text DEFAULT 'pending' NOT NULL,
   "processed_count" integer DEFAULT 0 NOT NULL,
   "skipped_count" integer DEFAULT 0 NOT NULL,
+  "attempt_count" integer DEFAULT 0 NOT NULL,
+  "next_retry_at" timestamp with time zone,
   "last_error" text,
   "created_at" timestamp with time zone DEFAULT now() NOT NULL,
   "updated_at" timestamp with time zone DEFAULT now() NOT NULL,
-  CONSTRAINT "exhaust_alias_backfill_state_status_check" CHECK ("status" IN ('pending', 'complete', 'failed'))
+  CONSTRAINT "exhaust_alias_backfill_state_status_check" CHECK ("status" IN ('pending', 'complete', 'failed')),
+  CONSTRAINT "exhaust_alias_backfill_state_attempt_count_check" CHECK ("attempt_count" >= 0)
 );
 
 -- Historical prose is deliberately not scanned. The service incrementally reads

@@ -217,8 +217,9 @@ type ExhaustAliasKind = "identity_v1" | "legacy_hash";
 type ExhaustAliasInput = { kind: ExhaustAliasKind; value: string };
 
 function canonicalizeExhaustAliases(aliases: ExhaustAliasInput[] | undefined) {
-  return [...(aliases ?? [])]
+  return [...new Map((aliases ?? [])
     .map((alias) => ({ kind: alias.kind, value: alias.value.trim() }))
+    .map((alias) => [`${alias.kind}\0${alias.value}`, alias] as const)).values()]
     .sort((left, right) => `${left.kind}\0${left.value}`.localeCompare(`${right.kind}\0${right.value}`));
 }
 
@@ -6066,15 +6067,24 @@ export function issueService(db: Db) {
             const stateRows = Array.from(await tx.execute(sql<{
               cursor_issue_id: string | null;
               status: "pending" | "complete" | "failed";
+              retry_eligible: boolean;
             }>`
-              select cursor_issue_id, status
+              select cursor_issue_id, status, (next_retry_at is null or next_retry_at <= now()) as retry_eligible
               from exhaust_alias_backfill_state
               where company_id = ${companyId}::uuid
               for update
             `));
             const state = stateRows[0];
-            if (!state || state.status === "failed") return false;
+            if (!state) return false;
             if (state.status === "complete") return true;
+            if (state.status === "failed") {
+              if (!state.retry_eligible) return false;
+              await tx.execute(sql`
+                update exhaust_alias_backfill_state
+                set status = 'pending', next_retry_at = null, updated_at = now()
+                where company_id = ${companyId}::uuid
+              `);
+            }
             const historical = Array.from(await tx.execute(sql<{
               id: string;
               parent_id: string | null;
@@ -6113,6 +6123,8 @@ export function issueService(db: Db) {
                   status = ${complete ? "complete" : "pending"},
                   processed_count = processed_count + ${historical.length},
                   skipped_count = skipped_count + ${skipped},
+                  attempt_count = 0,
+                  next_retry_at = null,
                   last_error = null,
                   updated_at = now()
               where company_id = ${companyId}::uuid
@@ -6122,10 +6134,21 @@ export function issueService(db: Db) {
         } catch (error) {
           logger.error({ error, companyId }, "Exhaust alias backfill failed");
           await db.execute(sql`
-            insert into exhaust_alias_backfill_state (company_id, status, last_error)
-            values (${companyId}::uuid, 'failed', 'backfill execution failed')
+            insert into exhaust_alias_backfill_state
+              (company_id, status, attempt_count, next_retry_at, last_error)
+            values
+              (${companyId}::uuid, 'failed', 1, now() + interval '5 seconds', 'backfill execution failed')
             on conflict (company_id) do update
-              set status = 'failed', last_error = excluded.last_error, updated_at = now()
+              set status = 'failed',
+                  attempt_count = least(exhaust_alias_backfill_state.attempt_count + 1, 7),
+                  next_retry_at = now() + make_interval(
+                    secs => least(
+                      300,
+                      5 * power(2, least(exhaust_alias_backfill_state.attempt_count, 6))::integer
+                    )
+                  ),
+                  last_error = excluded.last_error,
+                  updated_at = now()
           `).catch(() => undefined);
           return false;
         }
@@ -7229,6 +7252,19 @@ export function issueService(db: Db) {
       return db.transaction(async (tx) => {
         const persistExhaustAliases = async (issueId: string) => {
           if (exhaustAliases.length === 0) return;
+          const targetIssue = await tx
+            .select({ exhaustIdentity: issues.exhaustIdentity, parentId: issues.parentId })
+            .from(issues)
+            .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (
+            !targetIssue ||
+            targetIssue.exhaustIdentity !== exhaustIdentity ||
+            targetIssue.parentId !== issueData.parentId
+          ) {
+            throw conflict("Exhaust aliases cannot be attached to a different issue scope");
+          }
           const scopedIssues = await tx
             .select({ id: issues.id })
             .from(issues)

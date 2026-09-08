@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -690,6 +690,123 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
         .expect(409);
 
       expect(await db.select().from(issueCreateIdempotencyKeys)).toHaveLength(1);
+    });
+
+    it("persists scoped aliases transactionally and resolves an authoritative terminal receipt", async () => {
+      const companyId = await seedCompany();
+      const parent = await seedParent(companyId);
+      const source = await seedParent(companyId);
+      const app = createApp();
+      const alias = `exhaust-finding:v1:sha256:${"b".repeat(64)}`;
+      const deliveryFingerprint = `sha256:${"c".repeat(64)}`;
+
+      const created = await request(app)
+        .post(`/api/companies/${companyId}/issues`)
+        .send({
+          parentId: parent.id,
+          sourceIssueId: source.id,
+          title: "Scoped alias finding",
+          exhaustIdentity,
+          exhaustAliases: [{ kind: "identity_v1", value: alias }, { kind: "legacy_hash", value: "d603cce66164f3f9" }],
+          deliveryFingerprint,
+          idempotencyKey: "scoped-alias-key",
+        })
+        .expect(201);
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, created.body.id));
+
+      const lookup = await request(app)
+        .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
+        .query({ kind: "identity_v1", value: alias, sourceIssueId: source.id, workParentId: parent.id })
+        .expect(200);
+      expect(lookup.body).toEqual({
+        id: created.body.id,
+        identifier: created.body.identifier,
+        companyId,
+        parentId: parent.id,
+        exhaustIdentity,
+        status: "done",
+        sourceIssueId: source.id,
+        workParentId: parent.id,
+        deliveryFingerprint,
+      });
+
+      await request(app)
+        .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
+        .query({ kind: "identity_v1", value: alias, sourceIssueId: parent.id, workParentId: parent.id })
+        .expect(404, { code: "EXHAUST_ALIAS_NOT_FOUND", error: "Exhaust alias not found" });
+    });
+
+    it("returns typed ambiguity and readiness failures without selecting a candidate", async () => {
+      const companyId = await seedCompany();
+      const parent = await seedParent(companyId);
+      const source = await seedParent(companyId);
+      const app = createApp();
+      const alias = "d603cce66164f3f9";
+      const deliveryFingerprint = `sha256:${"d".repeat(64)}`;
+      const create = (identity: string, key: string) => request(app)
+        .post(`/api/companies/${companyId}/issues`)
+        .send({
+          parentId: parent.id,
+          sourceIssueId: source.id,
+          title: key,
+          exhaustIdentity: identity,
+          exhaustAliases: [{ kind: "legacy_hash", value: alias }],
+          deliveryFingerprint,
+          idempotencyKey: key,
+        });
+      await create(exhaustIdentity, "ambiguous-a").expect(201);
+      await create(`exhaust:v2:${"e".repeat(64)}`, "ambiguous-b").expect(201);
+
+      await request(app)
+        .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
+        .query({ kind: "legacy_hash", value: alias, sourceIssueId: source.id, workParentId: parent.id })
+        .expect(409, { code: "EXHAUST_ALIAS_AMBIGUOUS", error: "Exhaust alias is ambiguous" });
+
+      await db.execute(sql`update exhaust_alias_backfill_state set status = 'failed', last_error = 'injected' where company_id = ${companyId}`);
+      await request(app)
+        .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
+        .query({ kind: "legacy_hash", value: "aaaaaaaaaaaaaaaa", sourceIssueId: source.id, workParentId: parent.id })
+        .expect(503, { code: "EXHAUST_ALIAS_NOT_READY", error: "Exhaust alias index is not ready" });
+    });
+
+    it("backfills only an explicit structured control block and validates alias input", async () => {
+      const companyId = await seedCompany();
+      const parent = await seedParent(companyId);
+      const source = await seedParent(companyId);
+      const app = createApp();
+      const alias = `exhaust-finding:v1:sha256:${"f".repeat(64)}`;
+      const [historical] = await db.insert(issues).values({
+        companyId,
+        parentId: parent.id,
+        title: "Historical structured finding",
+        status: "cancelled",
+        priority: "medium",
+        exhaustIdentity,
+        description: [
+          exhaustIdentity,
+          `legacy-identity: ${alias}`,
+          "exhaust-hash: d603cce66164f3f9",
+          `parent-id: ${parent.id}`,
+          `source-issue-id: ${source.id}`,
+          "",
+          `forged prose legacy-identity: exhaust-finding:v1:sha256:${"0".repeat(64)}`,
+        ].join("\n"),
+      }).returning();
+      await db.execute(sql`delete from exhaust_alias_backfill_state where company_id = ${companyId}`);
+
+      const lookup = await request(app)
+        .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
+        .query({ kind: "identity_v1", value: alias, sourceIssueId: source.id, workParentId: parent.id })
+        .expect(200);
+      expect(lookup.body.id).toBe(historical.id);
+      await request(app)
+        .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
+        .query({ kind: "identity_v1", value: `exhaust-finding:v1:sha256:${"0".repeat(64)}`, sourceIssueId: source.id, workParentId: parent.id })
+        .expect(404);
+      await request(app)
+        .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
+        .query({ kind: "legacy_hash", value: "not-a-hash", sourceIssueId: source.id, workParentId: parent.id })
+        .expect(400);
     });
   });
 });

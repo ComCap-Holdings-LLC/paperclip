@@ -427,6 +427,17 @@ function withCreateIssueStatusDefault<T extends z.ZodRawShape>(schema: z.ZodObje
 }
 
 export const exhaustIdentitySchema = z.string().regex(/^exhaust:v2:[a-f0-9]{64}$/);
+const exhaustAliasSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("identity_v1"),
+    value: z.string().regex(/^exhaust-finding:v1:sha256:[a-f0-9]{64}$/),
+  }).strict(),
+  z.object({
+    kind: z.literal("legacy_hash"),
+    value: z.string().regex(/^[a-f0-9]{16}$/),
+  }).strict(),
+]);
+const exhaustDeliveryFingerprintSchema = z.string().regex(/^sha256:[a-f0-9]{64}$/);
 
 const createIssueBaseSchema = z.object({
   projectId: z.string().uuid().optional().nullable(),
@@ -434,6 +445,9 @@ const createIssueBaseSchema = z.object({
   goalId: z.string().uuid().optional().nullable(),
   parentId: z.string().uuid().optional().nullable(),
   exhaustIdentity: exhaustIdentitySchema.optional().nullable(),
+  sourceIssueId: z.string().uuid().optional().nullable(),
+  exhaustAliases: z.array(exhaustAliasSchema).max(16).optional(),
+  deliveryFingerprint: exhaustDeliveryFingerprintSchema.optional().nullable(),
   blockedByIssueIds: z.array(z.string().uuid()).optional(),
   unblockDescriptor: z.object({
     owner: z.union([

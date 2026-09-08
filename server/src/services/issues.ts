@@ -167,7 +167,11 @@ export const ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_DAYS = 7;
 const ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_MS = ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 const ISSUE_CREATE_IDEMPOTENCY_KEY_CLEANUP_BATCH_SIZE = 500;
 const EXHAUST_V2_IDENTITY_PATTERN = /^exhaust:v2:[a-f0-9]{64}$/;
+const EXHAUST_V1_IDENTITY_PATTERN = /^exhaust-finding:v1:sha256:[a-f0-9]{64}$/;
+const EXHAUST_LEGACY_HASH_PATTERN = /^[a-f0-9]{16}$/;
+const EXHAUST_DELIVERY_FINGERPRINT_PATTERN = /^sha256:[a-f0-9]{64}$/;
 const EXHAUST_IDENTITY_UNIQUE_CONSTRAINT = "issues_company_exhaust_identity_uq";
+const EXHAUST_ALIAS_BACKFILL_BATCH_SIZE = 250;
 const DELETED_ISSUE_COMMENT_BODY = "";
 const ISSUE_WAKE_DIAGNOSTICS_ACTIVITY_ACTIONS = ["issue.tree_hold_wakeup_deferred"] as const;
 
@@ -207,6 +211,34 @@ function issueCreateRequestFingerprint(input: IssueCreateInput) {
     blockedByIssueIds: semanticInput.blockedByIssueIds ? [...semanticInput.blockedByIssueIds].sort() : undefined,
   }));
   return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
+}
+
+type ExhaustAliasKind = "identity_v1" | "legacy_hash";
+type ExhaustAliasInput = { kind: ExhaustAliasKind; value: string };
+
+function canonicalizeExhaustAliases(aliases: ExhaustAliasInput[] | undefined) {
+  return [...(aliases ?? [])]
+    .map((alias) => ({ kind: alias.kind, value: alias.value.trim() }))
+    .sort((left, right) => `${left.kind}\0${left.value}`.localeCompare(`${right.kind}\0${right.value}`));
+}
+
+function parseStructuredExhaustControlBlock(description: string | null) {
+  if (!description) return null;
+  const [controlBlock = ""] = description.split(/\r?\n\r?\n/, 1);
+  const fields = new Map<string, string>();
+  for (const line of controlBlock.split(/\r?\n/)) {
+    const match = /^([a-z-]+):\s*(\S+)\s*$/.exec(line.trim());
+    if (match) fields.set(match[1], match[2]);
+  }
+  const sourceIssueId = fields.get("source-issue-id") ?? null;
+  const workParentId = fields.get("parent-id") ?? null;
+  if (!sourceIssueId || !workParentId || !isUuidLike(sourceIssueId) || !isUuidLike(workParentId)) return null;
+  const aliases: ExhaustAliasInput[] = [];
+  const identityV1 = fields.get("legacy-identity");
+  const legacyHash = fields.get("exhaust-hash");
+  if (identityV1 && EXHAUST_V1_IDENTITY_PATTERN.test(identityV1)) aliases.push({ kind: "identity_v1", value: identityV1 });
+  if (legacyHash && EXHAUST_LEGACY_HASH_PATTERN.test(legacyHash)) aliases.push({ kind: "legacy_hash", value: legacyHash });
+  return aliases.length > 0 ? { sourceIssueId, workParentId, aliases } : null;
 }
 
 function wakeRequestTargetsIssue(issueId: string) {
@@ -714,6 +746,9 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   actorResponsibleUserId?: string | null;
   trustExplicitResponsibleUserId?: boolean;
   idempotencyKey?: string | null;
+  sourceIssueId?: string | null;
+  exhaustAliases?: ExhaustAliasInput[];
+  deliveryFingerprint?: string | null;
   allowDuplicate?: boolean;
   onDeduplicated?: (reason: IssueCreateDeduplicationReason) => void;
 };
@@ -6013,6 +6048,132 @@ export function issueService(db: Db) {
         .then((rows) => rows[0] ?? null);
     },
 
+    getByExhaustAlias: async (companyId: string, query: {
+      kind: ExhaustAliasKind;
+      value: string;
+      sourceIssueId: string;
+      workParentId: string;
+    }) => {
+      const ensureBackfillReady = async () => {
+        try {
+          return await db.transaction(async (tx) => {
+            await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`exhaust-alias-backfill:${companyId}`}, 0))`);
+            await tx.execute(sql`
+              insert into exhaust_alias_backfill_state (company_id)
+              values (${companyId}::uuid)
+              on conflict (company_id) do nothing
+            `);
+            const stateRows = Array.from(await tx.execute(sql<{
+              cursor_issue_id: string | null;
+              status: "pending" | "complete" | "failed";
+            }>`
+              select cursor_issue_id, status
+              from exhaust_alias_backfill_state
+              where company_id = ${companyId}::uuid
+              for update
+            `));
+            const state = stateRows[0];
+            if (!state || state.status === "failed") return false;
+            if (state.status === "complete") return true;
+            const historical = Array.from(await tx.execute(sql<{
+              id: string;
+              parent_id: string | null;
+              description: string | null;
+            }>`
+              select id, parent_id, description
+              from issues
+              where company_id = ${companyId}::uuid
+                and exhaust_identity is not null
+                and (${state.cursor_issue_id}::uuid is null or id > ${state.cursor_issue_id}::uuid)
+              order by id asc
+              limit ${EXHAUST_ALIAS_BACKFILL_BATCH_SIZE}
+            `)) as Array<{ id: string; parent_id: string | null; description: string | null }>;
+            let skipped = 0;
+            for (const row of historical) {
+              const controls = parseStructuredExhaustControlBlock(row.description);
+              if (!controls || controls.workParentId !== row.parent_id) {
+                skipped += 1;
+                continue;
+              }
+              for (const alias of controls.aliases) {
+                await tx.execute(sql`
+                  insert into exhaust_issue_aliases
+                    (company_id, issue_id, kind, value, source_issue_id, work_parent_id)
+                  values
+                    (${companyId}::uuid, ${row.id}::uuid, ${alias.kind}, ${alias.value},
+                     ${controls.sourceIssueId}::uuid, ${controls.workParentId}::uuid)
+                  on conflict (issue_id, kind, value) do nothing
+                `);
+              }
+            }
+            const complete = historical.length < EXHAUST_ALIAS_BACKFILL_BATCH_SIZE;
+            await tx.execute(sql`
+              update exhaust_alias_backfill_state
+              set cursor_issue_id = ${historical.at(-1)?.id ?? state.cursor_issue_id}::uuid,
+                  status = ${complete ? "complete" : "pending"},
+                  processed_count = processed_count + ${historical.length},
+                  skipped_count = skipped_count + ${skipped},
+                  last_error = null,
+                  updated_at = now()
+              where company_id = ${companyId}::uuid
+            `);
+            return complete;
+          });
+        } catch (error) {
+          logger.error({ error, companyId }, "Exhaust alias backfill failed");
+          await db.execute(sql`
+            insert into exhaust_alias_backfill_state (company_id, status, last_error)
+            values (${companyId}::uuid, 'failed', 'backfill execution failed')
+            on conflict (company_id) do update
+              set status = 'failed', last_error = excluded.last_error, updated_at = now()
+          `).catch(() => undefined);
+          return false;
+        }
+      };
+
+      if (!(await ensureBackfillReady())) return { kind: "not_ready" as const };
+      const matches = Array.from(await db.execute(sql<{
+        id: string;
+        identifier: string;
+        company_id: string;
+        parent_id: string | null;
+        exhaust_identity: string;
+        status: string;
+        source_issue_id: string;
+        work_parent_id: string;
+        delivery_fingerprint: string | null;
+      }>`
+        select i.id, i.identifier, i.company_id, i.parent_id, i.exhaust_identity, i.status,
+               a.source_issue_id, a.work_parent_id, a.delivery_fingerprint
+        from exhaust_issue_aliases a
+        join issues i on i.id = a.issue_id and i.company_id = a.company_id
+        where a.company_id = ${companyId}::uuid
+          and a.kind = ${query.kind}
+          and a.value = ${query.value}
+          and a.source_issue_id = ${query.sourceIssueId}::uuid
+          and a.work_parent_id = ${query.workParentId}::uuid
+        order by i.id asc
+        limit 2
+      `));
+      if (matches.length === 0) return { kind: "not_found" as const };
+      if (matches.length > 1) return { kind: "ambiguous" as const };
+      const [match] = matches;
+      return {
+        kind: "found" as const,
+        receipt: {
+          id: match.id,
+          identifier: match.identifier,
+          companyId: match.company_id,
+          parentId: match.parent_id,
+          exhaustIdentity: match.exhaust_identity,
+          status: match.status,
+          sourceIssueId: match.source_issue_id,
+          workParentId: match.work_parent_id,
+          deliveryFingerprint: match.delivery_fingerprint,
+        },
+      };
+    },
+
     getCurrentScheduledRetry: async (issueId: string) => {
       const issue = await db
         .select({ id: issues.id, companyId: issues.companyId })
@@ -7007,14 +7168,26 @@ export function issueService(db: Db) {
         actorResponsibleUserId,
         trustExplicitResponsibleUserId,
         idempotencyKey: rawIdempotencyKey,
+        sourceIssueId: rawSourceIssueId,
+        exhaustAliases: rawExhaustAliases,
+        deliveryFingerprint: rawDeliveryFingerprint,
         allowDuplicate,
         onDeduplicated,
         ...rawIssueData
       } = data;
       const idempotencyKey = rawIdempotencyKey?.trim() || null;
       const exhaustIdentity = rawIssueData.exhaustIdentity?.trim() || null;
+      const sourceIssueId = rawSourceIssueId?.trim() || null;
+      const exhaustAliases = canonicalizeExhaustAliases(rawExhaustAliases);
+      const deliveryFingerprint = rawDeliveryFingerprint?.trim() || null;
       const issueData = { ...rawIssueData, exhaustIdentity };
-      const canonicalData = { ...data, exhaustIdentity };
+      const canonicalData = {
+        ...data,
+        exhaustIdentity,
+        sourceIssueId,
+        exhaustAliases,
+        deliveryFingerprint,
+      };
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
@@ -7039,8 +7212,47 @@ export function issueService(db: Db) {
       if (exhaustIdentity && !idempotencyKey) {
         throw unprocessable("exhaustIdentity requires idempotencyKey");
       }
+      if (exhaustAliases.length > 0) {
+        if (!exhaustIdentity || !sourceIssueId || !issueData.parentId || !deliveryFingerprint) {
+          throw unprocessable("exhaustAliases require exhaustIdentity, sourceIssueId, parentId, and deliveryFingerprint");
+        }
+        if (!EXHAUST_DELIVERY_FINGERPRINT_PATTERN.test(deliveryFingerprint)) {
+          throw unprocessable("Invalid deliveryFingerprint; expected sha256:<64 lowercase hex characters>");
+        }
+        if (exhaustAliases.some((alias) => alias.kind === "identity_v1"
+          ? !EXHAUST_V1_IDENTITY_PATTERN.test(alias.value)
+          : !EXHAUST_LEGACY_HASH_PATTERN.test(alias.value))) {
+          throw unprocessable("Invalid exhaust alias");
+        }
+      }
       const requestFingerprint = exhaustIdentity ? issueCreateRequestFingerprint(canonicalData) : null;
       return db.transaction(async (tx) => {
+        const persistExhaustAliases = async (issueId: string) => {
+          if (exhaustAliases.length === 0) return;
+          const scopedIssues = await tx
+            .select({ id: issues.id })
+            .from(issues)
+            .where(and(
+              eq(issues.companyId, companyId),
+              inArray(issues.id, [sourceIssueId!, issueData.parentId!]),
+            ));
+          if (new Set(scopedIssues.map((row) => row.id)).size !== new Set([sourceIssueId, issueData.parentId]).size) {
+            throw unprocessable("Exhaust alias source and work parent must belong to the company");
+          }
+          for (const alias of exhaustAliases) {
+            await tx.execute(sql`
+              insert into exhaust_issue_aliases
+                (company_id, issue_id, kind, value, source_issue_id, work_parent_id, delivery_fingerprint)
+              values
+                (${companyId}::uuid, ${issueId}::uuid, ${alias.kind}, ${alias.value},
+                 ${sourceIssueId}::uuid, ${issueData.parentId}::uuid, ${deliveryFingerprint})
+              on conflict (issue_id, kind, value) do update
+                set source_issue_id = excluded.source_issue_id,
+                    work_parent_id = excluded.work_parent_id,
+                    delivery_fingerprint = excluded.delivery_fingerprint
+            `);
+          }
+        };
         const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
         if (allowDuplicate === false) {
           const titleGuardKey =
@@ -7152,6 +7364,7 @@ export function issueService(db: Db) {
           if (existingIssue) deduplicationReason = "recent_open_title";
         }
         if (existingIssue) {
+          await persistExhaustAliases(existingIssue.id);
           if (idempotencyKey) {
             await tx
               .insert(issueCreateIdempotencyKeys)
@@ -7376,6 +7589,7 @@ export function issueService(db: Db) {
             issueId: winningIssue.id,
             requestFingerprint,
           }).onConflictDoNothing();
+          await persistExhaustAliases(winningIssue.id);
           onDeduplicated?.("exhaust_identity");
           const [enriched] = await withIssueLabels(tx, [winningIssue]);
           const [withRelations] = await withIssueRelationSummaries(companyId, [enriched], tx);
@@ -7389,6 +7603,7 @@ export function issueService(db: Db) {
             requestFingerprint,
           });
         }
+        await persistExhaustAliases(issue.id);
         if (watchdog) {
           await upsertIssueWatchdogForIssue(tx, companyId, issue.id, {
             agentId: watchdog.agentId,

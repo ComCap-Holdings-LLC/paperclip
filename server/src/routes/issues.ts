@@ -244,6 +244,20 @@ import {
 } from "../services/cross-issue-influence-limit.js";
 
 const exhaustIdentitySchema = z.string().regex(/^exhaust:v2:[a-f0-9]{64}$/);
+const exhaustAliasQuerySchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("identity_v1"),
+    value: z.string().regex(/^exhaust-finding:v1:sha256:[a-f0-9]{64}$/),
+    sourceIssueId: z.string().uuid(),
+    workParentId: z.string().uuid(),
+  }).strict(),
+  z.object({
+    kind: z.literal("legacy_hash"),
+    value: z.string().regex(/^[a-f0-9]{16}$/),
+    sourceIssueId: z.string().uuid(),
+    workParentId: z.string().uuid(),
+  }).strict(),
+]);
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
@@ -5827,6 +5841,33 @@ export function issueRoutes(
     const receipt = await svc.getByExhaustIdentity(companyId, parsedIdentity.data);
     if (!receipt) throw notFound("Issue not found");
     res.json(receipt);
+  });
+
+  router.get("/companies/:companyId/issues/by-exhaust-alias", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const parsed = exhaustAliasQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      res.status(400).json({
+        code: "EXHAUST_ALIAS_INVALID",
+        error: "A valid exhaust alias and source/work-parent scope are required",
+      });
+      return;
+    }
+    const result = await svc.getByExhaustAlias(companyId, parsed.data);
+    if (result.kind === "not_ready") {
+      res.status(503).json({ code: "EXHAUST_ALIAS_NOT_READY", error: "Exhaust alias index is not ready" });
+      return;
+    }
+    if (result.kind === "ambiguous") {
+      res.status(409).json({ code: "EXHAUST_ALIAS_AMBIGUOUS", error: "Exhaust alias is ambiguous" });
+      return;
+    }
+    if (result.kind === "not_found") {
+      res.status(404).json({ code: "EXHAUST_ALIAS_NOT_FOUND", error: "Exhaust alias not found" });
+      return;
+    }
+    res.json(result.receipt);
   });
 
   router.get("/companies/:companyId/issues", async (req, res) => {

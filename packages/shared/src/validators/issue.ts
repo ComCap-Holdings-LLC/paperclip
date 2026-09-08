@@ -426,11 +426,14 @@ function withCreateIssueStatusDefault<T extends z.ZodRawShape>(schema: z.ZodObje
   }, schema);
 }
 
+export const exhaustIdentitySchema = z.string().regex(/^exhaust:v2:[a-f0-9]{64}$/);
+
 const createIssueBaseSchema = z.object({
   projectId: z.string().uuid().optional().nullable(),
   projectWorkspaceId: z.string().uuid().optional().nullable(),
   goalId: z.string().uuid().optional().nullable(),
   parentId: z.string().uuid().optional().nullable(),
+  exhaustIdentity: exhaustIdentitySchema.optional().nullable(),
   blockedByIssueIds: z.array(z.string().uuid()).optional(),
   unblockDescriptor: z.object({
     owner: z.union([
@@ -471,7 +474,7 @@ const createIssueBaseSchema = z.object({
 });
 
 function requireBlockedStatusForUnblockDescriptor(
-  value: { status?: string; unblockDescriptor?: unknown },
+  value: { status?: string; unblockDescriptor?: unknown; exhaustIdentity?: string | null; idempotencyKey?: string | null },
   ctx: z.RefinementCtx,
 ) {
   if (value.unblockDescriptor != null && value.status !== undefined && value.status !== "blocked") {
@@ -479,6 +482,13 @@ function requireBlockedStatusForUnblockDescriptor(
       code: z.ZodIssueCode.custom,
       message: "unblockDescriptor requires blocked status",
       path: ["unblockDescriptor"],
+    });
+  }
+  if (value.exhaustIdentity && !value.idempotencyKey?.trim()) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "exhaustIdentity requires idempotencyKey",
+      path: ["idempotencyKey"],
     });
   }
 }

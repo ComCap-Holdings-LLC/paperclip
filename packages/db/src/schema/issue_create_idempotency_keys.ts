@@ -9,6 +9,7 @@ export const issueCreateIdempotencyKeys = pgTable(
     companyId: uuid("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
     idempotencyKey: text("idempotency_key").notNull(),
     issueId: uuid("issue_id").notNull().references(() => issues.id, { onDelete: "cascade" }),
+    requestFingerprint: text("request_fingerprint"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({

@@ -66,7 +66,7 @@ import {
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
-import { isForeignKeyViolation } from "../db-errors.js";
+import { isForeignKeyViolation, isUniqueViolation } from "../db-errors.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
 import {
@@ -166,8 +166,48 @@ const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_PARALLEL_READS = 8;
 export const ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_DAYS = 7;
 const ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_MS = ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 const ISSUE_CREATE_IDEMPOTENCY_KEY_CLEANUP_BATCH_SIZE = 500;
+const EXHAUST_V2_IDENTITY_PATTERN = /^exhaust:v2:[a-f0-9]{64}$/;
+const EXHAUST_IDENTITY_UNIQUE_CONSTRAINT = "issues_company_exhaust_identity_uq";
 const DELETED_ISSUE_COMMENT_BODY = "";
 const ISSUE_WAKE_DIAGNOSTICS_ACTIVITY_ACTIONS = ["issue.tree_hold_wakeup_deferred"] as const;
+
+function normalizeIssueCreateFingerprintValue(value: unknown): unknown {
+  if (value instanceof Date) return value.toISOString();
+  if (Array.isArray(value)) return value.map(normalizeIssueCreateFingerprintValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([, entry]) => entry !== undefined)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, entry]) => [key, normalizeIssueCreateFingerprintValue(entry)]),
+    );
+  }
+  return value;
+}
+
+function issueCreateRequestFingerprint(input: IssueCreateInput) {
+  const {
+    id: _generatedId,
+    idempotencyKey: _idempotencyKey,
+    allowDuplicate: _allowDuplicate,
+    onDeduplicated: _onDeduplicated,
+    actorRunId: _actorRunId,
+    watchdogActorRunId: _watchdogActorRunId,
+    actorResponsibleUserId: _actorResponsibleUserId,
+    trustExplicitResponsibleUserId: _trustExplicitResponsibleUserId,
+    createdByAgentId: _createdByAgentId,
+    createdByUserId: _createdByUserId,
+    originRunId: _originRunId,
+    sourceTrust: _sourceTrust,
+    ...semanticInput
+  } = input;
+  const canonical = JSON.stringify(normalizeIssueCreateFingerprintValue({
+    ...semanticInput,
+    labelIds: semanticInput.labelIds ? [...semanticInput.labelIds].sort() : undefined,
+    blockedByIssueIds: semanticInput.blockedByIssueIds ? [...semanticInput.blockedByIssueIds].sort() : undefined,
+  }));
+  return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
+}
 
 function wakeRequestTargetsIssue(issueId: string) {
   return sql`(
@@ -3107,6 +3147,7 @@ const issueListSelect = {
   projectWorkspaceId: issues.projectWorkspaceId,
   goalId: issues.goalId,
   parentId: issues.parentId,
+  exhaustIdentity: issues.exhaustIdentity,
   title: issues.title,
   description: sql<string | null>`
     CASE
@@ -5952,6 +5993,25 @@ export function issueService(db: Db) {
       return getIssueByIdentifier(identifier);
     },
 
+    getByExhaustIdentity: async (companyId: string, exhaustIdentity: string) => {
+      return db
+        .select({
+          id: issues.id,
+          identifier: issues.identifier,
+          companyId: issues.companyId,
+          parentId: issues.parentId,
+          exhaustIdentity: issues.exhaustIdentity,
+          status: issues.status,
+        })
+        .from(issues)
+        .where(and(
+          eq(issues.companyId, companyId),
+          eq(issues.exhaustIdentity, exhaustIdentity),
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+    },
+
     getCurrentScheduledRetry: async (issueId: string) => {
       const issue = await db
         .select({ id: issues.id, companyId: issues.companyId })
@@ -6968,8 +7028,16 @@ export function issueService(db: Db) {
       if (data.status === "in_progress" && !data.assigneeAgentId && !data.assigneeUserId) {
         throw unprocessable("in_progress issues require an assignee");
       }
+      const idempotencyKey = rawIdempotencyKey?.trim() || null;
+      const exhaustIdentity = issueData.exhaustIdentity?.trim() || null;
+      if (exhaustIdentity && !EXHAUST_V2_IDENTITY_PATTERN.test(exhaustIdentity)) {
+        throw unprocessable("Invalid exhaustIdentity; expected exhaust:v2:<64 lowercase hex characters>");
+      }
+      if (exhaustIdentity && !idempotencyKey) {
+        throw unprocessable("exhaustIdentity requires idempotencyKey");
+      }
+      const requestFingerprint = exhaustIdentity ? issueCreateRequestFingerprint(data) : null;
       return db.transaction(async (tx) => {
-        const idempotencyKey = rawIdempotencyKey?.trim() || null;
         const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
         if (allowDuplicate === false) {
           const titleGuardKey =
@@ -6979,6 +7047,10 @@ export function issueService(db: Db) {
         if (idempotencyKey) {
           const idempotencyGuardKey = `issue-create:idempotency:${companyId}:${idempotencyKey}`;
           await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${idempotencyGuardKey}, 0))`);
+        }
+        if (exhaustIdentity) {
+          const exhaustIdentityGuardKey = `issue-create:exhaust-identity:${companyId}:${exhaustIdentity}`;
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${exhaustIdentityGuardKey}, 0))`);
         }
 
         let existingIssue: typeof issues.$inferSelect | undefined;
@@ -6991,14 +7063,18 @@ export function issueService(db: Db) {
               select ${issueCreateIdempotencyKeys.id}
               from ${issueCreateIdempotencyKeys}
               where ${issueCreateIdempotencyKeys.companyId} = ${companyId}
+                and ${issueCreateIdempotencyKeys.requestFingerprint} is null
                 and ${issueCreateIdempotencyKeys.createdAt} < ${idempotencyKeyRetentionCutoff.toISOString()}::timestamptz
               order by ${issueCreateIdempotencyKeys.createdAt} asc, ${issueCreateIdempotencyKeys.id} asc
               limit ${ISSUE_CREATE_IDEMPOTENCY_KEY_CLEANUP_BATCH_SIZE}
             )
           `);
 
-          [existingIssue] = await tx
-            .select()
+          const existingMapping = await tx
+            .select({
+              issue: issues,
+              requestFingerprint: issueCreateIdempotencyKeys.requestFingerprint,
+            })
             .from(issueCreateIdempotencyKeys)
             .innerJoin(issues, eq(issueCreateIdempotencyKeys.issueId, issues.id))
             .where(and(
@@ -7006,10 +7082,50 @@ export function issueService(db: Db) {
               eq(issueCreateIdempotencyKeys.idempotencyKey, idempotencyKey),
             ))
             .limit(1)
-            .then((rows) => rows.map((row) => row.issues));
-          if (existingIssue) deduplicationReason = "idempotency_key";
+            .then((rows) => rows[0] ?? null);
+          if (existingMapping) {
+            if (requestFingerprint && existingMapping.requestFingerprint == null) {
+              throw conflict("Legacy idempotency mapping cannot be replayed as a fingerprinted exhaust request");
+            }
+            if (requestFingerprint && existingMapping.requestFingerprint !== requestFingerprint) {
+              throw conflict("Idempotency key was already used for a different request");
+            }
+            if (exhaustIdentity && existingMapping.issue.exhaustIdentity !== exhaustIdentity) {
+              throw conflict("Idempotency key was already used for a different exhaust identity");
+            }
+            existingIssue = existingMapping.issue;
+            deduplicationReason = "idempotency_key";
+          }
         }
-        if (!existingIssue && allowDuplicate === false) {
+        if (!existingIssue && exhaustIdentity && requestFingerprint) {
+          const identityMatch = await tx
+            .select()
+            .from(issues)
+            .where(and(
+              eq(issues.companyId, companyId),
+              eq(issues.exhaustIdentity, exhaustIdentity),
+            ))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (identityMatch) {
+            const matchingFingerprint = await tx
+              .select({ requestFingerprint: issueCreateIdempotencyKeys.requestFingerprint })
+              .from(issueCreateIdempotencyKeys)
+              .where(and(
+                eq(issueCreateIdempotencyKeys.companyId, companyId),
+                eq(issueCreateIdempotencyKeys.issueId, identityMatch.id),
+                eq(issueCreateIdempotencyKeys.requestFingerprint, requestFingerprint),
+              ))
+              .limit(1)
+              .then((rows) => rows[0] ?? null);
+            if (!matchingFingerprint) {
+              throw conflict("Exhaust identity was already used for a different request");
+            }
+            existingIssue = identityMatch;
+            deduplicationReason = "idempotency_key";
+          }
+        }
+        if (!existingIssue && !exhaustIdentity && allowDuplicate === false) {
           [existingIssue] = await tx
             .select()
             .from(issues)
@@ -7029,7 +7145,7 @@ export function issueService(db: Db) {
           if (idempotencyKey) {
             await tx
               .insert(issueCreateIdempotencyKeys)
-              .values({ companyId, idempotencyKey, issueId: existingIssue.id })
+              .values({ companyId, idempotencyKey, issueId: existingIssue.id, requestFingerprint })
               .onConflictDoNothing();
           }
           if (deduplicationReason) onDeduplicated?.(deduplicationReason);
@@ -7222,12 +7338,51 @@ export function issueService(db: Db) {
           }),
         );
 
-        const [issue] = await tx.insert(issues).values(values).returning();
+        let issue: typeof issues.$inferSelect;
+        try {
+          [issue] = await tx.transaction(async (insertTx) => insertTx.insert(issues).values(values).returning());
+        } catch (error) {
+          if (!exhaustIdentity || !isUniqueViolation(error, EXHAUST_IDENTITY_UNIQUE_CONSTRAINT)) throw error;
+          const winningIssue = await tx
+            .select()
+            .from(issues)
+            .where(and(
+              eq(issues.companyId, companyId),
+              eq(issues.exhaustIdentity, exhaustIdentity),
+            ))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (!winningIssue || !requestFingerprint) throw error;
+          const winningFingerprint = await tx
+            .select({ requestFingerprint: issueCreateIdempotencyKeys.requestFingerprint })
+            .from(issueCreateIdempotencyKeys)
+            .where(and(
+              eq(issueCreateIdempotencyKeys.companyId, companyId),
+              eq(issueCreateIdempotencyKeys.issueId, winningIssue.id),
+              eq(issueCreateIdempotencyKeys.requestFingerprint, requestFingerprint),
+            ))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (!winningFingerprint) {
+            throw conflict("Exhaust identity was concurrently used for a different request");
+          }
+          await tx.insert(issueCreateIdempotencyKeys).values({
+            companyId,
+            idempotencyKey: idempotencyKey!,
+            issueId: winningIssue.id,
+            requestFingerprint,
+          }).onConflictDoNothing();
+          onDeduplicated?.("idempotency_key");
+          const [enriched] = await withIssueLabels(tx, [winningIssue]);
+          const [withRelations] = await withIssueRelationSummaries(companyId, [enriched], tx);
+          return withRelations;
+        }
         if (idempotencyKey) {
           await tx.insert(issueCreateIdempotencyKeys).values({
             companyId,
             idempotencyKey,
             issueId: issue.id,
+            requestFingerprint,
           });
         }
         if (watchdog) {

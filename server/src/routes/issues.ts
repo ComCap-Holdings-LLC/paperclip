@@ -101,6 +101,7 @@ import {
   type IssueWriteDenialCode,
   type IssueWriteDenialContext,
 } from "@paperclipai/shared";
+
 import { trackAgentTaskCompleted } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { isUniqueViolation } from "../db-errors.js";
@@ -242,6 +243,7 @@ import {
   type CrossIssueInfluenceKind,
 } from "../services/cross-issue-influence-limit.js";
 
+const exhaustIdentitySchema = z.string().regex(/^exhaust:v2:[a-f0-9]{64}$/);
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
@@ -376,6 +378,25 @@ function applyCreateIssueStatusDefault(req: Request, res: Response, next: () => 
       status: resolution.status,
     };
   }
+  next();
+}
+
+function applyCreateIssueIdempotencyHeader(req: Request, res: Response, next: () => void) {
+  const headerKey = req.header("idempotency-key")?.trim();
+  if (!headerKey) {
+    next();
+    return;
+  }
+  if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
+    next();
+    return;
+  }
+  const bodyKey = (req.body as Record<string, unknown>).idempotencyKey;
+  if (typeof bodyKey === "string" && bodyKey.trim() !== headerKey) {
+    res.status(400).json({ error: "Idempotency-Key header must match body idempotencyKey" });
+    return;
+  }
+  req.body = { ...req.body, idempotencyKey: headerKey };
   next();
 }
 
@@ -5795,6 +5816,19 @@ export function issueRoutes(
     res.json(result);
   });
 
+  router.get("/companies/:companyId/issues/by-exhaust-identity", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const parsedIdentity = exhaustIdentitySchema.safeParse(req.query.identity);
+    if (!parsedIdentity.success) {
+      res.status(400).json({ error: "A valid exhaust:v2 identity query parameter is required" });
+      return;
+    }
+    const receipt = await svc.getByExhaustIdentity(companyId, parsedIdentity.data);
+    if (!receipt) throw notFound("Issue not found");
+    res.json(receipt);
+  });
+
   router.get("/companies/:companyId/issues", async (req, res) => {
     const startedAt = Date.now();
     const companyId = req.params.companyId as string;
@@ -8148,7 +8182,7 @@ export function issueRoutes(
     res.json({ ok: true });
   });
 
-  router.post("/companies/:companyId/issues", applyCreateIssueStatusDefault, validate(createIssueSchema), async (req, res) => {
+  router.post("/companies/:companyId/issues", applyCreateIssueIdempotencyHeader, applyCreateIssueStatusDefault, validate(createIssueSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     if (isSkillTestScopedActor(req)) {

@@ -984,6 +984,63 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
       },
     );
 
+    it("falls back to the trusted persisted receipt when the post-ready reread sees no match", async () => {
+      const companyId = await seedCompany();
+      const parent = await seedParent(companyId);
+      const source = await seedParent(companyId);
+      const app = createApp();
+      const alias = "3333333333333333";
+      const created = await request(app)
+        .post(`/api/companies/${companyId}/issues`)
+        .send({
+          parentId: parent.id,
+          sourceIssueId: source.id,
+          title: "Persisted alias hidden after readiness",
+          exhaustIdentity: `exhaust:v2:${"3".repeat(64)}`,
+          exhaustAliases: [{ kind: "legacy_hash", value: alias }],
+          deliveryFingerprint: `sha256:${"c".repeat(64)}`,
+          idempotencyKey: "persisted-alias-post-ready-transient",
+        })
+        .expect(201);
+      await db.execute(sql`
+        insert into exhaust_alias_backfill_state (company_id, status)
+        values (${companyId}::uuid, 'pending')
+        on conflict (company_id) do update
+          set status = excluded.status,
+              cursor_issue_id = null,
+              next_retry_at = null
+      `);
+      await db.execute(sql`
+        create or replace function test_drop_exhaust_alias_after_ready()
+        returns trigger
+        language plpgsql
+        as $$
+        begin
+          delete from exhaust_issue_aliases where company_id = new.company_id;
+          return new;
+        end
+        $$
+      `);
+      await db.execute(sql`
+        create trigger test_drop_exhaust_alias_after_ready
+        after update on exhaust_alias_backfill_state
+        for each row
+        when (new.status = 'complete')
+        execute function test_drop_exhaust_alias_after_ready()
+      `);
+
+      try {
+        const lookup = await request(app)
+          .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
+          .query({ kind: "legacy_hash", value: alias, sourceIssueId: source.id, workParentId: parent.id })
+          .expect(200);
+        expect(lookup.body.id).toBe(created.body.id);
+      } finally {
+        await db.execute(sql`drop trigger if exists test_drop_exhaust_alias_after_ready on exhaust_alias_backfill_state`);
+        await db.execute(sql`drop function if exists test_drop_exhaust_alias_after_ready()`);
+      }
+    });
+
     it("backfills only an explicit structured control block and validates alias input", async () => {
       const companyId = await seedCompany();
       const parent = await seedParent(companyId);

@@ -896,6 +896,94 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
         .expect(503, { code: "EXHAUST_ALIAS_NOT_READY", error: "Exhaust alias index is not ready" });
     });
 
+    it.each(["pending", "failed"] as const)(
+      "advances an eligible %s backfill even when the requested alias is already persisted",
+      async (initialStatus) => {
+        const companyId = await seedCompany();
+        const parent = await seedParent(companyId);
+        const source = await seedParent(companyId);
+        const app = createApp();
+        const persistedAlias = initialStatus === "pending" ? "1111111111111111" : "2222222222222222";
+        const historicalHash = (initialStatus === "pending" ? "8" : "9").repeat(64);
+        const historicalAlias = `exhaust-finding:v1:sha256:${historicalHash}`;
+        const historicalIdentity = `exhaust:v2:${historicalHash}`;
+        const created = await request(app)
+          .post(`/api/companies/${companyId}/issues`)
+          .send({
+            parentId: parent.id,
+            sourceIssueId: source.id,
+            title: `Persisted ${initialStatus} alias`,
+            exhaustIdentity: initialStatus === "pending"
+              ? `exhaust:v2:${"1".repeat(64)}`
+              : `exhaust:v2:${"2".repeat(64)}`,
+            exhaustAliases: [{ kind: "legacy_hash", value: persistedAlias }],
+            deliveryFingerprint: `sha256:${"b".repeat(64)}`,
+            idempotencyKey: `persisted-${initialStatus}-alias`,
+          })
+          .expect(201);
+        const [historical] = await db.insert(issues).values({
+          companyId,
+          parentId: parent.id,
+          title: `Later ${initialStatus} historical alias`,
+          status: "done",
+          priority: "medium",
+          exhaustIdentity: historicalIdentity,
+          description: [
+            historicalIdentity,
+            `legacy-identity: ${historicalAlias}`,
+            `parent-id: ${parent.id}`,
+            `source-issue-id: ${source.id}`,
+          ].join("\n"),
+        }).returning();
+        await db.execute(sql`
+          insert into exhaust_alias_backfill_state
+            (company_id, status, attempt_count, next_retry_at, last_error)
+          values
+            (${companyId}::uuid, ${initialStatus}, ${initialStatus === "failed" ? 1 : 0},
+             ${initialStatus === "failed" ? sql`now() - interval '1 second'` : sql`null`},
+             ${initialStatus === "failed" ? "injected transient failure" : null})
+          on conflict (company_id) do update
+            set status = excluded.status,
+                attempt_count = excluded.attempt_count,
+                next_retry_at = excluded.next_retry_at,
+                last_error = excluded.last_error,
+                cursor_issue_id = null
+        `);
+
+        const persisted = await request(app)
+          .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
+          .query({
+            kind: "legacy_hash",
+            value: persistedAlias,
+            sourceIssueId: source.id,
+            workParentId: parent.id,
+          })
+          .expect(200);
+        expect(persisted.body.id).toBe(created.body.id);
+
+        const [state] = Array.from(await db.execute(sql<{
+          status: string;
+          processed_count: number;
+        }>`
+          select status, processed_count
+          from exhaust_alias_backfill_state
+          where company_id = ${companyId}::uuid
+        `));
+        expect(state.status).toBe("complete");
+        expect(state.processed_count).toBeGreaterThan(0);
+        const backfilled = await request(app)
+          .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
+          .query({
+            kind: "identity_v1",
+            value: historicalAlias,
+            sourceIssueId: source.id,
+            workParentId: parent.id,
+          })
+          .expect(200);
+        expect(backfilled.body.id).toBe(historical.id);
+      },
+    );
+
     it("backfills only an explicit structured control block and validates alias input", async () => {
       const companyId = await seedCompany();
       const parent = await seedParent(companyId);

@@ -6228,8 +6228,9 @@ export function issueService(db: Db) {
       };
 
       const persisted = resolveMatches(await findMatches());
-      if (persisted) return persisted;
-      if (!(await ensureBackfillReady())) return { kind: "not_ready" as const };
+      if (!(await ensureBackfillReady())) {
+        return persisted ?? { kind: "not_ready" as const };
+      }
       return resolveMatches(await findMatches()) ?? { kind: "not_found" as const };
     },
 

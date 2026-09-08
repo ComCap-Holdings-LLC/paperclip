@@ -796,12 +796,15 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
         .expect(409, { code: "EXHAUST_ALIAS_AMBIGUOUS", error: "Exhaust alias is ambiguous" });
 
       await db.execute(sql`
-        update exhaust_alias_backfill_state
-        set status = 'failed',
-            attempt_count = 1,
-            next_retry_at = now() + interval '1 hour',
-            last_error = 'injected transient failure'
-        where company_id = ${companyId}
+        insert into exhaust_alias_backfill_state
+          (company_id, status, attempt_count, next_retry_at, last_error)
+        values
+          (${companyId}::uuid, 'failed', 1, now() + interval '1 hour', 'injected transient failure')
+        on conflict (company_id) do update
+          set status = excluded.status,
+              attempt_count = excluded.attempt_count,
+              next_retry_at = excluded.next_retry_at,
+              last_error = excluded.last_error
       `);
       const [beforeRetry] = Array.from(await db.execute(sql<{ processed_count: number }>`
         select processed_count
@@ -846,6 +849,53 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
       expect(recoveredState).toEqual({ status: "complete", last_error: null });
     });
 
+    it("returns a persisted scoped alias during backfill cooldown but keeps unknown aliases not-ready", async () => {
+      const companyId = await seedCompany();
+      const parent = await seedParent(companyId);
+      const source = await seedParent(companyId);
+      const app = createApp();
+      const alias = "abcdef0123456789";
+      const deliveryFingerprint = `sha256:${"a".repeat(64)}`;
+      const created = await request(app)
+        .post(`/api/companies/${companyId}/issues`)
+        .send({
+          parentId: parent.id,
+          sourceIssueId: source.id,
+          title: "Persisted alias during cooldown",
+          exhaustIdentity,
+          exhaustAliases: [{ kind: "legacy_hash", value: alias }],
+          deliveryFingerprint,
+          idempotencyKey: "persisted-alias-during-cooldown",
+        })
+        .expect(201);
+      await db.execute(sql`
+        insert into exhaust_alias_backfill_state
+          (company_id, status, attempt_count, next_retry_at, last_error)
+        values
+          (${companyId}::uuid, 'failed', 1, now() + interval '1 hour', 'injected transient failure')
+        on conflict (company_id) do update
+          set status = excluded.status,
+              attempt_count = excluded.attempt_count,
+              next_retry_at = excluded.next_retry_at,
+              last_error = excluded.last_error
+      `);
+
+      const persisted = await request(app)
+        .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
+        .query({ kind: "legacy_hash", value: alias, sourceIssueId: source.id, workParentId: parent.id })
+        .expect(200);
+      expect(persisted.body).toMatchObject({
+        id: created.body.id,
+        exhaustIdentity,
+        sourceIssueId: source.id,
+        workParentId: parent.id,
+      });
+      await request(app)
+        .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
+        .query({ kind: "legacy_hash", value: "0000000000000000", sourceIssueId: source.id, workParentId: parent.id })
+        .expect(503, { code: "EXHAUST_ALIAS_NOT_READY", error: "Exhaust alias index is not ready" });
+    });
+
     it("backfills only an explicit structured control block and validates alias input", async () => {
       const companyId = await seedCompany();
       const parent = await seedParent(companyId);
@@ -884,6 +934,73 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
         .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
         .query({ kind: "legacy_hash", value: "not-a-hash", sourceIssueId: source.id, workParentId: parent.id })
         .expect(400);
+    });
+
+    it("quarantines a poison historical control block and advances to a later valid alias", async () => {
+      const companyId = await seedCompany();
+      const parent = await seedParent(companyId);
+      const source = await seedParent(companyId);
+      const app = createApp();
+      const poisonId = "10000000-0000-4000-8000-000000000001";
+      const validId = "20000000-0000-4000-8000-000000000002";
+      const validAlias = `exhaust-finding:v1:sha256:${"7".repeat(64)}`;
+      await db.insert(issues).values([
+        {
+          id: poisonId,
+          companyId,
+          parentId: parent.id,
+          title: "Poison historical alias row",
+          status: "cancelled",
+          priority: "medium",
+          exhaustIdentity: `exhaust:v2:${"6".repeat(64)}`,
+          description: [
+            `exhaust:v2:${"6".repeat(64)}`,
+            `legacy-identity: exhaust-finding:v1:sha256:${"6".repeat(64)}`,
+            `parent-id: ${parent.id}`,
+            "source-issue-id: definitely-not-a-uuid",
+          ].join("\n"),
+        },
+        {
+          id: validId,
+          companyId,
+          parentId: parent.id,
+          title: "Later valid historical alias row",
+          status: "done",
+          priority: "medium",
+          exhaustIdentity: `exhaust:v2:${"7".repeat(64)}`,
+          description: [
+            `exhaust:v2:${"7".repeat(64)}`,
+            `legacy-identity: ${validAlias}`,
+            `parent-id: ${parent.id}`,
+            `source-issue-id: ${source.id}`,
+          ].join("\n"),
+        },
+      ]);
+      await db.execute(sql`delete from exhaust_alias_backfill_state where company_id = ${companyId}`);
+
+      const lookup = await request(app)
+        .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
+        .query({ kind: "identity_v1", value: validAlias, sourceIssueId: source.id, workParentId: parent.id })
+        .expect(200);
+      expect(lookup.body).toMatchObject({ id: validId, status: "done" });
+      const [state] = Array.from(await db.execute(sql<{
+        cursor_issue_id: string | null;
+        status: string;
+        processed_count: number;
+        skipped_count: number;
+        last_error: string | null;
+      }>`
+        select cursor_issue_id, status, processed_count, skipped_count, last_error
+        from exhaust_alias_backfill_state
+        where company_id = ${companyId}::uuid
+      `));
+      expect(state).toEqual({
+        cursor_issue_id: validId,
+        status: "complete",
+        processed_count: 2,
+        skipped_count: 1,
+        last_error: `skipped issue ${poisonId}: invalid structured control block`,
+      });
     });
   });
 });

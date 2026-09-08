@@ -6055,6 +6055,50 @@ export function issueService(db: Db) {
       sourceIssueId: string;
       workParentId: string;
     }) => {
+      const findMatches = async () => Array.from(await db.execute(sql<{
+        id: string;
+        identifier: string;
+        company_id: string;
+        parent_id: string | null;
+        exhaust_identity: string;
+        status: string;
+        source_issue_id: string;
+        work_parent_id: string;
+        delivery_fingerprint: string | null;
+      }>`
+        select i.id, i.identifier, i.company_id, i.parent_id, i.exhaust_identity, i.status,
+               a.source_issue_id, a.work_parent_id, a.delivery_fingerprint
+        from exhaust_issue_aliases a
+        join issues i on i.id = a.issue_id and i.company_id = a.company_id
+        where a.company_id = ${companyId}::uuid
+          and a.kind = ${query.kind}
+          and a.value = ${query.value}
+          and a.source_issue_id = ${query.sourceIssueId}::uuid
+          and a.work_parent_id = ${query.workParentId}::uuid
+        order by i.id asc
+        limit 2
+      `));
+
+      const resolveMatches = (matches: Awaited<ReturnType<typeof findMatches>>) => {
+        if (matches.length === 0) return null;
+        if (matches.length > 1) return { kind: "ambiguous" as const };
+        const [match] = matches;
+        return {
+          kind: "found" as const,
+          receipt: {
+            id: match.id,
+            identifier: match.identifier,
+            companyId: match.company_id,
+            parentId: match.parent_id,
+            exhaustIdentity: match.exhaust_identity,
+            status: match.status,
+            sourceIssueId: match.source_issue_id,
+            workParentId: match.work_parent_id,
+            deliveryFingerprint: match.delivery_fingerprint,
+          },
+        };
+      };
+
       const ensureBackfillReady = async () => {
         try {
           return await db.transaction(async (tx) => {
@@ -6099,21 +6143,50 @@ export function issueService(db: Db) {
               limit ${EXHAUST_ALIAS_BACKFILL_BATCH_SIZE}
             `)) as Array<{ id: string; parent_id: string | null; description: string | null }>;
             let skipped = 0;
+            let lastSkipError: string | null = null;
             for (const row of historical) {
-              const controls = parseStructuredExhaustControlBlock(row.description);
-              if (!controls || controls.workParentId !== row.parent_id) {
+              let controls: ReturnType<typeof parseStructuredExhaustControlBlock>;
+              try {
+                controls = parseStructuredExhaustControlBlock(row.description);
+              } catch {
+                controls = null;
+              }
+              if (
+                !controls
+                || !isUuidLike(controls.sourceIssueId)
+                || !isUuidLike(controls.workParentId)
+                || controls.workParentId !== row.parent_id
+              ) {
+                const [persistedAlias] = Array.from(await tx.execute(sql<{ present: boolean }>`
+                  select true as present
+                  from exhaust_issue_aliases
+                  where company_id = ${companyId}::uuid
+                    and issue_id = ${row.id}::uuid
+                  limit 1
+                `));
+                if (persistedAlias?.present) continue;
                 skipped += 1;
+                lastSkipError = `skipped issue ${row.id}: invalid structured control block`;
                 continue;
               }
-              for (const alias of controls.aliases) {
-                await tx.execute(sql`
-                  insert into exhaust_issue_aliases
-                    (company_id, issue_id, kind, value, source_issue_id, work_parent_id)
-                  values
-                    (${companyId}::uuid, ${row.id}::uuid, ${alias.kind}, ${alias.value},
-                     ${controls.sourceIssueId}::uuid, ${controls.workParentId}::uuid)
-                  on conflict (issue_id, kind, value) do nothing
-                `);
+              const validControls = controls;
+              try {
+                await tx.transaction(async (rowTx) => {
+                  for (const alias of validControls.aliases) {
+                    await rowTx.execute(sql`
+                      insert into exhaust_issue_aliases
+                        (company_id, issue_id, kind, value, source_issue_id, work_parent_id)
+                      values
+                        (${companyId}::uuid, ${row.id}::uuid, ${alias.kind}, ${alias.value},
+                         ${validControls.sourceIssueId}::uuid, ${validControls.workParentId}::uuid)
+                      on conflict (issue_id, kind, value) do nothing
+                    `);
+                  }
+                });
+              } catch (error) {
+                skipped += 1;
+                lastSkipError = `skipped issue ${row.id}: alias persistence failed`;
+                logger.warn({ error, companyId, issueId: row.id }, "Skipping invalid exhaust alias backfill row");
               }
             }
             const complete = historical.length < EXHAUST_ALIAS_BACKFILL_BATCH_SIZE;
@@ -6125,7 +6198,7 @@ export function issueService(db: Db) {
                   skipped_count = skipped_count + ${skipped},
                   attempt_count = 0,
                   next_retry_at = null,
-                  last_error = null,
+                  last_error = ${lastSkipError},
                   updated_at = now()
               where company_id = ${companyId}::uuid
             `);
@@ -6154,47 +6227,10 @@ export function issueService(db: Db) {
         }
       };
 
+      const persisted = resolveMatches(await findMatches());
+      if (persisted) return persisted;
       if (!(await ensureBackfillReady())) return { kind: "not_ready" as const };
-      const matches = Array.from(await db.execute(sql<{
-        id: string;
-        identifier: string;
-        company_id: string;
-        parent_id: string | null;
-        exhaust_identity: string;
-        status: string;
-        source_issue_id: string;
-        work_parent_id: string;
-        delivery_fingerprint: string | null;
-      }>`
-        select i.id, i.identifier, i.company_id, i.parent_id, i.exhaust_identity, i.status,
-               a.source_issue_id, a.work_parent_id, a.delivery_fingerprint
-        from exhaust_issue_aliases a
-        join issues i on i.id = a.issue_id and i.company_id = a.company_id
-        where a.company_id = ${companyId}::uuid
-          and a.kind = ${query.kind}
-          and a.value = ${query.value}
-          and a.source_issue_id = ${query.sourceIssueId}::uuid
-          and a.work_parent_id = ${query.workParentId}::uuid
-        order by i.id asc
-        limit 2
-      `));
-      if (matches.length === 0) return { kind: "not_found" as const };
-      if (matches.length > 1) return { kind: "ambiguous" as const };
-      const [match] = matches;
-      return {
-        kind: "found" as const,
-        receipt: {
-          id: match.id,
-          identifier: match.identifier,
-          companyId: match.company_id,
-          parentId: match.parent_id,
-          exhaustIdentity: match.exhaust_identity,
-          status: match.status,
-          sourceIssueId: match.source_issue_id,
-          workParentId: match.work_parent_id,
-          deliveryFingerprint: match.delivery_fingerprint,
-        },
-      };
+      return resolveMatches(await findMatches()) ?? { kind: "not_found" as const };
     },
 
     getCurrentScheduledRetry: async (issueId: string) => {

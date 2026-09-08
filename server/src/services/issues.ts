@@ -7009,8 +7009,12 @@ export function issueService(db: Db) {
         idempotencyKey: rawIdempotencyKey,
         allowDuplicate,
         onDeduplicated,
-        ...issueData
+        ...rawIssueData
       } = data;
+      const idempotencyKey = rawIdempotencyKey?.trim() || null;
+      const exhaustIdentity = rawIssueData.exhaustIdentity?.trim() || null;
+      const issueData = { ...rawIssueData, exhaustIdentity };
+      const canonicalData = { ...data, exhaustIdentity };
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
@@ -7029,15 +7033,13 @@ export function issueService(db: Db) {
       if (data.status === "in_progress" && !data.assigneeAgentId && !data.assigneeUserId) {
         throw unprocessable("in_progress issues require an assignee");
       }
-      const idempotencyKey = rawIdempotencyKey?.trim() || null;
-      const exhaustIdentity = issueData.exhaustIdentity?.trim() || null;
       if (exhaustIdentity && !EXHAUST_V2_IDENTITY_PATTERN.test(exhaustIdentity)) {
         throw unprocessable("Invalid exhaustIdentity; expected exhaust:v2:<64 lowercase hex characters>");
       }
       if (exhaustIdentity && !idempotencyKey) {
         throw unprocessable("exhaustIdentity requires idempotencyKey");
       }
-      const requestFingerprint = exhaustIdentity ? issueCreateRequestFingerprint(data) : null;
+      const requestFingerprint = exhaustIdentity ? issueCreateRequestFingerprint(canonicalData) : null;
       return db.transaction(async (tx) => {
         const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
         if (allowDuplicate === false) {
@@ -7101,11 +7103,11 @@ export function issueService(db: Db) {
             .limit(1)
             .then((rows) => rows[0] ?? null);
           if (existingMapping) {
+            if (existingMapping.requestFingerprint != null && existingMapping.requestFingerprint !== requestFingerprint) {
+              throw conflict("Idempotency key was already used for a different request");
+            }
             if (requestFingerprint && existingMapping.requestFingerprint == null) {
               throw conflict("Legacy idempotency mapping cannot be replayed as a fingerprinted exhaust request");
-            }
-            if (requestFingerprint && existingMapping.requestFingerprint !== requestFingerprint) {
-              throw conflict("Idempotency key was already used for a different request");
             }
             if (exhaustIdentity && existingMapping.issue.exhaustIdentity !== exhaustIdentity) {
               throw conflict("Idempotency key was already used for a different exhaust identity");

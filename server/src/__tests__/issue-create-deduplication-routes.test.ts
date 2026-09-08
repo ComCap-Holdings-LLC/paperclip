@@ -344,6 +344,52 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
   describe("versioned exhaust identity creates", () => {
     const exhaustIdentity = `exhaust:v2:${"a".repeat(64)}`;
 
+    it("canonicalizes identity whitespace before fingerprinting and persistence", async () => {
+      const companyId = await seedCompany();
+      const parent = await seedParent(companyId);
+      const svc = issueService(db);
+      const idempotencyKey = "canonical-whitespace-key";
+
+      const first = await svc.create(companyId, {
+        parentId: parent.id,
+        title: "Canonical finding",
+        exhaustIdentity: `  ${exhaustIdentity}  `,
+        idempotencyKey,
+      });
+      const replay = await svc.create(companyId, {
+        parentId: parent.id,
+        title: "Canonical finding",
+        exhaustIdentity,
+        idempotencyKey,
+      });
+
+      expect(replay.id).toBe(first.id);
+      expect(first.exhaustIdentity).toBe(exhaustIdentity);
+      expect(await db.select().from(issues).where(eq(issues.exhaustIdentity, exhaustIdentity))).toHaveLength(1);
+    });
+
+    it("rejects a non-fingerprinted replay of an existing fingerprinted key", async () => {
+      const companyId = await seedCompany();
+      const parent = await seedParent(companyId);
+      const app = createApp();
+      const idempotencyKey = "fingerprinted-key-without-identity";
+
+      const first = await request(app)
+        .post(`/api/companies/${companyId}/issues`)
+        .send({ parentId: parent.id, title: "Fingerprinted finding", exhaustIdentity, idempotencyKey })
+        .expect(201);
+      const conflict = await request(app)
+        .post(`/api/companies/${companyId}/issues`)
+        .send({ parentId: parent.id, title: "Fingerprinted finding", idempotencyKey })
+        .expect(409);
+
+      expect(conflict.body.error).toMatch(/idempotency key.*different request/i);
+      const persistedIssues = await db.select().from(issues);
+      expect(persistedIssues).toHaveLength(2);
+      expect(persistedIssues).toContainEqual(expect.objectContaining({ id: first.body.id, exhaustIdentity }));
+      expect(await db.select().from(issueCreateIdempotencyKeys)).toHaveLength(1);
+    });
+
     it("durably replays the same key and fingerprint while preserving a terminal receipt", async () => {
       const companyId = await seedCompany();
       const parent = await seedParent(companyId);

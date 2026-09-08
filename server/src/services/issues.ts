@@ -702,6 +702,7 @@ type IssueUserContextInput = {
 };
 type ProjectGoalReader = Pick<Db, "select">;
 type DbReader = Pick<Db, "select">;
+type IssueCreateDeduplicationReason = "idempotency_key" | "exhaust_identity" | "recent_open_title";
 type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   labelIds?: string[];
   blockedByIssueIds?: string[];
@@ -714,7 +715,7 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   trustExplicitResponsibleUserId?: boolean;
   idempotencyKey?: string | null;
   allowDuplicate?: boolean;
-  onDeduplicated?: (reason: "idempotency_key" | "recent_open_title") => void;
+  onDeduplicated?: (reason: IssueCreateDeduplicationReason) => void;
 };
 type IssueChildCreateInput = IssueCreateInput & {
   acceptanceCriteria?: string[];
@@ -7054,7 +7055,23 @@ export function issueService(db: Db) {
         }
 
         let existingIssue: typeof issues.$inferSelect | undefined;
-        let deduplicationReason: "idempotency_key" | "recent_open_title" | null = null;
+        let deduplicationReason: IssueCreateDeduplicationReason | null = null;
+        const assertMatchingExhaustFingerprint = async (issueId: string, message: string) => {
+          const mappings = await tx
+            .select({ requestFingerprint: issueCreateIdempotencyKeys.requestFingerprint })
+            .from(issueCreateIdempotencyKeys)
+            .where(and(
+              eq(issueCreateIdempotencyKeys.companyId, companyId),
+              eq(issueCreateIdempotencyKeys.issueId, issueId),
+            ));
+          if (
+            !requestFingerprint ||
+            mappings.length === 0 ||
+            mappings.some((mapping) => mapping.requestFingerprint !== requestFingerprint)
+          ) {
+            throw conflict(message);
+          }
+        };
         if (idempotencyKey) {
           const idempotencyKeyRetentionCutoff = new Date(Date.now() - ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_MS);
           await tx.execute(sql`
@@ -7108,21 +7125,12 @@ export function issueService(db: Db) {
             .limit(1)
             .then((rows) => rows[0] ?? null);
           if (identityMatch) {
-            const matchingFingerprint = await tx
-              .select({ requestFingerprint: issueCreateIdempotencyKeys.requestFingerprint })
-              .from(issueCreateIdempotencyKeys)
-              .where(and(
-                eq(issueCreateIdempotencyKeys.companyId, companyId),
-                eq(issueCreateIdempotencyKeys.issueId, identityMatch.id),
-                eq(issueCreateIdempotencyKeys.requestFingerprint, requestFingerprint),
-              ))
-              .limit(1)
-              .then((rows) => rows[0] ?? null);
-            if (!matchingFingerprint) {
-              throw conflict("Exhaust identity was already used for a different request");
-            }
+            await assertMatchingExhaustFingerprint(
+              identityMatch.id,
+              "Exhaust identity was already used for a different request",
+            );
             existingIssue = identityMatch;
-            deduplicationReason = "idempotency_key";
+            deduplicationReason = "exhaust_identity";
           }
         }
         if (!existingIssue && !exhaustIdentity && allowDuplicate === false) {
@@ -7340,6 +7348,9 @@ export function issueService(db: Db) {
 
         let issue: typeof issues.$inferSelect;
         try {
+          // The savepoint keeps the outer transaction usable after PostgreSQL
+          // aborts this statement on a unique-identity violation. Recovery then
+          // rereads and validates the authoritative winner in the outer tx.
           [issue] = await tx.transaction(async (insertTx) => insertTx.insert(issues).values(values).returning());
         } catch (error) {
           if (!exhaustIdentity || !isUniqueViolation(error, EXHAUST_IDENTITY_UNIQUE_CONSTRAINT)) throw error;
@@ -7353,26 +7364,17 @@ export function issueService(db: Db) {
             .limit(1)
             .then((rows) => rows[0] ?? null);
           if (!winningIssue || !requestFingerprint) throw error;
-          const winningFingerprint = await tx
-            .select({ requestFingerprint: issueCreateIdempotencyKeys.requestFingerprint })
-            .from(issueCreateIdempotencyKeys)
-            .where(and(
-              eq(issueCreateIdempotencyKeys.companyId, companyId),
-              eq(issueCreateIdempotencyKeys.issueId, winningIssue.id),
-              eq(issueCreateIdempotencyKeys.requestFingerprint, requestFingerprint),
-            ))
-            .limit(1)
-            .then((rows) => rows[0] ?? null);
-          if (!winningFingerprint) {
-            throw conflict("Exhaust identity was concurrently used for a different request");
-          }
+          await assertMatchingExhaustFingerprint(
+            winningIssue.id,
+            "Exhaust identity was concurrently used for a different request",
+          );
           await tx.insert(issueCreateIdempotencyKeys).values({
             companyId,
             idempotencyKey: idempotencyKey!,
             issueId: winningIssue.id,
             requestFingerprint,
           }).onConflictDoNothing();
-          onDeduplicated?.("idempotency_key");
+          onDeduplicated?.("exhaust_identity");
           const [enriched] = await withIssueLabels(tx, [winningIssue]);
           const [withRelations] = await withIssueRelationSummaries(companyId, [enriched], tx);
           return withRelations;

@@ -424,6 +424,11 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
 
       expect([first.status, second.status].sort()).toEqual([200, 201]);
       expect(first.body.id).toBe(second.body.id);
+      const identityReplay = first.status === 200 ? first : second;
+      expect(identityReplay.body).toMatchObject({
+        deduplicated: true,
+        deduplicationReason: "exhaust_identity",
+      });
       expect(await db.select().from(issues).where(eq(issues.exhaustIdentity, exhaustIdentity))).toHaveLength(1);
       expect(await db.select().from(issueCreateIdempotencyKeys)).toHaveLength(2);
 
@@ -556,6 +561,89 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
 
       expect(response.body.error).toMatch(/legacy idempotency mapping/i);
       expect(await db.select().from(issues)).toHaveLength(2);
+    });
+
+    it.each([
+      { caseName: "has no mapping", legacyFingerprint: undefined },
+      { caseName: "has a null-fingerprint mapping", legacyFingerprint: null },
+    ])("fails closed when an identity winner $caseName", async ({ legacyFingerprint }) => {
+      const companyId = await seedCompany();
+      const parent = await seedParent(companyId);
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        parentId: parent.id,
+        exhaustIdentity,
+        title: "Legacy identity winner",
+        status: "done",
+        priority: "medium",
+      });
+      if (legacyFingerprint === null) {
+        await db.insert(issueCreateIdempotencyKeys).values({
+          companyId,
+          idempotencyKey: "legacy-winner-key",
+          issueId,
+          requestFingerprint: legacyFingerprint,
+        });
+      }
+
+      const response = await request(createApp())
+        .post(`/api/companies/${companyId}/issues`)
+        .send({
+          parentId: parent.id,
+          title: "Legacy identity winner",
+          exhaustIdentity,
+          idempotencyKey: "new-versioned-key",
+        })
+        .expect(409);
+
+      expect(response.body.error).toMatch(/identity.*different request/i);
+      const mappings = await db.select().from(issueCreateIdempotencyKeys);
+      if (legacyFingerprint === null) {
+        expect(mappings).toEqual([
+          expect.objectContaining({
+            issueId,
+            idempotencyKey: "legacy-winner-key",
+            requestFingerprint: null,
+          }),
+        ]);
+      } else {
+        expect(mappings).toEqual([]);
+      }
+    });
+
+    it("fails closed when an identity winner has a different durable fingerprint", async () => {
+      const companyId = await seedCompany();
+      const parent = await seedParent(companyId);
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        parentId: parent.id,
+        exhaustIdentity,
+        title: "Existing identity winner",
+        status: "todo",
+        priority: "medium",
+      });
+      await db.insert(issueCreateIdempotencyKeys).values({
+        companyId,
+        idempotencyKey: "existing-versioned-key",
+        issueId,
+        requestFingerprint: `sha256:${"b".repeat(64)}`,
+      });
+
+      await request(createApp())
+        .post(`/api/companies/${companyId}/issues`)
+        .send({
+          parentId: parent.id,
+          title: "Existing identity winner",
+          exhaustIdentity,
+          idempotencyKey: "new-versioned-key",
+        })
+        .expect(409);
+
+      expect(await db.select().from(issueCreateIdempotencyKeys)).toHaveLength(1);
     });
   });
 });

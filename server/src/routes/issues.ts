@@ -8339,7 +8339,7 @@ export function issueRoutes(
       projectId: createBody.projectId ?? null,
       executionPolicy,
     }, actor);
-    let deduplicationReason: "idempotency_key" | "recent_open_title" | null = null;
+    let deduplicationReason: "idempotency_key" | "exhaust_identity" | "recent_open_title" | null = null;
     const createInput = {
       ...createBody,
       ...(taskBridgeOriginForActor(req) ?? {}),
@@ -8353,7 +8353,7 @@ export function issueRoutes(
       actorResponsibleUserId: authenticatedActorResponsibleUserId(req),
       trustExplicitResponsibleUserId: actor.actorType === "user",
       watchdogActorRunId: actor.runId,
-      onDeduplicated: (reason: "idempotency_key" | "recent_open_title") => {
+      onDeduplicated: (reason: "idempotency_key" | "exhaust_identity" | "recent_open_title") => {
         deduplicationReason = reason;
       },
     };

@@ -8524,11 +8524,14 @@ export function issueService(
           .then((rows) => rows[0] ?? null);
         if (existingRun) {
           const expectedBoundVersion = input.expectedExecutionVersion + 1;
+          // Idempotency is bound to immutable checkout identity, not the run's
+          // mutable lifecycle status. Agent pause and recovery paths may mark
+          // the run terminal while deliberately retaining this exact external
+          // binding for the executor to rediscover and explicitly reconcile.
           if (
             existingRun.agentId !== input.agentId ||
             existingRun.externalExecutorIssueId !== input.issueId ||
             existingRun.externalExecutorExpectedVersion !== input.expectedExecutionVersion ||
-            existingRun.status !== "running" ||
             issue.externalExecutorRunId !== existingRun.id ||
             issue.executionVersion !== expectedBoundVersion ||
             existingRun.externalExecutorVisible !== true ||

@@ -26,6 +26,7 @@ import { issueRoutes } from "../routes/issues.js";
 import { issueTreeControlService } from "../services/issue-tree-control.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
+import { agentService } from "../services/agents.js";
 import { persistActivity } from "../services/activity-log.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import { logger } from "../middleware/logger.js";
@@ -1413,6 +1414,72 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       .where(eq(heartbeatRuns.id, checkout.body.run.id))
       .then((rows) => rows[0]);
     expect(run).toEqual({ status: "succeeded" });
+  });
+
+  it("replays an intact external checkout after the assignee is paused and its run is cancelled", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    const runKey = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Paused external executor replay",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+    const app = createApp(agentActor(companyId, agentId, currentRunId));
+    const checkout = await request(app)
+      .post(`/api/issues/${issueId}/external-executor/checkout`)
+      .send({ runKey, expectedExecutionVersion: 0, expectedStatuses: ["todo"] });
+    expect(checkout.status, JSON.stringify(checkout.body)).toBe(201);
+
+    await agentService(db).pause(agentId);
+    await heartbeatService(db).cancelActiveForAgent(agentId);
+
+    expect(await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, checkout.body.run.id))
+      .then((rows) => rows[0]))
+      .toEqual({ status: "cancelled" });
+    expect(await db
+      .select({
+        externalExecutorRunId: issues.externalExecutorRunId,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionVersion: issues.executionVersion,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]))
+      .toEqual({
+        externalExecutorRunId: checkout.body.run.id,
+        checkoutRunId: checkout.body.run.id,
+        executionRunId: checkout.body.run.id,
+        executionVersion: 1,
+      });
+
+    const replay = await request(app)
+      .post(`/api/issues/${issueId}/external-executor/checkout`)
+      .send({ runKey, expectedExecutionVersion: 0, expectedStatuses: ["todo"] });
+    expect(replay.status, JSON.stringify(replay.body)).toBe(200);
+    expect(replay.body).toMatchObject({
+      idempotent: true,
+      issue: { id: issueId, executionVersion: 1 },
+      run: { id: checkout.body.run.id, runKey, executionVersion: 1 },
+    });
+
+    const foreignReplay = await request(createApp(agentActor(companyId, randomUUID(), currentRunId)))
+      .post(`/api/issues/${issueId}/external-executor/checkout`)
+      .send({ runKey, expectedExecutionVersion: 0, expectedStatuses: ["todo"] });
+    expect(foreignReplay.status).toBe(403);
+    expect(await db
+      .select({ externalExecutorRunId: issues.externalExecutorRunId, executionVersion: issues.executionVersion })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]))
+      .toEqual({ externalExecutorRunId: checkout.body.run.id, executionVersion: 1 });
   });
 
   it("rolls back external checkout when its audit write fails", async () => {

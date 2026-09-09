@@ -562,6 +562,12 @@ export const updateIssueSchema = createIssueBaseSchema.omit({
   resume: z.boolean().optional(),
   interrupt: z.boolean().optional(),
   hiddenAt: z.string().datetime().nullable().optional(),
+  // COM-12697: compare-and-swap guard, matching checkout's expectedStatuses
+  // precedent. When present, the write is rejected with 409 unless the
+  // issue's current status (read under the same row lock as the write) is
+  // one of these -- closing the race where an unconditional PATCH can
+  // silently clobber a concurrent status change.
+  expectedStatuses: z.array(z.enum(ISSUE_STATUSES)).nonempty().optional(),
 });
 
 export type UpdateIssue = z.infer<typeof updateIssueSchema>;

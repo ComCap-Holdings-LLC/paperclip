@@ -6185,19 +6185,31 @@ export function issueService(db: Db) {
                   }
                 });
               } catch (error) {
-                for (const alias of validControls.aliases) {
-                  await tx.execute(sql`
-                    insert into exhaust_issue_alias_conflicts
-                      (company_id, issue_id, kind, value, source_issue_id, work_parent_id, reason)
-                    values
-                      (${companyId}::uuid, ${row.id}::uuid, ${alias.kind}, ${alias.value},
-                       ${validControls.sourceIssueId}::uuid, ${validControls.workParentId}::uuid,
-                       'backfill_claim_conflict')
-                    on conflict (issue_id, kind, value) do nothing
-                  `);
+                const quarantineReason = isUniqueViolation(error, EXHAUST_ALIAS_CLAIM_UNIQUE_CONSTRAINT)
+                  ? "backfill_claim_conflict"
+                  : "backfill_persistence_error";
+                try {
+                  await tx.transaction(async (quarantineTx) => {
+                    for (const alias of validControls.aliases) {
+                      await quarantineTx.execute(sql`
+                        insert into exhaust_issue_alias_conflicts
+                          (company_id, issue_id, kind, value, source_issue_id, work_parent_id, reason)
+                        values
+                          (${companyId}::uuid, ${row.id}::uuid, ${alias.kind}, ${alias.value},
+                           ${validControls.sourceIssueId}::uuid, ${validControls.workParentId}::uuid,
+                           ${quarantineReason})
+                        on conflict (issue_id, kind, value) do nothing
+                      `);
+                    }
+                  });
+                } catch (quarantineError) {
+                  logger.error(
+                    { error: quarantineError, companyId, issueId: row.id, reason: quarantineReason },
+                    "Failed to persist exhaust alias backfill quarantine record",
+                  );
                 }
                 skipped += 1;
-                lastSkipError = `skipped issue ${row.id}: alias persistence failed`;
+                lastSkipError = `skipped issue ${row.id}: ${quarantineReason}`;
                 logger.warn({ error, companyId, issueId: row.id }, "Skipping invalid exhaust alias backfill row");
               }
             }
@@ -7380,15 +7392,16 @@ export function issueService(db: Db) {
           const exhaustIdentityGuardKey = `issue-create:exhaust-identity:${companyId}:${exhaustIdentity}`;
           await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${exhaustIdentityGuardKey}, 0))`);
         }
-        for (const alias of exhaustAliases) {
-          const aliasGuardKey = [
-            "issue-create:exhaust-alias",
-            companyId,
-            alias.kind,
-            alias.value,
-            sourceIssueId,
-            issueData.parentId,
-          ].join(":");
+        const aliasGuardKeys = exhaustAliases.map((alias) => [
+          "issue-create:exhaust-alias",
+          companyId,
+          alias.kind,
+          alias.value,
+          sourceIssueId,
+          issueData.parentId,
+        ].join(":"))
+          .sort((left, right) => left.localeCompare(right));
+        for (const aliasGuardKey of aliasGuardKeys) {
           await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${aliasGuardKey}, 0))`);
         }
 

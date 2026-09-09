@@ -1160,29 +1160,30 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
       }
     });
 
-    it("atomically claims one scoped alias across concurrent identities", async () => {
+    it("atomically claims aliases in canonical order across reversed concurrent requests", async () => {
       const companyId = await seedCompany();
       const parent = await seedParent(companyId);
       const source = await seedParent(companyId);
       const app = createApp();
       const alias = "5555555555555555";
       const identityAlias = `exhaust-finding:v1:sha256:${"5".repeat(64)}`;
-      const create = (suffix: string) => request(app)
+      const aliases = [
+        { kind: "identity_v1" as const, value: identityAlias },
+        { kind: "legacy_hash" as const, value: alias },
+      ];
+      const create = (suffix: string, requestAliases: typeof aliases) => request(app)
         .post(`/api/companies/${companyId}/issues`)
         .send({
           parentId: parent.id,
           sourceIssueId: source.id,
           title: "Concurrent alias claim",
           exhaustIdentity: `exhaust:v2:${suffix.repeat(64)}`,
-          exhaustAliases: [
-            { kind: "identity_v1", value: identityAlias },
-            { kind: "legacy_hash", value: alias },
-          ],
+          exhaustAliases: requestAliases,
           deliveryFingerprint: `sha256:${"e".repeat(64)}`,
           idempotencyKey: `concurrent-alias-${suffix}`,
         });
 
-      const responses = await Promise.all([create("6"), create("7")]);
+      const responses = await Promise.all([create("6", aliases), create("7", [...aliases].reverse())]);
       expect(responses.map((response) => response.status).sort()).toEqual([201, 409]);
       const claimed = Array.from(await db.execute(sql<{ issue_id: string; kind: string }>`
         select issue_id, kind from exhaust_issue_aliases
@@ -1247,6 +1248,111 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
           and value = ${alias}
       `));
       expect(conflicts).toEqual([{ issue_id: historical.id, reason: "backfill_claim_conflict" }]);
+    });
+
+    it("classifies a non-claim backfill insert fault accurately and continues progress", async () => {
+      const companyId = await seedCompany();
+      const parent = await seedParent(companyId);
+      const source = await seedParent(companyId);
+      const app = createApp();
+      const alias = "9090909090909090";
+      const [historical] = await db.insert(issues).values({
+        companyId,
+        parentId: parent.id,
+        title: "Historical alias with injected persistence fault",
+        status: "done",
+        priority: "medium",
+        exhaustIdentity: `exhaust:v2:${"a".repeat(64)}`,
+        description: [
+          `exhaust:v2:${"a".repeat(64)}`,
+          `exhaust-hash: ${alias}`,
+          `parent-id: ${parent.id}`,
+          `source-issue-id: ${source.id}`,
+        ].join("\n"),
+      }).returning();
+      const [historicalUnquarantinable] = await db.insert(issues).values({
+        companyId,
+        parentId: parent.id,
+        title: "Historical alias with injected quarantine fault",
+        status: "done",
+        priority: "medium",
+        exhaustIdentity: `exhaust:v2:${"b".repeat(64)}`,
+        description: [
+          `exhaust:v2:${"b".repeat(64)}`,
+          "exhaust-hash: 9191919191919191",
+          `parent-id: ${parent.id}`,
+          `source-issue-id: ${source.id}`,
+        ].join("\n"),
+      }).returning();
+      await db.execute(sql`
+        create or replace function test_fail_nonclaim_alias_insert()
+        returns trigger language plpgsql as $$
+        begin
+          if new.issue_id in (
+            '${sql.raw(historical.id)}'::uuid,
+            '${sql.raw(historicalUnquarantinable.id)}'::uuid
+          ) then
+            raise exception 'injected non-claim persistence failure';
+          end if;
+          return new;
+        end
+        $$
+      `);
+      await db.execute(sql`
+        create trigger test_fail_nonclaim_alias_insert
+        before insert on exhaust_issue_aliases
+        for each row execute function test_fail_nonclaim_alias_insert()
+      `);
+      await db.execute(sql`
+        create or replace function test_fail_alias_quarantine_insert()
+        returns trigger language plpgsql as $$
+        begin
+          if new.issue_id = '${sql.raw(historicalUnquarantinable.id)}'::uuid then
+            raise exception 'injected quarantine persistence failure';
+          end if;
+          return new;
+        end
+        $$
+      `);
+      await db.execute(sql`
+        create trigger test_fail_alias_quarantine_insert
+        before insert on exhaust_issue_alias_conflicts
+        for each row execute function test_fail_alias_quarantine_insert()
+      `);
+      await db.execute(sql`
+        insert into exhaust_alias_backfill_state (company_id, status)
+        values (${companyId}::uuid, 'pending')
+        on conflict (company_id) do update set status = 'pending', cursor_issue_id = null
+      `);
+
+      try {
+        await request(app)
+          .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
+          .query({ kind: "legacy_hash", value: alias, sourceIssueId: source.id, workParentId: parent.id })
+          .expect(404, { code: "EXHAUST_ALIAS_NOT_FOUND", error: "Exhaust alias not found" });
+        const [conflict] = Array.from(await db.execute(sql<{ reason: string }>`
+          select reason
+          from exhaust_issue_alias_conflicts
+          where company_id = ${companyId}::uuid and issue_id = ${historical.id}::uuid
+        `));
+        expect(conflict.reason).toBe("backfill_persistence_error");
+        const [state] = Array.from(await db.execute(sql<{ status: string; skipped_count: number }>`
+          select status, skipped_count
+          from exhaust_alias_backfill_state
+          where company_id = ${companyId}::uuid
+        `));
+        expect(state).toMatchObject({ status: "complete", skipped_count: 2 });
+        const unpersistedQuarantine = Array.from(await db.execute(sql`
+          select id from exhaust_issue_alias_conflicts
+          where issue_id = ${historicalUnquarantinable.id}::uuid
+        `));
+        expect(unpersistedQuarantine).toHaveLength(0);
+      } finally {
+        await db.execute(sql`drop trigger if exists test_fail_alias_quarantine_insert on exhaust_issue_alias_conflicts`);
+        await db.execute(sql`drop function if exists test_fail_alias_quarantine_insert()`);
+        await db.execute(sql`drop trigger if exists test_fail_nonclaim_alias_insert on exhaust_issue_aliases`);
+        await db.execute(sql`drop function if exists test_fail_nonclaim_alias_insert()`);
+      }
     });
 
     it("prevents generic PATCH from releasing or remapping exhaust dedupe claims", async () => {

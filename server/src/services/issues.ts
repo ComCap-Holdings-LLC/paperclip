@@ -6207,6 +6207,7 @@ export function issueService(db: Db) {
                     { error: quarantineError, companyId, issueId: row.id, reason: quarantineReason },
                     "Failed to persist exhaust alias backfill quarantine record",
                   );
+                  throw quarantineError;
                 }
                 skipped += 1;
                 lastSkipError = `skipped issue ${row.id}: ${quarantineReason}`;

@@ -1250,7 +1250,7 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
       expect(conflicts).toEqual([{ issue_id: historical.id, reason: "backfill_claim_conflict" }]);
     });
 
-    it("classifies a non-claim backfill insert fault accurately and continues progress", async () => {
+    it("retries a non-claim backfill fault when quarantine persistence fails", async () => {
       const companyId = await seedCompany();
       const parent = await seedParent(companyId);
       const source = await seedParent(companyId);
@@ -1270,28 +1270,11 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
           `source-issue-id: ${source.id}`,
         ].join("\n"),
       }).returning();
-      const [historicalUnquarantinable] = await db.insert(issues).values({
-        companyId,
-        parentId: parent.id,
-        title: "Historical alias with injected quarantine fault",
-        status: "done",
-        priority: "medium",
-        exhaustIdentity: `exhaust:v2:${"b".repeat(64)}`,
-        description: [
-          `exhaust:v2:${"b".repeat(64)}`,
-          "exhaust-hash: 9191919191919191",
-          `parent-id: ${parent.id}`,
-          `source-issue-id: ${source.id}`,
-        ].join("\n"),
-      }).returning();
       await db.execute(sql`
         create or replace function test_fail_nonclaim_alias_insert()
         returns trigger language plpgsql as $$
         begin
-          if new.issue_id in (
-            '${sql.raw(historical.id)}'::uuid,
-            '${sql.raw(historicalUnquarantinable.id)}'::uuid
-          ) then
+          if new.issue_id = '${sql.raw(historical.id)}'::uuid then
             raise exception 'injected non-claim persistence failure';
           end if;
           return new;
@@ -1307,7 +1290,7 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
         create or replace function test_fail_alias_quarantine_insert()
         returns trigger language plpgsql as $$
         begin
-          if new.issue_id = '${sql.raw(historicalUnquarantinable.id)}'::uuid then
+          if new.issue_id = '${sql.raw(historical.id)}'::uuid then
             raise exception 'injected quarantine persistence failure';
           end if;
           return new;
@@ -1329,6 +1312,36 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
         await request(app)
           .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
           .query({ kind: "legacy_hash", value: alias, sourceIssueId: source.id, workParentId: parent.id })
+          .expect(503, { code: "EXHAUST_ALIAS_NOT_READY", error: "Exhaust alias index is not ready" });
+        const [failedState] = Array.from(await db.execute(sql<{
+          status: string;
+          cursor_issue_id: string | null;
+          processed_count: number;
+          skipped_count: number;
+        }>`
+          select status, cursor_issue_id, processed_count, skipped_count
+          from exhaust_alias_backfill_state
+          where company_id = ${companyId}::uuid
+        `));
+        expect(failedState).toEqual({
+          status: "failed",
+          cursor_issue_id: null,
+          processed_count: 0,
+          skipped_count: 0,
+        });
+        expect(Array.from(await db.execute(sql`
+          select id from exhaust_issue_alias_conflicts where issue_id = ${historical.id}::uuid
+        `))).toHaveLength(0);
+
+        await db.execute(sql`drop trigger test_fail_alias_quarantine_insert on exhaust_issue_alias_conflicts`);
+        await db.execute(sql`
+          update exhaust_alias_backfill_state
+          set next_retry_at = now() - interval '1 second'
+          where company_id = ${companyId}::uuid
+        `);
+        await request(app)
+          .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
+          .query({ kind: "legacy_hash", value: alias, sourceIssueId: source.id, workParentId: parent.id })
           .expect(404, { code: "EXHAUST_ALIAS_NOT_FOUND", error: "Exhaust alias not found" });
         const [conflict] = Array.from(await db.execute(sql<{ reason: string }>`
           select reason
@@ -1336,17 +1349,22 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
           where company_id = ${companyId}::uuid and issue_id = ${historical.id}::uuid
         `));
         expect(conflict.reason).toBe("backfill_persistence_error");
-        const [state] = Array.from(await db.execute(sql<{ status: string; skipped_count: number }>`
-          select status, skipped_count
+        const [recoveredState] = Array.from(await db.execute(sql<{
+          status: string;
+          cursor_issue_id: string | null;
+          processed_count: number;
+          skipped_count: number;
+        }>`
+          select status, cursor_issue_id, processed_count, skipped_count
           from exhaust_alias_backfill_state
           where company_id = ${companyId}::uuid
         `));
-        expect(state).toMatchObject({ status: "complete", skipped_count: 2 });
-        const unpersistedQuarantine = Array.from(await db.execute(sql`
-          select id from exhaust_issue_alias_conflicts
-          where issue_id = ${historicalUnquarantinable.id}::uuid
-        `));
-        expect(unpersistedQuarantine).toHaveLength(0);
+        expect(recoveredState).toEqual({
+          status: "complete",
+          cursor_issue_id: historical.id,
+          processed_count: 1,
+          skipped_count: 1,
+        });
       } finally {
         await db.execute(sql`drop trigger if exists test_fail_alias_quarantine_insert on exhaust_issue_alias_conflicts`);
         await db.execute(sql`drop function if exists test_fail_alias_quarantine_insert()`);

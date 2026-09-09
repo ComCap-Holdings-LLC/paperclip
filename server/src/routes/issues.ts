@@ -5859,6 +5859,10 @@ export function issueRoutes(
       res.status(503).json({ code: "EXHAUST_ALIAS_NOT_READY", error: "Exhaust alias index is not ready" });
       return;
     }
+    if (result.kind === "changed") {
+      res.status(409).json({ code: "EXHAUST_ALIAS_CHANGED", error: "Exhaust alias changed during reconciliation" });
+      return;
+    }
     if (result.kind === "ambiguous") {
       res.status(409).json({ code: "EXHAUST_ALIAS_AMBIGUOUS", error: "Exhaust alias is ambiguous" });
       return;
@@ -9115,6 +9119,18 @@ export function issueRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;
+    if (
+      existing.exhaustIdentity
+      && (
+        (req.body.exhaustIdentity !== undefined && req.body.exhaustIdentity !== existing.exhaustIdentity)
+        || (req.body.parentId !== undefined && req.body.parentId !== existing.parentId)
+        || req.body.sourceIssueId !== undefined
+        || req.body.exhaustAliases !== undefined
+        || req.body.deliveryFingerprint !== undefined
+      )
+    ) {
+      throw conflict("Exhaust identity and alias scope are immutable");
+    }
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
     if (req.actor.type === "agent" && req.body.onBehalfOfUserId != null) {
       await auditAgentIssueCommentAttributionSpoof({

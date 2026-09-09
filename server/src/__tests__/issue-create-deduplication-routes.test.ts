@@ -788,12 +788,60 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
           idempotencyKey: key,
         });
       await create(exhaustIdentity, "ambiguous-a").expect(201);
-      await create(`exhaust:v2:${"e".repeat(64)}`, "ambiguous-b").expect(201);
-
-      await request(app)
-        .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
-        .query({ kind: "legacy_hash", value: alias, sourceIssueId: source.id, workParentId: parent.id })
-        .expect(409, { code: "EXHAUST_ALIAS_AMBIGUOUS", error: "Exhaust alias is ambiguous" });
+      const [historicalDuplicate] = await db.insert(issues).values({
+        companyId,
+        parentId: parent.id,
+        title: "Pre-constraint ambiguous alias",
+        status: "done",
+        priority: "medium",
+        exhaustIdentity: `exhaust:v2:${"e".repeat(64)}`,
+      }).returning();
+      await db.execute(sql`drop index exhaust_issue_aliases_company_scope_claim_uq`);
+      try {
+        await db.execute(sql`
+          insert into exhaust_issue_aliases
+            (company_id, issue_id, kind, value, source_issue_id, work_parent_id, delivery_fingerprint)
+          values
+            (${companyId}::uuid, ${historicalDuplicate.id}::uuid, 'legacy_hash', ${alias},
+             ${source.id}::uuid, ${parent.id}::uuid, ${deliveryFingerprint})
+        `);
+        await request(app)
+          .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
+          .query({ kind: "legacy_hash", value: alias, sourceIssueId: source.id, workParentId: parent.id })
+          .expect(409, { code: "EXHAUST_ALIAS_AMBIGUOUS", error: "Exhaust alias is ambiguous" });
+        await db.execute(sql`
+          update exhaust_alias_backfill_state
+          set status = 'pending', cursor_issue_id = null
+          where company_id = ${companyId}::uuid
+        `);
+        await db.execute(sql`
+          create or replace function test_resolve_ambiguous_alias_after_ready()
+          returns trigger language plpgsql as $$
+          begin
+            delete from exhaust_issue_aliases where issue_id = '${sql.raw(historicalDuplicate.id)}'::uuid;
+            return new;
+          end
+          $$
+        `);
+        await db.execute(sql`
+          create trigger test_resolve_ambiguous_alias_after_ready
+          after update on exhaust_alias_backfill_state
+          for each row when (new.status = 'complete')
+          execute function test_resolve_ambiguous_alias_after_ready()
+        `);
+        await request(app)
+          .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
+          .query({ kind: "legacy_hash", value: alias, sourceIssueId: source.id, workParentId: parent.id })
+          .expect(409, { code: "EXHAUST_ALIAS_CHANGED", error: "Exhaust alias changed during reconciliation" });
+      } finally {
+        await db.execute(sql`drop trigger if exists test_resolve_ambiguous_alias_after_ready on exhaust_alias_backfill_state`);
+        await db.execute(sql`drop function if exists test_resolve_ambiguous_alias_after_ready()`);
+        await db.execute(sql`delete from exhaust_issue_aliases where issue_id = ${historicalDuplicate.id}::uuid`);
+        await db.execute(sql`
+          create unique index exhaust_issue_aliases_company_scope_claim_uq
+          on exhaust_issue_aliases (company_id, kind, value, source_issue_id, work_parent_id)
+        `);
+      }
 
       await db.execute(sql`
         insert into exhaust_alias_backfill_state
@@ -984,7 +1032,7 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
       },
     );
 
-    it("returns not found when the authoritative post-ready reread sees no match", async () => {
+    it("returns retryable conflict when a persisted alias disappears during reconciliation", async () => {
       const companyId = await seedCompany();
       const parent = await seedParent(companyId);
       const source = await seedParent(companyId);
@@ -1033,7 +1081,7 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
         await request(app)
           .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
           .query({ kind: "legacy_hash", value: alias, sourceIssueId: source.id, workParentId: parent.id })
-          .expect(404, { code: "EXHAUST_ALIAS_NOT_FOUND", error: "Exhaust alias not found" });
+          .expect(409, { code: "EXHAUST_ALIAS_CHANGED", error: "Exhaust alias changed during reconciliation" });
         const [state] = Array.from(await db.execute(sql<{ status: string }>`
           select status
           from exhaust_alias_backfill_state
@@ -1051,6 +1099,186 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
         await db.execute(sql`drop trigger if exists test_drop_exhaust_alias_after_ready on exhaust_alias_backfill_state`);
         await db.execute(sql`drop function if exists test_drop_exhaust_alias_after_ready()`);
       }
+    });
+
+    it("returns retryable conflict when a persisted alias remaps during reconciliation", async () => {
+      const companyId = await seedCompany();
+      const parent = await seedParent(companyId);
+      const source = await seedParent(companyId);
+      const app = createApp();
+      const alias = "4444444444444444";
+      const first = await request(app)
+        .post(`/api/companies/${companyId}/issues`)
+        .send({
+          parentId: parent.id,
+          sourceIssueId: source.id,
+          title: "Alias owner before reconciliation",
+          exhaustIdentity: `exhaust:v2:${"4".repeat(64)}`,
+          exhaustAliases: [{ kind: "legacy_hash", value: alias }],
+          deliveryFingerprint: `sha256:${"d".repeat(64)}`,
+          idempotencyKey: "alias-owner-before-reconciliation",
+        })
+        .expect(201);
+      const [replacement] = await db.insert(issues).values({
+        companyId,
+        parentId: parent.id,
+        title: "Alias owner after reconciliation",
+        status: "done",
+        priority: "medium",
+        exhaustIdentity: `exhaust:v2:${"5".repeat(64)}`,
+      }).returning();
+      await db.execute(sql`
+        insert into exhaust_alias_backfill_state (company_id, status)
+        values (${companyId}::uuid, 'pending')
+        on conflict (company_id) do update set status = 'pending', cursor_issue_id = null
+      `);
+      await db.execute(sql`
+        create or replace function test_remap_exhaust_alias_after_ready()
+        returns trigger language plpgsql as $$
+        begin
+          update exhaust_issue_aliases
+          set issue_id = '${sql.raw(replacement.id)}'::uuid
+          where company_id = new.company_id and issue_id = '${sql.raw(first.body.id)}'::uuid;
+          return new;
+        end
+        $$
+      `);
+      await db.execute(sql`
+        create trigger test_remap_exhaust_alias_after_ready
+        after update on exhaust_alias_backfill_state
+        for each row when (new.status = 'complete')
+        execute function test_remap_exhaust_alias_after_ready()
+      `);
+      try {
+        await request(app)
+          .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
+          .query({ kind: "legacy_hash", value: alias, sourceIssueId: source.id, workParentId: parent.id })
+          .expect(409, { code: "EXHAUST_ALIAS_CHANGED", error: "Exhaust alias changed during reconciliation" });
+      } finally {
+        await db.execute(sql`drop trigger if exists test_remap_exhaust_alias_after_ready on exhaust_alias_backfill_state`);
+        await db.execute(sql`drop function if exists test_remap_exhaust_alias_after_ready()`);
+      }
+    });
+
+    it("atomically claims one scoped alias across concurrent identities", async () => {
+      const companyId = await seedCompany();
+      const parent = await seedParent(companyId);
+      const source = await seedParent(companyId);
+      const app = createApp();
+      const alias = "5555555555555555";
+      const identityAlias = `exhaust-finding:v1:sha256:${"5".repeat(64)}`;
+      const create = (suffix: string) => request(app)
+        .post(`/api/companies/${companyId}/issues`)
+        .send({
+          parentId: parent.id,
+          sourceIssueId: source.id,
+          title: "Concurrent alias claim",
+          exhaustIdentity: `exhaust:v2:${suffix.repeat(64)}`,
+          exhaustAliases: [
+            { kind: "identity_v1", value: identityAlias },
+            { kind: "legacy_hash", value: alias },
+          ],
+          deliveryFingerprint: `sha256:${"e".repeat(64)}`,
+          idempotencyKey: `concurrent-alias-${suffix}`,
+        });
+
+      const responses = await Promise.all([create("6"), create("7")]);
+      expect(responses.map((response) => response.status).sort()).toEqual([201, 409]);
+      const claimed = Array.from(await db.execute(sql<{ issue_id: string; kind: string }>`
+        select issue_id, kind from exhaust_issue_aliases
+        where company_id = ${companyId}::uuid
+          and ((kind = 'legacy_hash' and value = ${alias})
+            or (kind = 'identity_v1' and value = ${identityAlias}))
+        order by kind
+      `));
+      expect(claimed).toHaveLength(2);
+      expect(new Set(claimed.map((row) => row.issue_id)).size).toBe(1);
+    });
+
+    it("quarantines a duplicate historical alias claim without displacing its owner", async () => {
+      const companyId = await seedCompany();
+      const parent = await seedParent(companyId);
+      const source = await seedParent(companyId);
+      const app = createApp();
+      const alias = "6666666666666666";
+      const owner = await request(app)
+        .post(`/api/companies/${companyId}/issues`)
+        .send({
+          parentId: parent.id,
+          sourceIssueId: source.id,
+          title: "Canonical alias owner",
+          exhaustIdentity: `exhaust:v2:${"8".repeat(64)}`,
+          exhaustAliases: [{ kind: "legacy_hash", value: alias }],
+          deliveryFingerprint: `sha256:${"f".repeat(64)}`,
+          idempotencyKey: "canonical-alias-owner",
+        })
+        .expect(201);
+      const [historical] = await db.insert(issues).values({
+        companyId,
+        parentId: parent.id,
+        title: "Historical duplicate alias claimant",
+        status: "done",
+        priority: "medium",
+        exhaustIdentity: `exhaust:v2:${"9".repeat(64)}`,
+        description: [
+          `exhaust:v2:${"9".repeat(64)}`,
+          `exhaust-hash: ${alias}`,
+          `parent-id: ${parent.id}`,
+          `source-issue-id: ${source.id}`,
+        ].join("\n"),
+      }).returning();
+      await db.execute(sql`
+        insert into exhaust_alias_backfill_state (company_id, status)
+        values (${companyId}::uuid, 'pending')
+        on conflict (company_id) do update set status = 'pending', cursor_issue_id = null
+      `);
+
+      const lookup = await request(app)
+        .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
+        .query({ kind: "legacy_hash", value: alias, sourceIssueId: source.id, workParentId: parent.id })
+        .expect(200);
+      expect(lookup.body.id).toBe(owner.body.id);
+      const conflicts = Array.from(await db.execute(sql<{ issue_id: string; reason: string }>`
+        select issue_id, reason
+        from exhaust_issue_alias_conflicts
+        where company_id = ${companyId}::uuid
+          and issue_id = ${historical.id}::uuid
+          and kind = 'legacy_hash'
+          and value = ${alias}
+      `));
+      expect(conflicts).toEqual([{ issue_id: historical.id, reason: "backfill_claim_conflict" }]);
+    });
+
+    it("prevents generic PATCH from releasing or remapping exhaust dedupe claims", async () => {
+      const companyId = await seedCompany();
+      const parent = await seedParent(companyId);
+      const replacementParent = await seedParent(companyId);
+      const source = await seedParent(companyId);
+      const app = createApp();
+      const identity = `exhaust:v2:${"d".repeat(64)}`;
+      const alias = "7777777777777777";
+      const created = await request(app)
+        .post(`/api/companies/${companyId}/issues`)
+        .send({
+          parentId: parent.id,
+          sourceIssueId: source.id,
+          title: "Immutable dedupe claims",
+          exhaustIdentity: identity,
+          exhaustAliases: [{ kind: "legacy_hash", value: alias }],
+          deliveryFingerprint: `sha256:${"1".repeat(64)}`,
+          idempotencyKey: "immutable-dedupe-claims",
+        })
+        .expect(201);
+
+      await request(app).patch(`/api/issues/${created.body.id}`).send({ exhaustIdentity: null }).expect(409);
+      await request(app).patch(`/api/issues/${created.body.id}`).send({ parentId: replacementParent.id }).expect(409);
+      await request(app).patch(`/api/issues/${created.body.id}`).send({
+        sourceIssueId: replacementParent.id,
+        exhaustAliases: [{ kind: "legacy_hash", value: "8888888888888888" }],
+        deliveryFingerprint: `sha256:${"2".repeat(64)}`,
+      }).expect(409);
+      const [unchanged] = await db.select().from(issues).where(eq(issues.id, created.body.id));
+      expect(unchanged).toMatchObject({ exhaustIdentity: identity, parentId: parent.id });
     });
 
     it("backfills only an explicit structured control block and validates alias input", async () => {

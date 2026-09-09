@@ -171,6 +171,7 @@ const EXHAUST_V1_IDENTITY_PATTERN = /^exhaust-finding:v1:sha256:[a-f0-9]{64}$/;
 const EXHAUST_LEGACY_HASH_PATTERN = /^[a-f0-9]{16}$/;
 const EXHAUST_DELIVERY_FINGERPRINT_PATTERN = /^sha256:[a-f0-9]{64}$/;
 const EXHAUST_IDENTITY_UNIQUE_CONSTRAINT = "issues_company_exhaust_identity_uq";
+const EXHAUST_ALIAS_CLAIM_UNIQUE_CONSTRAINT = "exhaust_issue_aliases_company_scope_claim_uq";
 const EXHAUST_ALIAS_BACKFILL_BATCH_SIZE = 250;
 const DELETED_ISSUE_COMMENT_BODY = "";
 const ISSUE_WAKE_DIAGNOSTICS_ACTIVITY_ACTIONS = ["issue.tree_hold_wakeup_deferred"] as const;
@@ -6184,6 +6185,17 @@ export function issueService(db: Db) {
                   }
                 });
               } catch (error) {
+                for (const alias of validControls.aliases) {
+                  await tx.execute(sql`
+                    insert into exhaust_issue_alias_conflicts
+                      (company_id, issue_id, kind, value, source_issue_id, work_parent_id, reason)
+                    values
+                      (${companyId}::uuid, ${row.id}::uuid, ${alias.kind}, ${alias.value},
+                       ${validControls.sourceIssueId}::uuid, ${validControls.workParentId}::uuid,
+                       'backfill_claim_conflict')
+                    on conflict (issue_id, kind, value) do nothing
+                  `);
+                }
                 skipped += 1;
                 lastSkipError = `skipped issue ${row.id}: alias persistence failed`;
                 logger.warn({ error, companyId, issueId: row.id }, "Skipping invalid exhaust alias backfill row");
@@ -6231,7 +6243,15 @@ export function issueService(db: Db) {
       if (!(await ensureBackfillReady())) {
         return persisted ?? { kind: "not_ready" as const };
       }
-      return resolveMatches(await findMatches()) ?? { kind: "not_found" as const };
+      const refreshed = resolveMatches(await findMatches());
+      if (!persisted) return refreshed ?? { kind: "not_found" as const };
+      if (persisted.kind === "ambiguous") {
+        return refreshed?.kind === "ambiguous" ? refreshed : { kind: "changed" as const };
+      }
+      if (refreshed?.kind === "found" && refreshed.receipt.id === persisted.receipt.id) {
+        return refreshed;
+      }
+      return { kind: "changed" as const };
     },
 
     getCurrentScheduledRetry: async (issueId: string) => {
@@ -7313,17 +7333,37 @@ export function issueService(db: Db) {
             throw unprocessable("Exhaust alias source and work parent must belong to the company");
           }
           for (const alias of exhaustAliases) {
-            await tx.execute(sql`
-              insert into exhaust_issue_aliases
-                (company_id, issue_id, kind, value, source_issue_id, work_parent_id, delivery_fingerprint)
-              values
-                (${companyId}::uuid, ${issueId}::uuid, ${alias.kind}, ${alias.value},
-                 ${sourceIssueId}::uuid, ${issueData.parentId}::uuid, ${deliveryFingerprint})
-              on conflict (issue_id, kind, value) do update
-                set source_issue_id = excluded.source_issue_id,
-                    work_parent_id = excluded.work_parent_id,
-                    delivery_fingerprint = excluded.delivery_fingerprint
-            `);
+            const existingClaim = Array.from(await tx.execute(sql<{ issue_id: string }>`
+              select issue_id
+              from exhaust_issue_aliases
+              where company_id = ${companyId}::uuid
+                and kind = ${alias.kind}
+                and value = ${alias.value}
+                and source_issue_id = ${sourceIssueId}::uuid
+                and work_parent_id = ${issueData.parentId}::uuid
+              limit 1
+            `))[0];
+            if (existingClaim && existingClaim.issue_id !== issueId) {
+              throw conflict("Exhaust alias was already claimed by a different issue");
+            }
+            try {
+              await tx.execute(sql`
+                insert into exhaust_issue_aliases
+                  (company_id, issue_id, kind, value, source_issue_id, work_parent_id, delivery_fingerprint)
+                values
+                  (${companyId}::uuid, ${issueId}::uuid, ${alias.kind}, ${alias.value},
+                   ${sourceIssueId}::uuid, ${issueData.parentId}::uuid, ${deliveryFingerprint})
+                on conflict (issue_id, kind, value) do update
+                  set source_issue_id = excluded.source_issue_id,
+                      work_parent_id = excluded.work_parent_id,
+                      delivery_fingerprint = excluded.delivery_fingerprint
+              `);
+            } catch (error) {
+              if (isUniqueViolation(error, EXHAUST_ALIAS_CLAIM_UNIQUE_CONSTRAINT)) {
+                throw conflict("Exhaust alias was concurrently claimed by a different issue");
+              }
+              throw error;
+            }
           }
         };
         const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
@@ -7339,6 +7379,17 @@ export function issueService(db: Db) {
         if (exhaustIdentity) {
           const exhaustIdentityGuardKey = `issue-create:exhaust-identity:${companyId}:${exhaustIdentity}`;
           await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${exhaustIdentityGuardKey}, 0))`);
+        }
+        for (const alias of exhaustAliases) {
+          const aliasGuardKey = [
+            "issue-create:exhaust-alias",
+            companyId,
+            alias.kind,
+            alias.value,
+            sourceIssueId,
+            issueData.parentId,
+          ].join(":");
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${aliasGuardKey}, 0))`);
         }
 
         let existingIssue: typeof issues.$inferSelect | undefined;
@@ -7995,6 +8046,17 @@ export function issueService(db: Db) {
         .where(eq(issues.id, id))
         .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
       if (!existing) return null;
+
+      const requestedExhaustIdentity = data.exhaustIdentity;
+      if (
+        existing.exhaustIdentity
+        && (
+          (requestedExhaustIdentity !== undefined && requestedExhaustIdentity !== existing.exhaustIdentity)
+          || (data.parentId !== undefined && data.parentId !== existing.parentId)
+        )
+      ) {
+        throw conflict("Exhaust identity and alias scope are immutable");
+      }
 
       const {
         labelIds: nextLabelIds,

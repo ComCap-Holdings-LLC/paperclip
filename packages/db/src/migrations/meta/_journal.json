@@ -1548,6 +1548,13 @@
       "when": 1788973200000,
       "tag": "0222_exhaust_issue_aliases",
       "breakpoints": true
+    },
+    {
+      "idx": 223,
+      "version": "7",
+      "when": 1789063200000,
+      "tag": "0223_exhaust_alias_claims",
+      "breakpoints": true
     }
   ]
 }

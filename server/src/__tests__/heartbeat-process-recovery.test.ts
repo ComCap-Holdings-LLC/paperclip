@@ -2243,6 +2243,54 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.executionRunId).toBe(retryRun?.id);
   });
 
+  it("leaves externally owned runs untouched during graceful shutdown", async () => {
+    const { agentId, runId, issueId, wakeupRequestId } = await seedRunFixture({
+      agentStatus: "running",
+    });
+    const runKey = randomUUID();
+
+    await db
+      .update(heartbeatRuns)
+      .set({
+        externalExecutorRunKey: runKey,
+        externalExecutorIssueId: issueId,
+        externalExecutorExpectedVersion: 0,
+        externalExecutorVisible: true,
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(issues)
+      .set({
+        externalExecutorRunId: runId,
+        executionVersion: 1,
+      })
+      .where(eq(issues.id, issueId));
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.drainRunningRunsForShutdown(
+      "SIGTERM",
+      new Date("2026-03-19T00:06:00.000Z"),
+    );
+
+    expect(result).toEqual({ interrupted: 0, interruptedRunIds: [], retryRunIds: [] });
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({ id: runId, status: "running", externalExecutorRunKey: runKey });
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
+    expect(issue).toMatchObject({
+      checkoutRunId: runId,
+      executionRunId: runId,
+      externalExecutorRunId: runId,
+      executionVersion: 1,
+    });
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0]);
+    expect(wakeup?.status).toBe("claimed");
+  });
+
   it("does not overwrite a run that is no longer running during graceful shutdown drain", async () => {
     const { runId, wakeupRequestId } = await seedRunFixture({
       agentStatus: "running",

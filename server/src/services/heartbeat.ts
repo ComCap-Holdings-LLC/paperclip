@@ -10682,9 +10682,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         selectedRunIds
           ? and(
             eq(heartbeatRuns.status, "running"),
+            isNull(heartbeatRuns.externalExecutorRunKey),
             inArray(heartbeatRuns.id, selectedRunIds),
           )
-          : eq(heartbeatRuns.status, "running"),
+          : and(
+            eq(heartbeatRuns.status, "running"),
+            isNull(heartbeatRuns.externalExecutorRunKey),
+          ),
       );
 
     const interruptedRunIds: string[] = [];

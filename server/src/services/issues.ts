@@ -4386,11 +4386,15 @@ type ExternalExecutorAuditActor = {
 
 export function issueService(
   db: Db,
-  dependencies: { persistActivity?: typeof persistActivity } = {},
+  dependencies: {
+    persistActivity?: typeof persistActivity;
+    assertAssignableAgent?: typeof assertAssignableAgent;
+  } = {},
 ) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
   const persistExternalExecutorActivity = dependencies.persistActivity ?? persistActivity;
+  const assertExternalExecutorAssignableAgent = dependencies.assertAssignableAgent ?? assertAssignableAgent;
 
   function publishCommittedExternalExecutorActivity(publications: ActivityPublication[]) {
     for (const publication of publications) {
@@ -8508,20 +8512,6 @@ export function issueService(
           .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
           .then((rows) => rows[0] ?? null);
         if (!issue) throw notFound("Issue not found");
-        if (
-          issue.projectId !== input.expectedProjectId ||
-          issue.parentId !== input.expectedParentId ||
-          issue.assigneeAgentId !== input.expectedAssigneeAgentId
-        ) {
-          throw conflict("External executor checkout authority changed before admission", {
-            issueId: issue.id,
-          });
-        }
-        await assertAssignableAgent(tx as unknown as Db, input.companyId, input.agentId, { kind: "work" });
-        if (issue.hiddenAt) {
-          throw conflict("External executor checkout cannot bind a hidden issue", { issueId: issue.id });
-        }
-
         const existingRun = await tx
           .select()
           .from(heartbeatRuns)
@@ -8538,6 +8528,7 @@ export function issueService(
             existingRun.agentId !== input.agentId ||
             existingRun.externalExecutorIssueId !== input.issueId ||
             existingRun.externalExecutorExpectedVersion !== input.expectedExecutionVersion ||
+            existingRun.status !== "running" ||
             issue.externalExecutorRunId !== existingRun.id ||
             issue.executionVersion !== expectedBoundVersion ||
             existingRun.externalExecutorVisible !== true ||
@@ -8559,6 +8550,24 @@ export function issueService(
             },
             idempotent: true,
           };
+        }
+
+        if (
+          issue.projectId !== input.expectedProjectId ||
+          issue.parentId !== input.expectedParentId ||
+          issue.assigneeAgentId !== input.expectedAssigneeAgentId
+        ) {
+          throw conflict("External executor checkout authority changed before admission", {
+            issueId: issue.id,
+          });
+        }
+        await assertExternalExecutorAssignableAgent(tx as unknown as Db, input.companyId, input.agentId, {
+          kind: "work",
+          lockForUpdate: true,
+          requireInvokable: true,
+        });
+        if (issue.hiddenAt) {
+          throw conflict("External executor checkout cannot bind a hidden issue", { issueId: issue.id });
         }
 
         if (issue.projectId) {

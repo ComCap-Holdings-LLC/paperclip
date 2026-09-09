@@ -29,6 +29,7 @@ import { issueService } from "../services/issues.js";
 import { persistActivity } from "../services/activity-log.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import { logger } from "../middleware/logger.js";
+import { assertAssignableAgent as assertAgentAssignable } from "../services/agent-assignability.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -766,6 +767,116 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     });
     expect(retry.status, JSON.stringify(retry.body)).toBe(200);
     expect(retry.body).toMatchObject({ idempotent: true, run: { id: checkout.body.run.id } });
+  });
+
+  it("keeps a duplicate external checkout idempotent after its agent is paused", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    const runKey = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "External executor retry after agent pause",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    const app = createApp(agentActor(companyId, agentId, currentRunId));
+    const checkout = await request(app).post(`/api/issues/${issueId}/external-executor/checkout`).send({
+      runKey,
+      expectedExecutionVersion: 0,
+      expectedStatuses: ["todo"],
+    });
+    expect(checkout.status, JSON.stringify(checkout.body)).toBe(201);
+
+    await db.update(agents).set({ status: "paused", pausedAt: new Date() }).where(eq(agents.id, agentId));
+    const retry = await request(app).post(`/api/issues/${issueId}/external-executor/checkout`).send({
+      runKey,
+      expectedExecutionVersion: 0,
+      expectedStatuses: ["todo"],
+    });
+    expect(retry.status, JSON.stringify(retry.body)).toBe(200);
+    expect(retry.body).toMatchObject({ idempotent: true, run: { id: checkout.body.run.id } });
+  });
+
+  it("rejects a new external checkout for a paused agent without mutation", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    await db.update(agents).set({ status: "paused", pausedAt: new Date() }).where(eq(agents.id, agentId));
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Paused external executor cannot start",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    const response = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${issueId}/external-executor/checkout`)
+      .send({ runKey: randomUUID(), expectedExecutionVersion: 0, expectedStatuses: ["todo"] });
+
+    expect(response.status).toBe(409);
+    expect(response.body.error).toMatch(/paused agent/i);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.externalExecutorIssueId, issueId))).toEqual([]);
+    expect(await db.select({ status: issues.status, executionVersion: issues.executionVersion, externalExecutorRunId: issues.externalExecutorRunId })
+      .from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]))
+      .toEqual({ status: "todo", executionVersion: 0, externalExecutorRunId: null });
+  });
+
+  it("holds agent eligibility stable until external checkout commits", async () => {
+    const { companyId, agentId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "External executor agent status race",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    let eligibilityRead!: () => void;
+    const eligibilityWasRead = new Promise<void>((resolve) => { eligibilityRead = resolve; });
+    let allowCheckout!: () => void;
+    const checkoutMayContinue = new Promise<void>((resolve) => { allowCheckout = resolve; });
+    const service = issueService(db, {
+      assertAssignableAgent: async (...args) => {
+        await assertAgentAssignable(...args);
+        eligibilityRead();
+        await checkoutMayContinue;
+      },
+    });
+
+    const checkoutPromise = service.externalExecutorCheckout({
+      issueId,
+      companyId,
+      agentId,
+      expectedProjectId: null,
+      expectedParentId: null,
+      expectedAssigneeAgentId: agentId,
+      runKey: randomUUID(),
+      expectedExecutionVersion: 0,
+      expectedStatuses: ["todo"],
+      audit: { actorType: "agent", actorId: agentId, agentId, runId: null, agentApiKeyId: null },
+    });
+    await eligibilityWasRead;
+
+    let pauseCommitted = false;
+    const pausePromise = db
+      .update(agents)
+      .set({ status: "paused", pausedAt: new Date() })
+      .where(eq(agents.id, agentId))
+      .then(() => { pauseCommitted = true; });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const pauseCommittedBeforeCheckout = pauseCommitted;
+    allowCheckout();
+
+    const checkout = await checkoutPromise;
+    await pausePromise;
+    expect(pauseCommittedBeforeCheckout).toBe(false);
+    expect(checkout).toMatchObject({ idempotent: false, issue: { id: issueId, executionVersion: 1 } });
   });
 
   it("rejects a new external checkout while its project is paused", async () => {

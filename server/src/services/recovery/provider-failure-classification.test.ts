@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS,
   classifyAdapterFailureForRecovery,
+  classifyContinuationFailure,
 } from "./service.js";
 
 describe("classifyAdapterFailureForRecovery", () => {
@@ -91,5 +92,65 @@ describe("classifyAdapterFailureForRecovery", () => {
       error: "Workspace storage capacity limit reached.",
       resultJson: null,
     })).toBeNull();
+  });
+
+  // COM-11514: a gateway auth failure used to fall through every branch here
+  // and return null, so reconcileStrandedAssignedIssues treated it as a generic
+  // stall and requeued the issue to `todo`. That re-woke an assignee who could
+  // not possibly fix a credential, which is the churn loop this ticket filed.
+  it.each([
+    "hermes_gateway_auth_failed",
+    "hermes_gateway_api_key_missing",
+    "hermes_gateway_api_base_url_missing",
+    "hermes_gateway_api_base_url_invalid",
+    "hermes_gateway_plain_http_remote_denied",
+    "cursor_cloud_auth_failed",
+  ])("classifies credential/endpoint failure %s as configuration_incomplete", (errorCode) => {
+    expect(classifyAdapterFailureForRecovery({
+      errorCode,
+      error: "Check adapterConfig.apiKey matches the Hermes API_SERVER_KEY for the running gateway.",
+      resultJson: null,
+    })).toEqual({ kind: "configuration_incomplete" });
+  });
+
+  it("classifies credential failures without needing quota or config text in the message", () => {
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "hermes_gateway_auth_failed",
+      error: "",
+      resultJson: null,
+    })).toEqual({ kind: "configuration_incomplete" });
+  });
+
+  // The other side of the split: gateway transport faults are genuinely
+  // transient, so they must NOT be pushed to blocked as configuration problems.
+  it.each([
+    "hermes_gateway_rate_limited",
+    "hermes_gateway_upstream_error",
+    "hermes_gateway_connect_failed",
+    "hermes_gateway_timeout",
+  ])("leaves transient gateway transport failure %s unclassified", (errorCode) => {
+    expect(classifyAdapterFailureForRecovery({
+      errorCode,
+      error: "Gateway is temporarily unavailable.",
+      resultJson: null,
+    })).toBeNull();
+  });
+});
+
+describe("classifyContinuationFailure gateway codes", () => {
+  const run = (errorCode: string | null) =>
+    ({ errorCode } as unknown as Parameters<typeof classifyContinuationFailure>[0]);
+
+  it.each([
+    "hermes_gateway_connect_failed",
+    "hermes_gateway_rate_limited",
+    "hermes_gateway_upstream_error",
+    "hermes_gateway_timeout",
+  ])("retries transient gateway transport failure %s", (errorCode) => {
+    expect(classifyContinuationFailure(run(errorCode)).kind).toBe("transient_infra");
+  });
+
+  it("does not put a gateway auth failure on the transient retry path", () => {
+    expect(classifyContinuationFailure(run("hermes_gateway_auth_failed")).kind).not.toBe("transient_infra");
   });
 });

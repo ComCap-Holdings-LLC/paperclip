@@ -10695,6 +10695,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const retryRunIds: string[] = [];
 
     for (const { run, agent } of activeRuns) {
+      if (run.externalExecutorRunKey) {
+        logger.info(
+          { runId: run.id, externalExecutorIssueId: run.externalExecutorIssueId },
+          "skipping external executor run during graceful shutdown drain",
+        );
+        continue;
+      }
       const running = runningProcesses.get(run.id);
       try {
         if (running) {

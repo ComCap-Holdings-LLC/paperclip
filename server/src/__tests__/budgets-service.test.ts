@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -8,6 +9,8 @@ import {
   companies,
   costEvents,
   createDb,
+  heartbeatRuns,
+  issues,
   projects,
 } from "@paperclipai/db";
 import { budgetService } from "../services/budgets.ts";
@@ -342,6 +345,8 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
     await db.delete(approvals);
     await db.delete(budgetPolicies);
     await db.delete(costEvents);
+    await db.delete(issues);
+    await db.delete(heartbeatRuns);
     await db.delete(projects);
     await db.delete(agents);
     await db.delete(companies);
@@ -636,5 +641,61 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
       pauseReason: null,
     });
     expect(overviewAfterResume.activeIncidents).toHaveLength(0);
+  });
+
+  it("does not budget-pause a project while an external executor owns work in that scope", async () => {
+    const { companyId, agentId, projectId } = await createBudgetFixture();
+    const issueId = randomUUID();
+    const externalRunId = randomUUID();
+    const cancelWorkForScope = vi.fn().mockResolvedValue(undefined);
+    const service = budgetService(db, { cancelWorkForScope });
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "project",
+      scopeId: projectId,
+      metric: "billed_cents",
+      windowKind: "lifetime",
+      amount: 100,
+      warnPercent: 75,
+      hardStopEnabled: true,
+      notifyEnabled: false,
+      isActive: true,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: externalRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "external_executor",
+      externalExecutorRunKey: randomUUID(),
+      externalExecutorIssueId: issueId,
+      externalExecutorExpectedVersion: 0,
+      externalExecutorVisible: true,
+      startedAt: new Date(),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      projectId,
+      title: "Budget-fenced external executor",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: externalRunId,
+      executionRunId: externalRunId,
+      externalExecutorRunId: externalRunId,
+      executionVersion: 1,
+    });
+
+    const event = await insertCostEvent({ companyId, agentId, projectId, costCents: 125 });
+    await expect(service.evaluateCostEvent(event)).rejects.toThrow(/active external executor/i);
+
+    const project = await db
+      .select({ pausedAt: projects.pausedAt, pauseReason: projects.pauseReason })
+      .from(projects)
+      .where(eq(projects.id, projectId))
+      .then((rows) => rows[0]);
+    expect(project).toEqual({ pausedAt: null, pauseReason: null });
+    expect(cancelWorkForScope).not.toHaveBeenCalled();
   });
 });

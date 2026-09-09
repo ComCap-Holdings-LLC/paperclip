@@ -100,6 +100,10 @@ import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallbac
 import { getRunLogStore } from "./run-log-store.js";
 import { getDefaultCompanyGoal } from "./goals.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
+import {
+  assertIssueSubtreeHasNoExternalExecutor,
+  lockExternalExecutorScope,
+} from "./external-executor-scope.js";
 import { budgetService } from "./budgets.js";
 import { DEFAULT_INSERT_CHUNK_ROWS, insertRowsInChunks } from "./batch-insert.js";
 import type {
@@ -4372,9 +4376,38 @@ async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?:
   }, 0);
 }
 
-export function issueService(db: Db) {
+type ExternalExecutorAuditActor = {
+  actorType: "agent" | "user" | "system";
+  actorId: string;
+  agentId: string | null;
+  runId: string | null;
+  agentApiKeyId: string | null;
+};
+
+export function issueService(
+  db: Db,
+  dependencies: { persistActivity?: typeof persistActivity } = {},
+) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
+  const persistExternalExecutorActivity = dependencies.persistActivity ?? persistActivity;
+
+  function publishCommittedExternalExecutorActivity(publications: ActivityPublication[]) {
+    for (const publication of publications) {
+      try {
+        publishActivity(publication);
+      } catch (err) {
+        logger.warn({
+          err,
+          companyId: publication.companyId,
+          action: publication.payload.action,
+          entityId: publication.payload.entityId,
+          runId: publication.payload.runId,
+          lifecycleCommitted: true,
+        }, "failed to publish committed external executor activity");
+      }
+    }
+  }
 
   function normalizeCreateIssueTitle(title: string) {
     return title.trim().replace(/\s+/g, " ").toLowerCase();
@@ -7718,6 +7751,10 @@ export function issueService(db: Db) {
       }
 
       const runUpdate = async (tx: any) => {
+        if (issueData.projectId !== undefined || issueData.parentId !== undefined) {
+          await lockExternalExecutorScope(tx as unknown as Db, existing.companyId);
+          await assertIssueSubtreeHasNoExternalExecutor(tx as unknown as Db, existing.companyId, id);
+        }
         // The receipt baseline must be read under the same row lock as the
         // write. Otherwise a concurrent update can be mistaken for a change
         // made by this request.
@@ -8450,14 +8487,18 @@ export function issueService(db: Db) {
       issueId: string;
       companyId: string;
       agentId: string;
+      expectedProjectId: string | null;
+      expectedParentId: string | null;
+      expectedAssigneeAgentId: string | null;
       runKey: string;
       expectedExecutionVersion: number;
       expectedStatuses: string[];
+      audit: ExternalExecutorAuditActor;
     }) => {
-      await assertAssignableAgent(db, input.companyId, input.agentId, { kind: "work" });
+      const postCommitActivityPublications: ActivityPublication[] = [];
 
-      try {
-        return await db.transaction(async (tx) => {
+      const result = await db.transaction(async (tx) => {
+        await lockExternalExecutorScope(tx as unknown as Db, input.companyId);
         // Serializing on the issue makes same-key retries deterministic and
         // prevents two different executor keys from both observing it idle.
         await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${input.issueId} for update`);
@@ -8467,6 +8508,16 @@ export function issueService(db: Db) {
           .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
           .then((rows) => rows[0] ?? null);
         if (!issue) throw notFound("Issue not found");
+        if (
+          issue.projectId !== input.expectedProjectId ||
+          issue.parentId !== input.expectedParentId ||
+          issue.assigneeAgentId !== input.expectedAssigneeAgentId
+        ) {
+          throw conflict("External executor checkout authority changed before admission", {
+            issueId: issue.id,
+          });
+        }
+        await assertAssignableAgent(tx as unknown as Db, input.companyId, input.agentId, { kind: "work" });
         if (issue.hiddenAt) {
           throw conflict("External executor checkout cannot bind a hidden issue", { issueId: issue.id });
         }
@@ -8643,14 +8694,20 @@ export function issueService(db: Db) {
         if (!updated) {
           throw conflict("External executor checkout compare-and-swap lost", { issueId: input.issueId });
         }
+        const { publication } = await persistExternalExecutorActivity(tx as unknown as Db, {
+          companyId: input.companyId, actorType: input.audit.actorType, actorId: input.audit.actorId,
+          agentId: input.audit.agentId, runId, agentApiKeyId: input.audit.agentApiKeyId,
+          action: "issue.external_executor_checked_out", entityType: "issue", entityId: input.issueId,
+          details: { externalExecutorRunId: runId, runKey: input.runKey, expectedExecutionVersion: input.expectedExecutionVersion, boundExecutionVersion, holdId: null },
+        });
+        postCommitActivityPublications.push(publication);
         const [enriched] = await withIssueLabels(tx, [updated]);
         return {
           issue: enriched,
           run: { id: runId, runKey: input.runKey, executionVersion: boundExecutionVersion, holdId: null },
           idempotent: false,
         };
-        });
-      } catch (error) {
+      }).catch((error) => {
         // The issue row lock serializes contenders for one issue. The unique
         // key is the second fence: it prevents the same external run identity
         // from being claimed concurrently for two different issues.
@@ -8661,19 +8718,27 @@ export function issueService(db: Db) {
           });
         }
         throw error;
-      }
+      });
+      publishCommittedExternalExecutorActivity(postCommitActivityPublications);
+      return result;
     },
 
     terminalExternalExecutorRun: async (input: {
       issueId: string;
       companyId: string;
       agentId: string;
+      expectedProjectId: string | null;
+      expectedParentId: string | null;
+      expectedAssigneeAgentId: string | null;
       runKey: string;
       expectedExecutionVersion: number;
       issueStatus: "todo" | "blocked" | "in_review" | "done" | "cancelled";
       outcome: "succeeded" | "failed" | "cancelled";
       error?: string | null;
-    }) => db.transaction(async (tx) => {
+      audit: ExternalExecutorAuditActor;
+    }) => {
+      const postCommitActivityPublications: ActivityPublication[] = [];
+      const result = await db.transaction(async (tx) => {
       await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${input.issueId} for update`);
       const issue = await tx
         .select()
@@ -8681,6 +8746,15 @@ export function issueService(db: Db) {
         .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
         .then((rows) => rows[0] ?? null);
       if (!issue) throw notFound("Issue not found");
+      if (
+        issue.projectId !== input.expectedProjectId ||
+        issue.parentId !== input.expectedParentId ||
+        issue.assigneeAgentId !== input.expectedAssigneeAgentId
+      ) {
+        throw conflict("External executor terminal authority changed before mutation", {
+          issueId: issue.id,
+        });
+      }
       const runId = issue.externalExecutorRunId;
       if (!runId || issue.executionRunId !== runId || issue.checkoutRunId !== runId) {
         throw conflict("No active external executor run owns this issue", { issueId: input.issueId });
@@ -8806,6 +8880,8 @@ export function issueService(db: Db) {
             eq(issues.id, input.issueId),
             eq(issues.companyId, input.companyId),
             eq(issues.executionVersion, input.expectedExecutionVersion),
+            eq(issues.status, "in_progress"),
+            eq(issues.assigneeAgentId, input.agentId),
             eq(issues.externalExecutorRunId, runId),
             eq(issues.executionRunId, runId),
             eq(issues.checkoutRunId, runId),
@@ -8831,10 +8907,20 @@ export function issueService(db: Db) {
         .returning({ id: heartbeatRuns.id })
         .then((rows) => rows[0] ?? null);
       if (!terminalized) throw conflict("External executor run was terminalized concurrently", { issueId: input.issueId });
+      const { publication } = await persistExternalExecutorActivity(tx as unknown as Db, {
+        companyId: input.companyId, actorType: input.audit.actorType, actorId: input.audit.actorId,
+        agentId: input.audit.agentId, runId, agentApiKeyId: input.audit.agentApiKeyId,
+        action: "issue.external_executor_terminalized", entityType: "issue", entityId: input.issueId,
+        details: { externalExecutorRunId: runId, runKey: input.runKey, expectedExecutionVersion: input.expectedExecutionVersion, executionVersion: updated.executionVersion, issueStatus: input.issueStatus, outcome: input.outcome },
+      });
+      postCommitActivityPublications.push(publication);
 
       const [enriched] = await withIssueLabels(tx, [updated]);
       return { issue: enriched, runId, executionVersion: updated.executionVersion };
-    }),
+      });
+      publishCommittedExternalExecutorActivity(postCommitActivityPublications);
+      return result;
+    },
 
     recoverExternalExecutorRun: async (input: {
       issueId: string;
@@ -8842,7 +8928,10 @@ export function issueService(db: Db) {
       runKey: string;
       expectedExecutionVersion: number;
       reason: string;
-    }) => db.transaction(async (tx) => {
+      audit: ExternalExecutorAuditActor;
+    }) => {
+      const postCommitActivityPublications: ActivityPublication[] = [];
+      const result = await db.transaction(async (tx) => {
       await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${input.issueId} for update`);
       const issue = await tx
         .select()
@@ -8914,14 +9003,25 @@ export function issueService(db: Db) {
           .then((rows) => rows[0] ?? null);
         if (!recovered) throw conflict("External executor run changed during recovery", { issueId: input.issueId });
       }
+      const { publication } = await persistExternalExecutorActivity(tx as unknown as Db, {
+        companyId: input.companyId, actorType: input.audit.actorType, actorId: input.audit.actorId,
+        agentId: input.audit.agentId, runId, agentApiKeyId: input.audit.agentApiKeyId,
+        action: "issue.external_executor_recovered", entityType: "issue", entityId: input.issueId,
+        details: {
+          externalExecutorRunId: runId,
+          runKey: input.runKey,
+          expectedExecutionVersion: input.expectedExecutionVersion,
+          executionVersion: updated.executionVersion,
+          repairedSecondaryLocks,
+        },
+      });
+      postCommitActivityPublications.push(publication);
       const [enriched] = await withIssueLabels(tx, [updated]);
-      return {
-        issue: enriched,
-        runId,
-        executionVersion: updated.executionVersion,
-        repairedSecondaryLocks,
-      };
-    }),
+      return { issue: enriched, runId, executionVersion: updated.executionVersion, repairedSecondaryLocks };
+      });
+      publishCommittedExternalExecutorActivity(postCommitActivityPublications);
+      return result;
+    },
 
     release: async (id: string, actorAgentId?: string, actorRunId?: string | null) =>
       db.transaction(async (tx) => {

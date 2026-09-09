@@ -23,6 +23,7 @@ import {
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
+import { lockExternalExecutorScope } from "./external-executor-scope.js";
 
 type IssueRow = typeof issues.$inferSelect;
 type HoldRow = typeof issueTreeHolds.$inferSelect;
@@ -743,6 +744,7 @@ export function issueTreeControlService(db: Db) {
       const releaseReason = input.reason ?? "Subtree resume applied.";
 
       const { hold: resumeHold } = await db.transaction(async (tx) => {
+        await lockExternalExecutorScope(tx as unknown as Db, companyId);
         const [createdHold] = await tx
           .insert(issueTreeHolds)
           .values({
@@ -821,6 +823,7 @@ export function issueTreeControlService(db: Db) {
     }
 
     const { hold, members } = await db.transaction(async (tx) => {
+      await lockExternalExecutorScope(tx as unknown as Db, companyId);
       // A pause/cancel hold and an external executor checkout share the issue-row
       // fence. Lock the complete target tree in a stable order before either
       // operation can commit. If checkout won, the hold is rejected instead
@@ -928,6 +931,7 @@ export function issueTreeControlService(db: Db) {
 
     const now = new Date();
     const updated = await db.transaction(async (tx) => {
+      await lockExternalExecutorScope(tx as unknown as Db, companyId);
       const lockedIssueIds = [...issueIds].sort();
       await tx.execute(sql`
         select ${issues.id}
@@ -1050,6 +1054,7 @@ export function issueTreeControlService(db: Db) {
     const now = new Date();
     const releasedCancelHoldIds = activeCancelHolds.map((hold) => hold.id);
     const updatedIssues = await db.transaction(async (tx) => {
+      await lockExternalExecutorScope(tx as unknown as Db, companyId);
       const restored: TreeStatusUpdateResult["updatedIssues"] = [];
       const lockedIssueIds = [...restoreStatusByIssueId.keys()].sort();
       if (lockedIssueIds.length > 0) {
@@ -1231,6 +1236,7 @@ export function issueTreeControlService(db: Db) {
     },
   ) {
     return db.transaction(async (tx) => {
+      await lockExternalExecutorScope(tx as unknown as Db, companyId);
       const existing = await tx
         .select()
         .from(issueTreeHolds)

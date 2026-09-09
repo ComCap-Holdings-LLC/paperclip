@@ -10694,7 +10694,7 @@ export function issueRoutes(
     res: Response,
     issue: NonNullable<Awaited<ReturnType<typeof svc.getById>>>,
   ) {
-    if (req.actor.type !== "agent" || !req.actor.agentId) {
+    if (req.actor.type !== "agent" || req.actor.source !== "agent_key" || !req.actor.agentId) {
       res.status(403).json({ error: "External executor endpoints require an agent API key" });
       return null;
     }
@@ -10725,35 +10725,19 @@ export function issueRoutes(
         assigneeUserId: null,
       });
     }
+    const actor = getActorInfo(req);
     const result = await svc.externalExecutorCheckout({
       issueId: id,
       companyId: issue.companyId,
       agentId,
+      expectedProjectId: issue.projectId ?? null,
+      expectedParentId: issue.parentId ?? null,
+      expectedAssigneeAgentId: issue.assigneeAgentId ?? null,
       runKey: req.body.runKey,
       expectedExecutionVersion: req.body.expectedExecutionVersion,
       expectedStatuses: req.body.expectedStatuses,
+      audit: { ...actor },
     });
-    const actor = getActorInfo(req);
-    if (!result.idempotent) {
-      await logActivity(db, {
-        companyId: issue.companyId,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        agentId: actor.agentId,
-        runId: result.run.id,
-        agentApiKeyId: actor.agentApiKeyId,
-        action: "issue.external_executor_checked_out",
-        entityType: "issue",
-        entityId: issue.id,
-        details: {
-          externalExecutorRunId: result.run.id,
-          runKey: req.body.runKey,
-          expectedExecutionVersion: req.body.expectedExecutionVersion,
-          boundExecutionVersion: result.run.executionVersion,
-          holdId: result.run.holdId,
-        },
-      });
-    }
     res.status(result.idempotent ? 200 : 201).json(result);
   });
 
@@ -10763,28 +10747,20 @@ export function issueRoutes(
     if (!issue) return;
     const agentId = await requireExternalExecutorAgent(req, res, issue);
     if (!agentId) return;
+    const actor = getActorInfo(req);
     const result = await svc.terminalExternalExecutorRun({
       issueId: id,
       companyId: issue.companyId,
       agentId,
+      expectedProjectId: issue.projectId ?? null,
+      expectedParentId: issue.parentId ?? null,
+      expectedAssigneeAgentId: issue.assigneeAgentId ?? null,
       runKey: req.body.runKey,
       expectedExecutionVersion: req.body.expectedExecutionVersion,
       issueStatus: req.body.issueStatus,
       outcome: req.body.outcome,
       error: req.body.error,
-    });
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: issue.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: result.runId,
-      agentApiKeyId: actor.agentApiKeyId,
-      action: "issue.external_executor_terminalized",
-      entityType: "issue",
-      entityId: issue.id,
-      details: { externalExecutorRunId: result.runId, runKey: req.body.runKey, expectedExecutionVersion: req.body.expectedExecutionVersion, executionVersion: result.executionVersion, issueStatus: req.body.issueStatus, outcome: req.body.outcome },
+      audit: { ...actor },
     });
     res.json(result);
   });
@@ -10797,9 +10773,15 @@ export function issueRoutes(
     const id = req.params.id as string;
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!issue) return;
-    const result = await svc.recoverExternalExecutorRun({ issueId: id, companyId: issue.companyId, runKey: req.body.runKey, expectedExecutionVersion: req.body.expectedExecutionVersion, reason: req.body.reason });
     const actor = getActorInfo(req);
-    await logActivity(db, { companyId: issue.companyId, actorType: actor.actorType, actorId: actor.actorId, agentId: actor.agentId, runId: result.runId, action: "issue.external_executor_recovered", entityType: "issue", entityId: issue.id, details: { externalExecutorRunId: result.runId, runKey: req.body.runKey, expectedExecutionVersion: req.body.expectedExecutionVersion, executionVersion: result.executionVersion, repairedSecondaryLocks: result.repairedSecondaryLocks } });
+    const result = await svc.recoverExternalExecutorRun({
+      issueId: id,
+      companyId: issue.companyId,
+      runKey: req.body.runKey,
+      expectedExecutionVersion: req.body.expectedExecutionVersion,
+      reason: req.body.reason,
+      audit: { ...actor },
+    });
     res.json(result);
   });
 
@@ -10821,7 +10803,7 @@ export function issueRoutes(
     const id = parsedIssueId.data;
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!issue) return;
-    // Pull start is an issue mutation plus (when unassigned) an assignment.  It
+    // Pull start is an issue mutation plus (when unassigned) an assignment. It
     // must take the exact same authorization path as checkout; otherwise a
     // scoped/low-trust key can turn an issue into an active assignment merely by
     // asking the server to mint a run.

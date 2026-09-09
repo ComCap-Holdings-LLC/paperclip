@@ -1,5 +1,6 @@
 CREATE TABLE "exhaust_issue_alias_conflicts" (
   "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+  "alias_row_id" uuid,
   "company_id" uuid NOT NULL REFERENCES "companies"("id") ON DELETE CASCADE,
   "issue_id" uuid NOT NULL REFERENCES "issues"("id") ON DELETE CASCADE,
   "kind" text NOT NULL,
@@ -11,8 +12,13 @@ CREATE TABLE "exhaust_issue_alias_conflicts" (
   "quarantined_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE UNIQUE INDEX "exhaust_issue_alias_conflicts_issue_kind_value_uq"
-  ON "exhaust_issue_alias_conflicts" USING btree ("issue_id", "kind", "value");
+CREATE UNIQUE INDEX "exhaust_issue_alias_conflicts_alias_row_uq"
+  ON "exhaust_issue_alias_conflicts" USING btree ("alias_row_id")
+  WHERE "alias_row_id" IS NOT NULL;
+--> statement-breakpoint
+CREATE UNIQUE INDEX "exhaust_issue_alias_conflicts_runtime_issue_kind_value_uq"
+  ON "exhaust_issue_alias_conflicts" USING btree ("issue_id", "kind", "value")
+  WHERE "alias_row_id" IS NULL;
 --> statement-breakpoint
 WITH ranked AS (
   SELECT id, row_number() OVER (
@@ -22,19 +28,17 @@ WITH ranked AS (
   FROM exhaust_issue_aliases
 )
 INSERT INTO exhaust_issue_alias_conflicts
-  (company_id, issue_id, kind, value, source_issue_id, work_parent_id, delivery_fingerprint, reason)
-SELECT a.company_id, a.issue_id, a.kind, a.value, a.source_issue_id, a.work_parent_id,
+  (alias_row_id, company_id, issue_id, kind, value, source_issue_id, work_parent_id, delivery_fingerprint, reason)
+SELECT a.id, a.company_id, a.issue_id, a.kind, a.value, a.source_issue_id, a.work_parent_id,
        a.delivery_fingerprint, 'migration_duplicate_claim'
 FROM exhaust_issue_aliases a
 JOIN ranked r ON r.id = a.id
 WHERE r.claim_rank > 1
-ON CONFLICT (issue_id, kind, value) DO NOTHING;
+ON CONFLICT DO NOTHING;
 --> statement-breakpoint
 DELETE FROM exhaust_issue_aliases a
 USING exhaust_issue_alias_conflicts q
-WHERE q.issue_id = a.issue_id
-  AND q.kind = a.kind
-  AND q.value = a.value
+WHERE q.alias_row_id = a.id
   AND q.reason = 'migration_duplicate_claim';
 --> statement-breakpoint
 CREATE UNIQUE INDEX "exhaust_issue_aliases_company_scope_claim_uq"

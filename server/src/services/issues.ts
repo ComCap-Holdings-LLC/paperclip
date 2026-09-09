@@ -6198,7 +6198,7 @@ export function issueService(db: Db) {
                           (${companyId}::uuid, ${row.id}::uuid, ${alias.kind}, ${alias.value},
                            ${validControls.sourceIssueId}::uuid, ${validControls.workParentId}::uuid,
                            ${quarantineReason})
-                        on conflict (issue_id, kind, value) do nothing
+                        on conflict do nothing
                       `);
                     }
                   });

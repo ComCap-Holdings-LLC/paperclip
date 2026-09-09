@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import express from "express";
 import request from "supertest";
 import { eq, sql } from "drizzle-orm";
@@ -1381,6 +1382,7 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
       const app = createApp();
       const identity = `exhaust:v2:${"d".repeat(64)}`;
       const alias = "7777777777777777";
+      const identityAlias = `exhaust-finding:v1:sha256:${"7".repeat(64)}`;
       const created = await request(app)
         .post(`/api/companies/${companyId}/issues`)
         .send({
@@ -1388,21 +1390,119 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
           sourceIssueId: source.id,
           title: "Immutable dedupe claims",
           exhaustIdentity: identity,
-          exhaustAliases: [{ kind: "legacy_hash", value: alias }],
+          exhaustAliases: [
+            { kind: "legacy_hash", value: alias },
+            { kind: "identity_v1", value: identityAlias },
+          ],
           deliveryFingerprint: `sha256:${"1".repeat(64)}`,
           idempotencyKey: "immutable-dedupe-claims",
         })
         .expect(201);
 
+      const unchangedPatch = await request(app).patch(`/api/issues/${created.body.id}`).send({
+        sourceIssueId: source.id,
+        exhaustAliases: [
+          { kind: "legacy_hash", value: alias },
+          { kind: "identity_v1", value: identityAlias },
+          { kind: "legacy_hash", value: alias },
+        ],
+        deliveryFingerprint: `sha256:${"1".repeat(64)}`,
+      });
+      const storedControls = Array.from(await db.execute(sql`
+        select kind, value, source_issue_id, delivery_fingerprint
+        from exhaust_issue_aliases where issue_id = ${created.body.id}::uuid
+      `));
+      expect(storedControls).toEqual(expect.arrayContaining([
+        {
+          kind: "identity_v1",
+          value: identityAlias,
+          source_issue_id: source.id,
+          delivery_fingerprint: `sha256:${"1".repeat(64)}`,
+        },
+        {
+          kind: "legacy_hash",
+          value: alias,
+          source_issue_id: source.id,
+          delivery_fingerprint: `sha256:${"1".repeat(64)}`,
+        },
+      ]));
+      expect(storedControls).toHaveLength(2);
+      expect(unchangedPatch.status, JSON.stringify(unchangedPatch.body)).toBe(200);
+
       await request(app).patch(`/api/issues/${created.body.id}`).send({ exhaustIdentity: null }).expect(409);
       await request(app).patch(`/api/issues/${created.body.id}`).send({ parentId: replacementParent.id }).expect(409);
-      await request(app).patch(`/api/issues/${created.body.id}`).send({
-        sourceIssueId: replacementParent.id,
-        exhaustAliases: [{ kind: "legacy_hash", value: "8888888888888888" }],
-        deliveryFingerprint: `sha256:${"2".repeat(64)}`,
-      }).expect(409);
+      for (const changedControls of [
+        { sourceIssueId: replacementParent.id },
+        { sourceIssueId: null },
+        { exhaustAliases: [{ kind: "legacy_hash", value: "8888888888888888" }] },
+        { exhaustAliases: [] },
+        { deliveryFingerprint: `sha256:${"2".repeat(64)}` },
+        { deliveryFingerprint: null },
+      ]) {
+        await request(app).patch(`/api/issues/${created.body.id}`).send(changedControls).expect(409);
+      }
       const [unchanged] = await db.select().from(issues).where(eq(issues.id, created.body.id));
       expect(unchanged).toMatchObject({ exhaustIdentity: identity, parentId: parent.id });
+    });
+
+    it("migration 0223 retains the canonical alias row and quarantines every identical loser", async () => {
+      const companyId = await seedCompany();
+      const parent = await seedParent(companyId);
+      const source = await seedParent(companyId);
+      const [issue] = await db.insert(issues).values({
+        companyId,
+        parentId: parent.id,
+        title: "Duplicate migration fixture",
+        status: "done",
+        priority: "medium",
+        exhaustIdentity: `exhaust:v2:${"e".repeat(64)}`,
+      }).returning();
+      const migration = readFileSync(
+        new URL("../../../packages/db/src/migrations/0223_exhaust_alias_claims.sql", import.meta.url),
+        "utf8",
+      );
+      const rollbackMarker = new Error("rollback migration fixture");
+      const keeperAliasRowId = "10000000-0000-4000-8000-000000000001";
+      const loserAliasRowIds = [
+        "20000000-0000-4000-8000-000000000002",
+        "30000000-0000-4000-8000-000000000003",
+      ];
+
+      await expect(db.transaction(async (tx) => {
+        await tx.execute(sql`drop index exhaust_issue_aliases_company_scope_claim_uq`);
+        await tx.execute(sql`drop index exhaust_issue_aliases_issue_kind_value_uq`);
+        await tx.execute(sql`drop table exhaust_issue_alias_conflicts`);
+        await tx.execute(sql`
+          insert into exhaust_issue_aliases
+            (id, company_id, issue_id, kind, value, source_issue_id, work_parent_id)
+          values
+            (${keeperAliasRowId}::uuid, ${companyId}::uuid, ${issue.id}::uuid, 'legacy_hash', 'abababababababab', ${source.id}::uuid, ${parent.id}::uuid),
+            (${loserAliasRowIds[0]}::uuid, ${companyId}::uuid, ${issue.id}::uuid, 'legacy_hash', 'abababababababab', ${source.id}::uuid, ${parent.id}::uuid),
+            (${loserAliasRowIds[1]}::uuid, ${companyId}::uuid, ${issue.id}::uuid, 'legacy_hash', 'abababababababab', ${source.id}::uuid, ${parent.id}::uuid)
+        `);
+        for (const statement of migration.split("--> statement-breakpoint")) {
+          if (statement.trim()) await tx.execute(sql.raw(statement));
+        }
+
+        const retained = Array.from(await tx.execute(sql<{ id: string }>`
+          select id from exhaust_issue_aliases
+          where issue_id = ${issue.id}::uuid and kind = 'legacy_hash' and value = 'abababababababab'
+        `));
+        const quarantined = Array.from(await tx.execute(sql<{ alias_row_id: string }>`
+          select alias_row_id from exhaust_issue_alias_conflicts
+          where issue_id = ${issue.id}::uuid and kind = 'legacy_hash' and value = 'abababababababab'
+          order by alias_row_id
+        `));
+        const indexes = Array.from(await tx.execute(sql<{ indexname: string }>`
+          select indexname from pg_indexes
+          where schemaname = current_schema()
+            and indexname = 'exhaust_issue_aliases_company_scope_claim_uq'
+        `));
+        expect(retained).toEqual([{ id: keeperAliasRowId }]);
+        expect(quarantined.map((row) => row.alias_row_id)).toEqual(loserAliasRowIds);
+        expect(indexes).toHaveLength(1);
+        throw rollbackMarker;
+      })).rejects.toBe(rollbackMarker);
     });
 
     it("backfills only an explicit structured control block and validates alias input", async () => {

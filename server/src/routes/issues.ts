@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
-import { and, asc, desc, eq, inArray, isNull, notInArray, or } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -9119,17 +9119,57 @@ export function issueRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;
-    if (
-      existing.exhaustIdentity
-      && (
+    if (existing.exhaustIdentity) {
+      const controlChangeRequested = req.body.sourceIssueId !== undefined
+        || req.body.exhaustAliases !== undefined
+        || req.body.deliveryFingerprint !== undefined;
+      let controlChanged = false;
+      if (controlChangeRequested) {
+        const aliases = Array.from(await db.execute(sql<{
+          kind: "identity_v1" | "legacy_hash";
+          value: string;
+          source_issue_id: string;
+          delivery_fingerprint: string | null;
+        }>`
+          select kind, value, source_issue_id, delivery_fingerprint
+          from exhaust_issue_aliases
+          where company_id = ${existing.companyId}::uuid
+            and issue_id = ${existing.id}::uuid
+          order by kind, value
+        `)) as Array<{
+          kind: "identity_v1" | "legacy_hash";
+          value: string;
+          source_issue_id: string;
+          delivery_fingerprint: string | null;
+        }>;
+        const canonicalAliases = (values: Array<{ kind: string; value: string }>) => Array.from(
+          new Map(values.map((alias) => [
+            `${alias.kind}\0${alias.value}`,
+            { kind: alias.kind, value: alias.value },
+          ])).values(),
+        ).sort((left, right) => left.kind.localeCompare(right.kind) || left.value.localeCompare(right.value));
+        const sourceIds = [...new Set(aliases.map((alias) => alias.source_issue_id))];
+        const deliveryFingerprints = [...new Set(aliases.map((alias) => alias.delivery_fingerprint))];
+        const persistedSourceIssueId = sourceIds.length === 1 ? sourceIds[0] : null;
+        const persistedDeliveryFingerprint = deliveryFingerprints.length === 1 ? deliveryFingerprints[0] : null;
+        controlChanged = sourceIds.length > 1
+          || deliveryFingerprints.length > 1
+          || (req.body.sourceIssueId !== undefined && req.body.sourceIssueId !== persistedSourceIssueId)
+          || (req.body.deliveryFingerprint !== undefined
+            && req.body.deliveryFingerprint !== persistedDeliveryFingerprint)
+          || (req.body.exhaustAliases !== undefined
+            && JSON.stringify(canonicalAliases(
+              req.body.exhaustAliases as Array<{ kind: string; value: string }>,
+            ))
+              !== JSON.stringify(canonicalAliases(aliases)));
+      }
+      if (
         (req.body.exhaustIdentity !== undefined && req.body.exhaustIdentity !== existing.exhaustIdentity)
         || (req.body.parentId !== undefined && req.body.parentId !== existing.parentId)
-        || req.body.sourceIssueId !== undefined
-        || req.body.exhaustAliases !== undefined
-        || req.body.deliveryFingerprint !== undefined
-      )
-    ) {
-      throw conflict("Exhaust identity and alias scope are immutable");
+        || controlChanged
+      ) {
+        throw conflict("Exhaust identity and alias scope are immutable");
+      }
     }
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
     if (req.actor.type === "agent" && req.body.onBehalfOfUserId != null) {
@@ -9177,6 +9217,9 @@ export function issueRoutes(
       interrupt: interruptRequested,
       hiddenAt: hiddenAtRaw,
       onBehalfOfUserId: _requestedOnBehalfOfUserId,
+      sourceIssueId: _sourceIssueId,
+      exhaustAliases: _exhaustAliases,
+      deliveryFingerprint: _deliveryFingerprint,
       ...updateFields
     } = req.body;
     const reviewPolicyChangeRequested =

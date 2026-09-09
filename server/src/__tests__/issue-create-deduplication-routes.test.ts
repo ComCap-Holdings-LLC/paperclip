@@ -984,7 +984,7 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
       },
     );
 
-    it("falls back to the trusted persisted receipt when the post-ready reread sees no match", async () => {
+    it("returns not found when the authoritative post-ready reread sees no match", async () => {
       const companyId = await seedCompany();
       const parent = await seedParent(companyId);
       const source = await seedParent(companyId);
@@ -1030,11 +1030,23 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
       `);
 
       try {
-        const lookup = await request(app)
+        await request(app)
           .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
           .query({ kind: "legacy_hash", value: alias, sourceIssueId: source.id, workParentId: parent.id })
-          .expect(200);
-        expect(lookup.body.id).toBe(created.body.id);
+          .expect(404, { code: "EXHAUST_ALIAS_NOT_FOUND", error: "Exhaust alias not found" });
+        const [state] = Array.from(await db.execute(sql<{ status: string }>`
+          select status
+          from exhaust_alias_backfill_state
+          where company_id = ${companyId}::uuid
+        `));
+        expect(state.status).toBe("complete");
+        const [remaining] = Array.from(await db.execute(sql<{ count: number }>`
+          select count(*)::integer as count
+          from exhaust_issue_aliases
+          where company_id = ${companyId}::uuid
+            and issue_id = ${created.body.id}::uuid
+        `));
+        expect(remaining.count).toBe(0);
       } finally {
         await db.execute(sql`drop trigger if exists test_drop_exhaust_alias_after_ready on exhaust_alias_backfill_state`);
         await db.execute(sql`drop function if exists test_drop_exhaust_alias_after_ready()`);

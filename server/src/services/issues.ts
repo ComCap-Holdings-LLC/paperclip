@@ -6231,7 +6231,7 @@ export function issueService(db: Db) {
       if (!(await ensureBackfillReady())) {
         return persisted ?? { kind: "not_ready" as const };
       }
-      return resolveMatches(await findMatches()) ?? persisted ?? { kind: "not_found" as const };
+      return resolveMatches(await findMatches()) ?? { kind: "not_found" as const };
     },
 
     getCurrentScheduledRetry: async (issueId: string) => {

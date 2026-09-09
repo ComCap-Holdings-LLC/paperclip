@@ -4393,7 +4393,12 @@ export function issueService(
 ) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
-  const persistExternalExecutorActivity = dependencies.persistActivity ?? persistActivity;
+  // Resolve the optional audit dependency only when an external-executor
+  // lifecycle method uses it. Several unrelated route tests intentionally
+  // provide a narrow activity-log mock, and service construction must not
+  // require exports those routes never call.
+  const persistExternalExecutorActivity: typeof persistActivity = (...args) =>
+    (dependencies.persistActivity ?? persistActivity)(...args);
   const assertExternalExecutorAssignableAgent = dependencies.assertAssignableAgent ?? assertAssignableAgent;
 
   function publishCommittedExternalExecutorActivity(publications: ActivityPublication[]) {

@@ -39,6 +39,11 @@ export const issues = pgTable(
     assigneeUserId: text("assignee_user_id"),
     checkoutRunId: uuid("checkout_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
     executionRunId: uuid("execution_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
+    // External executors use a server-registered run and this monotonically
+    // increasing fence. Legacy checkouts remain compatible because both fields
+    // default to their pre-existing empty/zero state.
+    externalExecutorRunId: uuid("external_executor_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
+    executionVersion: integer("execution_version").notNull().default(0),
     executionAgentNameKey: text("execution_agent_name_key"),
     executionLockedAt: timestamp("execution_locked_at", { withTimezone: true }),
     createdByAgentId: uuid("created_by_agent_id").references(() => agents.id),

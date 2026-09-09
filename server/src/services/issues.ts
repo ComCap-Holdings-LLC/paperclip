@@ -66,7 +66,7 @@ import {
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
-import { isForeignKeyViolation } from "../db-errors.js";
+import { isForeignKeyViolation, isUniqueViolation } from "../db-errors.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
 import {
@@ -87,7 +87,12 @@ import {
   type ParsedExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
-import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
+import {
+  applyIssueExecutionPolicyTransition,
+  buildInitialIssueMonitorFields,
+  normalizeIssueExecutionPolicy,
+  parseIssueExecutionState,
+} from "./issue-execution-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
@@ -95,6 +100,11 @@ import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallbac
 import { getRunLogStore } from "./run-log-store.js";
 import { getDefaultCompanyGoal } from "./goals.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
+import {
+  assertIssueSubtreeHasNoExternalExecutor,
+  lockExternalExecutorScope,
+} from "./external-executor-scope.js";
+import { budgetService } from "./budgets.js";
 import { DEFAULT_INSERT_CHUNK_ROWS, insertRowsInChunks } from "./batch-insert.js";
 import type {
   ImportIssueRow,
@@ -3129,6 +3139,8 @@ const issueListSelect = {
   assigneeUserId: issues.assigneeUserId,
   checkoutRunId: issues.checkoutRunId,
   executionRunId: issues.executionRunId,
+  externalExecutorRunId: issues.externalExecutorRunId,
+  executionVersion: issues.executionVersion,
   executionAgentNameKey: issues.executionAgentNameKey,
   executionLockedAt: issues.executionLockedAt,
   createdByAgentId: issues.createdByAgentId,
@@ -4364,9 +4376,47 @@ async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?:
   }, 0);
 }
 
-export function issueService(db: Db) {
+type ExternalExecutorAuditActor = {
+  actorType: "agent" | "user" | "system";
+  actorId: string;
+  agentId: string | null;
+  runId: string | null;
+  agentApiKeyId: string | null;
+};
+
+export function issueService(
+  db: Db,
+  dependencies: {
+    persistActivity?: typeof persistActivity;
+    assertAssignableAgent?: typeof assertAssignableAgent;
+  } = {},
+) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
+  // Resolve the optional audit dependency only when an external-executor
+  // lifecycle method uses it. Several unrelated route tests intentionally
+  // provide a narrow activity-log mock, and service construction must not
+  // require exports those routes never call.
+  const persistExternalExecutorActivity: typeof persistActivity = (...args) =>
+    (dependencies.persistActivity ?? persistActivity)(...args);
+  const assertExternalExecutorAssignableAgent = dependencies.assertAssignableAgent ?? assertAssignableAgent;
+
+  function publishCommittedExternalExecutorActivity(publications: ActivityPublication[]) {
+    for (const publication of publications) {
+      try {
+        publishActivity(publication);
+      } catch (err) {
+        logger.warn({
+          err,
+          companyId: publication.companyId,
+          action: publication.payload.action,
+          entityId: publication.payload.entityId,
+          runId: publication.payload.runId,
+          lifecycleCommitted: true,
+        }, "failed to publish committed external executor activity");
+      }
+    }
+  }
 
   function normalizeCreateIssueTitle(title: string) {
     return title.trim().replace(/\s+/g, " ").toLowerCase();
@@ -5086,6 +5136,7 @@ export function issueService(db: Db) {
           assigneeAgentId: issues.assigneeAgentId,
           checkoutRunId: issues.checkoutRunId,
           executionRunId: issues.executionRunId,
+          externalExecutorRunId: issues.externalExecutorRunId,
         })
         .from(issues)
         .where(eq(issues.id, input.issueId))
@@ -5096,6 +5147,7 @@ export function issueService(db: Db) {
       }
 
       if (
+        lockedIssue.externalExecutorRunId ||
         lockedIssue.status !== "in_progress" ||
         lockedIssue.assigneeAgentId !== input.actorAgentId ||
         lockedIssue.checkoutRunId !== input.expectedCheckoutRunId
@@ -5147,6 +5199,7 @@ export function issueService(db: Db) {
             eq(issues.status, "in_progress"),
             eq(issues.assigneeAgentId, input.actorAgentId),
             eq(issues.checkoutRunId, input.expectedCheckoutRunId),
+            isNull(issues.externalExecutorRunId),
           ),
         )
         .returning({
@@ -5216,6 +5269,7 @@ export function issueService(db: Db) {
             eq(issues.assigneeAgentId, input.actorAgentId),
             isNull(issues.checkoutRunId),
             or(isNull(issues.executionRunId), eq(issues.executionRunId, input.actorRunId)),
+            isNull(issues.externalExecutorRunId),
           ),
         )
         .returning({
@@ -5245,11 +5299,14 @@ export function issueService(db: Db) {
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
       );
       const issue = await tx
-        .select({ executionRunId: issues.executionRunId })
+        .select({ executionRunId: issues.executionRunId, externalExecutorRunId: issues.externalExecutorRunId })
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
-      if (!issue?.executionRunId) return false;
+      // An external executor binding is cleared only by its terminal or board
+      // recovery CAS. Generic stale-run cleanup must not make that binding
+      // adoptable by an ordinary executor after a process restart.
+      if (!issue?.executionRunId || issue.externalExecutorRunId) return false;
 
       await tx.execute(
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.executionRunId} for update`,
@@ -5303,11 +5360,15 @@ export function issueService(db: Db) {
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
       );
       const issue = await tx
-        .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+        .select({
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+          externalExecutorRunId: issues.externalExecutorRunId,
+        })
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
-      if (!issue?.checkoutRunId) return false;
+      if (!issue?.checkoutRunId || issue.externalExecutorRunId) return false;
 
       await tx.execute(
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.checkoutRunId} for update`,
@@ -7699,6 +7760,10 @@ export function issueService(db: Db) {
       }
 
       const runUpdate = async (tx: any) => {
+        if (issueData.projectId !== undefined || issueData.parentId !== undefined) {
+          await lockExternalExecutorScope(tx as unknown as Db, existing.companyId);
+          await assertIssueSubtreeHasNoExternalExecutor(tx as unknown as Db, existing.companyId, id);
+        }
         // The receipt baseline must be read under the same row lock as the
         // write. Otherwise a concurrent update can be mistaken for a change
         // made by this request.
@@ -7709,6 +7774,20 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        const changesExecutionLifecycle =
+          issueData.status !== undefined ||
+          issueData.assigneeAgentId !== undefined ||
+          issueData.assigneeUserId !== undefined ||
+          issueData.hiddenAt !== undefined;
+        if (receiptExisting.externalExecutorRunId && changesExecutionLifecycle) {
+          throw conflict("External executor owns this issue until terminal CAS or explicit recovery", {
+            issueId: receiptExisting.id,
+            externalExecutorRunId: receiptExisting.externalExecutorRunId,
+          });
+        }
+        if (changesExecutionLifecycle) {
+          patch.executionVersion = receiptExisting.executionVersion + 1;
+        }
         const [previousLabelsByIssueId, previousRelationSummaries] = await Promise.all([
           nextLabelIds !== undefined
             ? labelMapForIssues(tx, [id])
@@ -7988,6 +8067,18 @@ export function issueService(db: Db) {
 
     remove: (id: string) =>
       db.transaction(async (tx) => {
+        await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} for update`);
+        const boundIssue = await tx
+          .select({ id: issues.id, externalExecutorRunId: issues.externalExecutorRunId })
+          .from(issues)
+          .where(eq(issues.id, id))
+          .then((rows) => rows[0] ?? null);
+        if (boundIssue?.externalExecutorRunId) {
+          throw conflict("External executor owns this issue until terminal CAS or explicit recovery", {
+            issueId: boundIssue.id,
+            externalExecutorRunId: boundIssue.externalExecutorRunId,
+          });
+        }
         const attachmentAssetIds = await tx
           .select({ assetId: issueAttachments.assetId })
           .from(issueAttachments)
@@ -8101,6 +8192,7 @@ export function issueService(db: Db) {
             inArray(issues.status, expectedStatuses),
             or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
             executionLockCondition,
+            isNull(issues.externalExecutorRunId),
           ),
         )
         .returning()
@@ -8118,12 +8210,20 @@ export function issueService(db: Db) {
           assigneeAgentId: issues.assigneeAgentId,
           checkoutRunId: issues.checkoutRunId,
           executionRunId: issues.executionRunId,
+          externalExecutorRunId: issues.externalExecutorRunId,
         })
         .from(issues)
         .where(eq(issues.id, id))
         .then((rows) => rows[0] ?? null);
 
       if (!current) throw notFound("Issue not found");
+
+      if (current.externalExecutorRunId) {
+        throw conflict("External executor owns this issue until terminal CAS or explicit recovery", {
+          issueId: current.id,
+          externalExecutorRunId: current.externalExecutorRunId,
+        });
+      }
 
       if (
         current.assigneeAgentId === agentId &&
@@ -8146,6 +8246,7 @@ export function issueService(db: Db) {
               eq(issues.assigneeAgentId, agentId),
               isNull(issues.checkoutRunId),
               or(isNull(issues.executionRunId), eq(issues.executionRunId, checkoutRunId)),
+              isNull(issues.externalExecutorRunId),
             ),
           )
           .returning()
@@ -8207,6 +8308,7 @@ export function issueService(db: Db) {
                 inArray(issues.status, expectedStatuses),
                 eq(issues.executionRunId, current.executionRunId),
                 or(isNull(issues.assigneeAgentId), eq(issues.assigneeAgentId, agentId)),
+                isNull(issues.externalExecutorRunId),
               ),
             )
             .returning()
@@ -8250,6 +8352,7 @@ export function issueService(db: Db) {
             assigneeAgentId: issues.assigneeAgentId,
             checkoutRunId: issues.checkoutRunId,
             executionRunId: issues.executionRunId,
+            externalExecutorRunId: issues.externalExecutorRunId,
           })
           .from(issues)
           .where(eq(issues.id, id))
@@ -8257,6 +8360,12 @@ export function issueService(db: Db) {
       const current = await loadCurrent();
 
       if (!current) throw notFound("Issue not found");
+      if (current.externalExecutorRunId) {
+        throw conflict("External executor owns this issue until terminal CAS or explicit recovery", {
+          issueId: current.id,
+          externalExecutorRunId: current.externalExecutorRunId,
+        });
+      }
 
       const resolveSameRunOwnership = (candidate: {
         id: string;
@@ -8383,6 +8492,554 @@ export function issueService(db: Db) {
       });
     },
 
+    externalExecutorCheckout: async (input: {
+      issueId: string;
+      companyId: string;
+      agentId: string;
+      expectedProjectId: string | null;
+      expectedParentId: string | null;
+      expectedAssigneeAgentId: string | null;
+      runKey: string;
+      expectedExecutionVersion: number;
+      expectedStatuses: string[];
+      audit: ExternalExecutorAuditActor;
+    }) => {
+      const postCommitActivityPublications: ActivityPublication[] = [];
+
+      const result = await db.transaction(async (tx) => {
+        await lockExternalExecutorScope(tx as unknown as Db, input.companyId);
+        // Serializing on the issue makes same-key retries deterministic and
+        // prevents two different executor keys from both observing it idle.
+        await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${input.issueId} for update`);
+        const issue = await tx
+          .select()
+          .from(issues)
+          .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
+          .then((rows) => rows[0] ?? null);
+        if (!issue) throw notFound("Issue not found");
+        const existingRun = await tx
+          .select()
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, input.companyId),
+              eq(heartbeatRuns.externalExecutorRunKey, input.runKey),
+            ),
+          )
+          .then((rows) => rows[0] ?? null);
+        if (existingRun) {
+          const expectedBoundVersion = input.expectedExecutionVersion + 1;
+          // Idempotency is bound to immutable checkout identity, not the run's
+          // mutable lifecycle status. Agent pause and recovery paths may mark
+          // the run terminal while deliberately retaining this exact external
+          // binding for the executor to rediscover and explicitly reconcile.
+          if (
+            existingRun.agentId !== input.agentId ||
+            existingRun.externalExecutorIssueId !== input.issueId ||
+            existingRun.externalExecutorExpectedVersion !== input.expectedExecutionVersion ||
+            issue.externalExecutorRunId !== existingRun.id ||
+            issue.executionVersion !== expectedBoundVersion ||
+            existingRun.externalExecutorVisible !== true ||
+            existingRun.externalExecutorHoldId !== null
+          ) {
+            throw conflict("External executor run key is already bound to a different checkout", {
+              issueId: input.issueId,
+              runKey: input.runKey,
+            });
+          }
+          const [enriched] = await withIssueLabels(tx, [issue]);
+          return {
+            issue: enriched,
+            run: {
+              id: existingRun.id,
+              runKey: input.runKey,
+              executionVersion: issue.executionVersion,
+              holdId: existingRun.externalExecutorHoldId,
+            },
+            idempotent: true,
+          };
+        }
+
+        if (
+          issue.projectId !== input.expectedProjectId ||
+          issue.parentId !== input.expectedParentId ||
+          issue.assigneeAgentId !== input.expectedAssigneeAgentId
+        ) {
+          throw conflict("External executor checkout authority changed before admission", {
+            issueId: issue.id,
+          });
+        }
+        await assertExternalExecutorAssignableAgent(tx as unknown as Db, input.companyId, input.agentId, {
+          kind: "work",
+          lockForUpdate: true,
+          requireInvokable: true,
+        });
+        if (issue.hiddenAt) {
+          throw conflict("External executor checkout cannot bind a hidden issue", { issueId: issue.id });
+        }
+
+        if (issue.projectId) {
+          await tx.execute(sql`select ${projects.id} from ${projects} where ${projects.id} = ${issue.projectId} for update`);
+          const project = await tx
+            .select({ pausedAt: projects.pausedAt, pauseReason: projects.pauseReason })
+            .from(projects)
+            .where(and(eq(projects.id, issue.projectId), eq(projects.companyId, input.companyId)))
+            .then((rows) => rows[0] ?? null);
+          if (project?.pausedAt) {
+            throw conflict(
+              project.pauseReason === "budget"
+                ? "Project is paused because its budget hard-stop was reached"
+                : "Project is paused",
+              { issueId: issue.id, projectId: issue.projectId },
+            );
+          }
+        }
+
+        const budgetBlock = await budgetService(tx as unknown as Db).getInvocationBlock(
+          input.companyId,
+          input.agentId,
+          { issueId: issue.id, projectId: issue.projectId },
+        );
+        if (budgetBlock) {
+          throw conflict("External executor checkout blocked by budget policy", {
+            issueId: issue.id,
+            ...budgetBlock,
+          });
+        }
+
+        if (!input.expectedStatuses.includes(issue.status)) {
+          throw conflict("Issue checkout conflict", {
+            issueId: issue.id,
+            status: issue.status,
+            expectedStatuses: input.expectedStatuses,
+          });
+        }
+        if (issue.executionVersion !== input.expectedExecutionVersion) {
+          throw conflict("External executor checkout used a stale execution version", {
+            issueId: issue.id,
+            expectedExecutionVersion: input.expectedExecutionVersion,
+            actualExecutionVersion: issue.executionVersion,
+          });
+        }
+        const dependencyReadiness = await listIssueDependencyReadinessMap(tx as unknown as Db, input.companyId, [issue.id]);
+        const readiness = dependencyReadiness.get(issue.id);
+        if ((readiness?.unresolvedBlockerIssueIds.length ?? 0) > 0) {
+          throw unprocessable("Issue is blocked by unresolved blockers", {
+            unresolvedBlockerIssueIds: readiness!.unresolvedBlockerIssueIds,
+          });
+        }
+        if (
+          issue.externalExecutorRunId ||
+          issue.executionRunId ||
+          issue.checkoutRunId ||
+          (issue.assigneeAgentId && issue.assigneeAgentId !== input.agentId)
+        ) {
+          throw conflict("Issue already has an active or unreleased execution binding", {
+            issueId: issue.id,
+            externalExecutorRunId: issue.externalExecutorRunId,
+            executionRunId: issue.executionRunId,
+            checkoutRunId: issue.checkoutRunId,
+            assigneeAgentId: issue.assigneeAgentId,
+          });
+        }
+
+        const activeExecutorHold = await treeControlSvc.getActiveExecutorHoldGate(input.companyId, input.issueId, tx);
+        if (activeExecutorHold) {
+          throw conflict("External executor checkout blocked by active subtree control hold", {
+            issueId: input.issueId,
+            holdId: activeExecutorHold.holdId,
+          });
+        }
+
+        const now = new Date();
+        const runId = randomUUID();
+        const boundExecutionVersion = input.expectedExecutionVersion + 1;
+        await tx.insert(heartbeatRuns).values({
+          id: runId,
+          companyId: input.companyId,
+          agentId: input.agentId,
+          invocationSource: "on_demand",
+          status: "running",
+          startedAt: now,
+          externalExecutorRunKey: input.runKey,
+          externalExecutorIssueId: input.issueId,
+          externalExecutorExpectedVersion: input.expectedExecutionVersion,
+          externalExecutorHoldId: null,
+          externalExecutorVisible: true,
+          contextSnapshot: {
+            issueId: input.issueId,
+            source: "issue.external_executor_checkout",
+            runKey: input.runKey,
+            expectedExecutionVersion: input.expectedExecutionVersion,
+            boundExecutionVersion,
+            holdId: null,
+            visible: true,
+          },
+          updatedAt: now,
+        });
+
+        const updated = await tx
+          .update(issues)
+          .set({
+            assigneeAgentId: input.agentId,
+            assigneeUserId: null,
+            checkoutRunId: runId,
+            executionRunId: runId,
+            externalExecutorRunId: runId,
+            executionAgentNameKey: null,
+            executionLockedAt: now,
+            executionVersion: boundExecutionVersion,
+            status: "in_progress",
+            startedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issues.id, input.issueId),
+              eq(issues.companyId, input.companyId),
+              eq(issues.executionVersion, input.expectedExecutionVersion),
+              isNull(issues.hiddenAt),
+              inArray(issues.status, input.expectedStatuses),
+              isNull(issues.externalExecutorRunId),
+              isNull(issues.executionRunId),
+              isNull(issues.checkoutRunId),
+              or(isNull(issues.assigneeAgentId), eq(issues.assigneeAgentId, input.agentId)),
+            ),
+          )
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!updated) {
+          throw conflict("External executor checkout compare-and-swap lost", { issueId: input.issueId });
+        }
+        const { publication } = await persistExternalExecutorActivity(tx as unknown as Db, {
+          companyId: input.companyId, actorType: input.audit.actorType, actorId: input.audit.actorId,
+          agentId: input.audit.agentId, runId, agentApiKeyId: input.audit.agentApiKeyId,
+          action: "issue.external_executor_checked_out", entityType: "issue", entityId: input.issueId,
+          details: { externalExecutorRunId: runId, runKey: input.runKey, expectedExecutionVersion: input.expectedExecutionVersion, boundExecutionVersion, holdId: null },
+        });
+        postCommitActivityPublications.push(publication);
+        const [enriched] = await withIssueLabels(tx, [updated]);
+        return {
+          issue: enriched,
+          run: { id: runId, runKey: input.runKey, executionVersion: boundExecutionVersion, holdId: null },
+          idempotent: false,
+        };
+      }).catch((error) => {
+        // The issue row lock serializes contenders for one issue. The unique
+        // key is the second fence: it prevents the same external run identity
+        // from being claimed concurrently for two different issues.
+        if (isUniqueViolation(error, "heartbeat_runs_external_executor_run_key_uq")) {
+          throw conflict("External executor run key is already bound to a different checkout", {
+            issueId: input.issueId,
+            runKey: input.runKey,
+          });
+        }
+        throw error;
+      });
+      publishCommittedExternalExecutorActivity(postCommitActivityPublications);
+      return result;
+    },
+
+    terminalExternalExecutorRun: async (input: {
+      issueId: string;
+      companyId: string;
+      agentId: string;
+      expectedProjectId: string | null;
+      expectedParentId: string | null;
+      expectedAssigneeAgentId: string | null;
+      runKey: string;
+      expectedExecutionVersion: number;
+      issueStatus: "todo" | "blocked" | "in_review" | "done" | "cancelled";
+      outcome: "succeeded" | "failed" | "cancelled";
+      error?: string | null;
+      audit: ExternalExecutorAuditActor;
+    }) => {
+      const postCommitActivityPublications: ActivityPublication[] = [];
+      const result = await db.transaction(async (tx) => {
+      await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${input.issueId} for update`);
+      const issue = await tx
+        .select()
+        .from(issues)
+        .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
+        .then((rows) => rows[0] ?? null);
+      if (!issue) throw notFound("Issue not found");
+      if (
+        issue.projectId !== input.expectedProjectId ||
+        issue.parentId !== input.expectedParentId ||
+        issue.assigneeAgentId !== input.expectedAssigneeAgentId
+      ) {
+        throw conflict("External executor terminal authority changed before mutation", {
+          issueId: issue.id,
+        });
+      }
+      const runId = issue.externalExecutorRunId;
+      if (!runId || issue.executionRunId !== runId || issue.checkoutRunId !== runId) {
+        throw conflict("No active external executor run owns this issue", { issueId: input.issueId });
+      }
+      if (issue.executionVersion !== input.expectedExecutionVersion) {
+        throw conflict("External executor terminal update used a stale execution version", {
+          issueId: input.issueId,
+          expectedExecutionVersion: input.expectedExecutionVersion,
+          actualExecutionVersion: issue.executionVersion,
+        });
+      }
+      const run = await tx
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      if (
+        !run ||
+        run.companyId !== input.companyId ||
+        run.agentId !== input.agentId ||
+        run.externalExecutorRunKey !== input.runKey ||
+        run.externalExecutorIssueId !== input.issueId ||
+        run.externalExecutorExpectedVersion !== input.expectedExecutionVersion - 1 ||
+        run.externalExecutorVisible !== true ||
+        run.externalExecutorHoldId !== null ||
+        !["running", "interrupted", "timed_out"].includes(run.status)
+      ) {
+        throw conflict("External executor terminal update does not own the active run", {
+          issueId: input.issueId,
+          runKey: input.runKey,
+        });
+      }
+
+      const pendingExecutionReview = parseIssueExecutionState(issue.executionState)?.status === "pending";
+      const [pendingInteraction, pendingApproval] = await Promise.all([
+        tx
+          .select({ id: issueThreadInteractions.id })
+          .from(issueThreadInteractions)
+          .where(and(
+            eq(issueThreadInteractions.companyId, input.companyId),
+            eq(issueThreadInteractions.issueId, input.issueId),
+            eq(issueThreadInteractions.status, "pending"),
+          ))
+          .limit(1)
+          .then((rows) => rows[0] ?? null),
+        tx
+          .select({ id: approvals.id })
+          .from(issueApprovals)
+          .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+          .where(and(
+            eq(issueApprovals.companyId, input.companyId),
+            eq(issueApprovals.issueId, input.issueId),
+            eq(approvals.status, "pending"),
+          ))
+          .limit(1)
+          .then((rows) => rows[0] ?? null),
+      ]);
+      if (
+        input.issueStatus === "done" &&
+        (pendingExecutionReview || pendingInteraction || pendingApproval)
+      ) {
+        throw unprocessable("External executor cannot complete an issue while review or approval is pending");
+      }
+      if (input.issueStatus === "blocked" && !issue.unblockDescriptor && !pendingInteraction && !pendingApproval) {
+        const blockerIds = await tx
+          .select({ id: issueRelations.issueId })
+          .from(issueRelations)
+          .where(and(
+            eq(issueRelations.companyId, input.companyId),
+            eq(issueRelations.relatedIssueId, input.issueId),
+            eq(issueRelations.type, "blocks"),
+          ))
+          .then((rows) => rows.map((row) => row.id));
+        const unresolvedBlocker = blockerIds.length > 0
+          ? await tx
+            .select({ id: issues.id })
+            .from(issues)
+            .where(and(
+              eq(issues.companyId, input.companyId),
+              inArray(issues.id, blockerIds),
+              ne(issues.status, "done"),
+            ))
+            .limit(1)
+            .then((rows) => rows[0] ?? null)
+          : null;
+        if (!unresolvedBlocker) {
+          throw unprocessable("Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor");
+        }
+      }
+
+      const executionPolicy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
+      const executionPolicyTransition = applyIssueExecutionPolicyTransition({
+        issue,
+        policy: executionPolicy,
+        previousPolicy: executionPolicy,
+        requestedStatus: input.issueStatus,
+        requestedAssigneePatch: {},
+        actor: { agentId: input.agentId },
+      });
+      const effectiveIssueStatus = typeof executionPolicyTransition.patch.status === "string"
+        ? executionPolicyTransition.patch.status
+        : input.issueStatus;
+      const now = new Date();
+      const statusPatch = applyStatusSideEffects(effectiveIssueStatus, {});
+      const updated = await tx
+        .update(issues)
+        .set({
+          ...(executionPolicyTransition.patch as Partial<typeof issues.$inferInsert>),
+          ...statusPatch,
+          status: effectiveIssueStatus,
+          ...(effectiveIssueStatus !== "done" ? { completedAt: null } : {}),
+          ...(effectiveIssueStatus !== "cancelled" ? { cancelledAt: null } : {}),
+          checkoutRunId: null,
+          executionRunId: null,
+          externalExecutorRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          executionVersion: input.expectedExecutionVersion + 1,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(issues.id, input.issueId),
+            eq(issues.companyId, input.companyId),
+            eq(issues.executionVersion, input.expectedExecutionVersion),
+            eq(issues.status, "in_progress"),
+            eq(issues.assigneeAgentId, input.agentId),
+            eq(issues.externalExecutorRunId, runId),
+            eq(issues.executionRunId, runId),
+            eq(issues.checkoutRunId, runId),
+          ),
+        )
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!updated) throw conflict("External executor terminal compare-and-swap lost", { issueId: input.issueId });
+
+      const terminalized = await tx
+        .update(heartbeatRuns)
+        .set({
+          status: input.outcome,
+          finishedAt: now,
+          error: input.error ?? null,
+          updatedAt: now,
+        })
+        // A lease teardown can fence the issue binding while marking the
+        // heartbeat run interrupted/timed_out. The same run-key/version CAS
+        // may still report its result; do not let it overwrite an intentional
+        // cancellation or another concurrent terminal outcome.
+        .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, run.status)))
+        .returning({ id: heartbeatRuns.id })
+        .then((rows) => rows[0] ?? null);
+      if (!terminalized) throw conflict("External executor run was terminalized concurrently", { issueId: input.issueId });
+      const { publication } = await persistExternalExecutorActivity(tx as unknown as Db, {
+        companyId: input.companyId, actorType: input.audit.actorType, actorId: input.audit.actorId,
+        agentId: input.audit.agentId, runId, agentApiKeyId: input.audit.agentApiKeyId,
+        action: "issue.external_executor_terminalized", entityType: "issue", entityId: input.issueId,
+        details: { externalExecutorRunId: runId, runKey: input.runKey, expectedExecutionVersion: input.expectedExecutionVersion, executionVersion: updated.executionVersion, issueStatus: input.issueStatus, outcome: input.outcome },
+      });
+      postCommitActivityPublications.push(publication);
+
+      const [enriched] = await withIssueLabels(tx, [updated]);
+      return { issue: enriched, runId, executionVersion: updated.executionVersion };
+      });
+      publishCommittedExternalExecutorActivity(postCommitActivityPublications);
+      return result;
+    },
+
+    recoverExternalExecutorRun: async (input: {
+      issueId: string;
+      companyId: string;
+      runKey: string;
+      expectedExecutionVersion: number;
+      reason: string;
+      audit: ExternalExecutorAuditActor;
+    }) => {
+      const postCommitActivityPublications: ActivityPublication[] = [];
+      const result = await db.transaction(async (tx) => {
+      await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${input.issueId} for update`);
+      const issue = await tx
+        .select()
+        .from(issues)
+        .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
+        .then((rows) => rows[0] ?? null);
+      if (!issue) throw notFound("Issue not found");
+      const runId = issue.externalExecutorRunId;
+      if (!runId || issue.executionVersion !== input.expectedExecutionVersion) {
+        throw conflict("External executor recovery used a stale or inactive binding", { issueId: input.issueId });
+      }
+      const run = await tx
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      if (
+        !run ||
+        run.companyId !== input.companyId ||
+        run.externalExecutorRunKey !== input.runKey ||
+        run.externalExecutorIssueId !== input.issueId ||
+        run.externalExecutorExpectedVersion !== input.expectedExecutionVersion - 1 ||
+        run.externalExecutorVisible !== true ||
+        run.externalExecutorHoldId !== null ||
+        !["running", "failed", "interrupted", "cancelled", "timed_out"].includes(run.status)
+      ) {
+        throw conflict("External executor recovery does not match the active run", {
+          issueId: input.issueId,
+          runKeyMatches: run?.externalExecutorRunKey === input.runKey,
+          issueMatches: run?.externalExecutorIssueId === input.issueId,
+          expectedVersionMatches: run?.externalExecutorExpectedVersion === input.expectedExecutionVersion - 1,
+          visible: run?.externalExecutorVisible ?? null,
+          holdId: run?.externalExecutorHoldId ?? null,
+          runStatus: run?.status ?? null,
+        });
+      }
+      // The external binding is the authoritative fence. Secondary execution
+      // locks can be absent after a partial persistence failure, but recovery
+      // still requires this exact issue, run key, and execution version above.
+      const repairedSecondaryLocks = issue.checkoutRunId !== runId || issue.executionRunId !== runId;
+      const now = new Date();
+      const updated = await tx
+        .update(issues)
+        .set({
+          status: "todo",
+          checkoutRunId: null,
+          executionRunId: null,
+          externalExecutorRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          executionVersion: input.expectedExecutionVersion + 1,
+          updatedAt: now,
+        })
+        .where(and(
+          eq(issues.id, input.issueId),
+          eq(issues.companyId, input.companyId),
+          eq(issues.executionVersion, input.expectedExecutionVersion),
+          eq(issues.externalExecutorRunId, runId),
+        ))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!updated) throw conflict("External executor recovery compare-and-swap lost", { issueId: input.issueId });
+      if (run.status === "running") {
+        const recovered = await tx
+          .update(heartbeatRuns)
+          .set({ status: "timed_out", finishedAt: now, error: input.reason, updatedAt: now })
+          .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")))
+          .returning({ id: heartbeatRuns.id })
+          .then((rows) => rows[0] ?? null);
+        if (!recovered) throw conflict("External executor run changed during recovery", { issueId: input.issueId });
+      }
+      const { publication } = await persistExternalExecutorActivity(tx as unknown as Db, {
+        companyId: input.companyId, actorType: input.audit.actorType, actorId: input.audit.actorId,
+        agentId: input.audit.agentId, runId, agentApiKeyId: input.audit.agentApiKeyId,
+        action: "issue.external_executor_recovered", entityType: "issue", entityId: input.issueId,
+        details: {
+          externalExecutorRunId: runId,
+          runKey: input.runKey,
+          expectedExecutionVersion: input.expectedExecutionVersion,
+          executionVersion: updated.executionVersion,
+          repairedSecondaryLocks,
+        },
+      });
+      postCommitActivityPublications.push(publication);
+      const [enriched] = await withIssueLabels(tx, [updated]);
+      return { issue: enriched, runId, executionVersion: updated.executionVersion, repairedSecondaryLocks };
+      });
+      publishCommittedExternalExecutorActivity(postCommitActivityPublications);
+      return result;
+    },
+
     release: async (id: string, actorAgentId?: string, actorRunId?: string | null) =>
       db.transaction(async (tx) => {
         await tx.execute(
@@ -8395,6 +9052,12 @@ export function issueService(db: Db) {
           .then((rows) => rows[0] ?? null);
 
         if (!existing) return null;
+        if (existing.externalExecutorRunId) {
+          throw conflict("External executor owns this issue until terminal CAS or explicit recovery", {
+            issueId: existing.id,
+            externalExecutorRunId: existing.externalExecutorRunId,
+          });
+        }
         if (actorAgentId && existing.assigneeAgentId && existing.assigneeAgentId !== actorAgentId) {
           throw conflict("Only assignee can release issue");
         }
@@ -8427,6 +9090,7 @@ export function issueService(db: Db) {
             executionRunId: null,
             executionAgentNameKey: null,
             executionLockedAt: null,
+            executionVersion: existing.executionVersion + 1,
             updatedAt: new Date(),
           })
           .where(eq(issues.id, id))
@@ -8447,17 +9111,26 @@ export function issueService(db: Db) {
             id: issues.id,
             checkoutRunId: issues.checkoutRunId,
             executionRunId: issues.executionRunId,
+            externalExecutorRunId: issues.externalExecutorRunId,
+            executionVersion: issues.executionVersion,
           })
           .from(issues)
           .where(eq(issues.id, id))
           .then((rows) => rows[0] ?? null);
         if (!existing) return null;
+        if (existing.externalExecutorRunId) {
+          throw conflict("External executor owns this issue until terminal CAS or explicit recovery", {
+            issueId: existing.id,
+            externalExecutorRunId: existing.externalExecutorRunId,
+          });
+        }
 
         const patch: Partial<typeof issues.$inferInsert> = {
           checkoutRunId: null,
           executionRunId: null,
           executionAgentNameKey: null,
           executionLockedAt: null,
+          executionVersion: existing.executionVersion + 1,
           updatedAt: new Date(),
         };
         if (options.clearAssignee) {

@@ -14,6 +14,7 @@ type AssignabilityAgent = AgentEligibilityAgent;
 
 type AgentAssignmentConflictReason =
   | "pending_approval"
+  | "assignee_paused"
   | "assignee_terminated"
   | "assignee_unknown_status"
   | "ancestor_terminated"
@@ -23,6 +24,9 @@ type AgentAssignmentConflictReason =
   | "ancestor_depth_exceeded";
 
 function assignmentMessage(kind: AgentAssignmentKind, reason: AgentAssignmentConflictReason) {
+  if (reason === "assignee_paused") {
+    return "Cannot start work for a paused agent";
+  }
   if (reason === "pending_approval") {
     return kind === "routine"
       ? "Cannot assign routines to pending approval agents"
@@ -67,8 +71,8 @@ function conflictDetails(input: {
   };
 }
 
-async function getAgent(db: Db, agentId: string): Promise<AssignabilityAgent | null> {
-  return db
+async function getAgent(db: Db, agentId: string, lockForUpdate = false): Promise<AssignabilityAgent | null> {
+  const query = db
     .select({
       id: agents.id,
       companyId: agents.companyId,
@@ -77,12 +81,13 @@ async function getAgent(db: Db, agentId: string): Promise<AssignabilityAgent | n
       reportsTo: agents.reportsTo,
     })
     .from(agents)
-    .where(eq(agents.id, agentId))
-    .then((rows) => rows[0] ?? null);
+    .where(eq(agents.id, agentId));
+  const rows = lockForUpdate ? await query.for("update") : await query;
+  return rows[0] ?? null;
 }
 
-async function listCompanyAgents(db: Db, companyId: string): Promise<AssignabilityAgent[]> {
-  return db
+async function listCompanyAgents(db: Db, companyId: string, lockForUpdate = false): Promise<AssignabilityAgent[]> {
+  const query = db
     .select({
       id: agents.id,
       companyId: agents.companyId,
@@ -91,7 +96,9 @@ async function listCompanyAgents(db: Db, companyId: string): Promise<Assignabili
       reportsTo: agents.reportsTo,
     })
     .from(agents)
-    .where(eq(agents.companyId, companyId));
+    .where(eq(agents.companyId, companyId))
+    .orderBy(agents.id);
+  return lockForUpdate ? query.for("update") : query;
 }
 
 function assignmentReasonFromHealth(health: AgentOrgChainHealth): AgentAssignmentConflictReason {
@@ -105,17 +112,22 @@ export async function assertAssignableAgent(
   db: Db,
   companyId: string,
   agentId: string | null | undefined,
-  options: { kind?: AgentAssignmentKind } = {},
+  options: {
+    kind?: AgentAssignmentKind;
+    lockForUpdate?: boolean;
+    requireInvokable?: boolean;
+  } = {},
 ) {
   if (!agentId) return;
   const kind = options.kind ?? "work";
-  const assignee = await getAgent(db, agentId);
+  const companyAgents = await listCompanyAgents(db, companyId, options.lockForUpdate);
+  const assignee = companyAgents.find((candidate) => candidate.id === agentId)
+    ?? await getAgent(db, agentId, options.lockForUpdate);
   if (!assignee) throw notFound("Assignee agent not found");
   if (assignee.companyId !== companyId) {
     throw unprocessable("Assignee must belong to same company");
   }
 
-  const companyAgents = await listCompanyAgents(db, companyId);
   const eligibility = getAgentWorkEligibility({ agent: assignee, agents: companyAgents });
   const chain = eligibility.orgChainHealth.fullChain.map((entry) => ({
     id: entry.id,
@@ -125,9 +137,20 @@ export async function assertAssignableAgent(
     reportsTo: entry.reportsTo,
   }));
 
-  if (eligibility.assignable) return;
+  const eligibilityReason = options.requireInvokable
+    ? eligibility.invokabilityReason
+    : eligibility.assignabilityReason;
+  if (eligibilityReason === "eligible") return;
 
-  if (eligibility.assignabilityReason === "pending_approval") {
+  if (eligibilityReason === "paused") {
+    throw conflict(assignmentMessage(kind, "assignee_paused"), conflictDetails({
+      companyId,
+      assigneeAgentId: agentId,
+      reason: "assignee_paused",
+      chain,
+    }));
+  }
+  if (eligibilityReason === "pending_approval") {
     throw conflict(assignmentMessage(kind, "pending_approval"), conflictDetails({
       companyId,
       assigneeAgentId: agentId,
@@ -135,7 +158,7 @@ export async function assertAssignableAgent(
       chain,
     }));
   }
-  if (eligibility.assignabilityReason === "terminated") {
+  if (eligibilityReason === "terminated") {
     throw conflict(assignmentMessage(kind, "assignee_terminated"), conflictDetails({
       companyId,
       assigneeAgentId: agentId,
@@ -143,7 +166,7 @@ export async function assertAssignableAgent(
       chain,
     }));
   }
-  if (eligibility.assignabilityReason === "unknown_status") {
+  if (eligibilityReason === "unknown_status") {
     throw conflict(assignmentMessage(kind, "assignee_unknown_status"), conflictDetails({
       companyId,
       assigneeAgentId: agentId,

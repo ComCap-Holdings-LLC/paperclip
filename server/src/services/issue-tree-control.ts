@@ -23,6 +23,7 @@ import {
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
+import { lockExternalExecutorScope } from "./external-executor-scope.js";
 
 type IssueRow = typeof issues.$inferSelect;
 type HoldRow = typeof issueTreeHolds.$inferSelect;
@@ -565,11 +566,13 @@ export function issueTreeControlService(db: Db) {
       .orderBy(asc(issueTreeHolds.createdAt), asc(issueTreeHolds.id));
   }
 
-  async function getActivePauseHoldGate(
+  async function getActiveHoldGate(
     companyId: string,
     issueId: string,
-  ): Promise<ActiveIssueTreePauseHoldGate | null> {
-    const activePauseHolds = await db
+    modes: readonly ("pause" | "cancel")[],
+    dbOrTx: Pick<Db, "select"> = db,
+  ): Promise<(Omit<ActiveIssueTreePauseHoldGate, "mode"> & { mode: "pause" | "cancel" }) | null> {
+    const activeHolds = await dbOrTx
       .select({
         id: issueTreeHolds.id,
         rootIssueId: issueTreeHolds.rootIssueId,
@@ -581,13 +584,13 @@ export function issueTreeControlService(db: Db) {
         and(
           eq(issueTreeHolds.companyId, companyId),
           eq(issueTreeHolds.status, "active"),
-          eq(issueTreeHolds.mode, "pause"),
+          inArray(issueTreeHolds.mode, [...modes]),
         ),
       )
       .orderBy(asc(issueTreeHolds.createdAt), asc(issueTreeHolds.id));
-    if (activePauseHolds.length === 0) return null;
+    if (activeHolds.length === 0) return null;
 
-    const holdByRootIssueId = new Map(activePauseHolds.map((hold) => [hold.rootIssueId, hold]));
+    const holdByRootIssueId = new Map(activeHolds.map((hold) => [hold.rootIssueId, hold]));
     let currentIssueId: string | null = issueId;
     const visited = new Set<string>();
 
@@ -610,7 +613,7 @@ export function issueTreeControlService(db: Db) {
         };
       }
 
-      const parent: { parentId: string | null } | null = await db
+      const parent: { parentId: string | null } | null = await dbOrTx
         .select({ parentId: issues.parentId })
         .from(issues)
         .where(and(eq(issues.id, currentIssueId), eq(issues.companyId, companyId)))
@@ -619,6 +622,21 @@ export function issueTreeControlService(db: Db) {
     }
 
     return null;
+  }
+
+  async function getActivePauseHoldGate(
+    companyId: string,
+    issueId: string,
+  ): Promise<ActiveIssueTreePauseHoldGate | null> {
+    return getActiveHoldGate(companyId, issueId, ["pause"]) as Promise<ActiveIssueTreePauseHoldGate | null>;
+  }
+
+  async function getActiveExecutorHoldGate(
+    companyId: string,
+    issueId: string,
+    dbOrTx: Pick<Db, "select"> = db,
+  ) {
+    return getActiveHoldGate(companyId, issueId, ["pause", "cancel"], dbOrTx);
   }
 
   async function preview(
@@ -726,6 +744,7 @@ export function issueTreeControlService(db: Db) {
       const releaseReason = input.reason ?? "Subtree resume applied.";
 
       const { hold: resumeHold } = await db.transaction(async (tx) => {
+        await lockExternalExecutorScope(tx as unknown as Db, companyId);
         const [createdHold] = await tx
           .insert(issueTreeHolds)
           .values({
@@ -804,6 +823,47 @@ export function issueTreeControlService(db: Db) {
     }
 
     const { hold, members } = await db.transaction(async (tx) => {
+      await lockExternalExecutorScope(tx as unknown as Db, companyId);
+      // A pause/cancel hold and an external executor checkout share the issue-row
+      // fence. Lock the complete target tree in a stable order before either
+      // operation can commit. If checkout won, the hold is rejected instead
+      // of creating a control hold that silently races an active executor.
+      const holdIssueIds = [...new Set(holdPreview.issues.map((issue) => issue.id))].sort();
+      if ((input.mode === "pause" || input.mode === "cancel") && holdIssueIds.length > 0) {
+        await tx.execute(sql`
+          select ${issues.id}
+          from ${issues}
+          where ${issues.companyId} = ${companyId} and ${inArray(issues.id, holdIssueIds)}
+          order by ${issues.id}
+          for update
+        `);
+        const activeExternalIssue = await tx
+          .select({ id: issues.id, externalExecutorRunId: issues.externalExecutorRunId })
+          .from(issues)
+          .where(
+            and(
+              eq(issues.companyId, companyId),
+              inArray(issues.id, holdIssueIds),
+              sql`${issues.externalExecutorRunId} is not null`,
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (activeExternalIssue) {
+          throw conflict("Cannot create a tree control hold while an external executor run is active", {
+            issueId: activeExternalIssue.id,
+            externalExecutorRunId: activeExternalIssue.externalExecutorRunId,
+          });
+        }
+        // A later checkout must present a fresh version even after this hold
+        // is released. This invalidates requests that read before the control
+        // operation acquired its row lock.
+        await tx
+          .update(issues)
+          .set({ executionVersion: sql`${issues.executionVersion} + 1`, updatedAt: new Date() })
+          .where(and(eq(issues.companyId, companyId), inArray(issues.id, holdIssueIds)));
+      }
+
       const [createdHold] = await tx
         .insert(issueTreeHolds)
         .values({
@@ -871,6 +931,28 @@ export function issueTreeControlService(db: Db) {
 
     const now = new Date();
     const updated = await db.transaction(async (tx) => {
+      await lockExternalExecutorScope(tx as unknown as Db, companyId);
+      const lockedIssueIds = [...issueIds].sort();
+      await tx.execute(sql`
+        select ${issues.id}
+        from ${issues}
+        where ${issues.companyId} = ${companyId} and ${inArray(issues.id, lockedIssueIds)}
+        order by ${issues.id}
+        for update
+      `);
+      const activeExternalIssue = await tx
+        .select({ id: issues.id, externalExecutorRunId: issues.externalExecutorRunId })
+        .from(issues)
+        .where(and(
+          eq(issues.companyId, companyId),
+          inArray(issues.id, lockedIssueIds),
+          sql`${issues.externalExecutorRunId} is not null`,
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (activeExternalIssue) {
+        throw conflict("Cannot cancel an issue with an active external executor run", activeExternalIssue);
+      }
       const rows = await tx
         .update(issues)
         .set({
@@ -881,6 +963,7 @@ export function issueTreeControlService(db: Db) {
           executionRunId: null,
           executionAgentNameKey: null,
           executionLockedAt: null,
+          executionVersion: sql`${issues.executionVersion} + 1`,
           updatedAt: now,
         })
         .where(
@@ -971,7 +1054,31 @@ export function issueTreeControlService(db: Db) {
     const now = new Date();
     const releasedCancelHoldIds = activeCancelHolds.map((hold) => hold.id);
     const updatedIssues = await db.transaction(async (tx) => {
+      await lockExternalExecutorScope(tx as unknown as Db, companyId);
       const restored: TreeStatusUpdateResult["updatedIssues"] = [];
+      const lockedIssueIds = [...restoreStatusByIssueId.keys()].sort();
+      if (lockedIssueIds.length > 0) {
+        await tx.execute(sql`
+          select ${issues.id}
+          from ${issues}
+          where ${issues.companyId} = ${companyId} and ${inArray(issues.id, lockedIssueIds)}
+          order by ${issues.id}
+          for update
+        `);
+        const activeExternalIssue = await tx
+          .select({ id: issues.id, externalExecutorRunId: issues.externalExecutorRunId })
+          .from(issues)
+          .where(and(
+            eq(issues.companyId, companyId),
+            inArray(issues.id, lockedIssueIds),
+            sql`${issues.externalExecutorRunId} is not null`,
+          ))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (activeExternalIssue) {
+          throw conflict("Cannot restore an issue with an active external executor run", activeExternalIssue);
+        }
+      }
       for (const [status, issueIdsForStatus] of issueIdsByStatus) {
         if (issueIdsForStatus.length === 0) continue;
         const rows = await tx
@@ -984,6 +1091,7 @@ export function issueTreeControlService(db: Db) {
             executionRunId: null,
             executionAgentNameKey: null,
             executionLockedAt: null,
+            executionVersion: sql`${issues.executionVersion} + 1`,
             updatedAt: now,
           })
           .where(
@@ -1127,22 +1235,58 @@ export function issueTreeControlService(db: Db) {
       actor: ActorInput;
     },
   ) {
-    const existing = await db
-      .select()
-      .from(issueTreeHolds)
-      .where(and(eq(issueTreeHolds.id, holdId), eq(issueTreeHolds.companyId, companyId)))
-      .then((rows) => rows[0] ?? null);
-    if (!existing) throw notFound("Issue tree hold not found");
-    if (existing.rootIssueId !== rootIssueId) {
-      throw unprocessable("Issue tree hold does not belong to the requested root issue");
-    }
-    if (existing.status === "released") {
-      throw conflict("Issue tree hold is already released");
-    }
+    return db.transaction(async (tx) => {
+      await lockExternalExecutorScope(tx as unknown as Db, companyId);
+      const existing = await tx
+        .select()
+        .from(issueTreeHolds)
+        .where(and(eq(issueTreeHolds.id, holdId), eq(issueTreeHolds.companyId, companyId)))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!existing) throw notFound("Issue tree hold not found");
+      if (existing.rootIssueId !== rootIssueId) {
+        throw unprocessable("Issue tree hold does not belong to the requested root issue");
+      }
+      if (existing.status === "released") {
+        throw conflict("Issue tree hold is already released");
+      }
 
-    const [updated] = await db
-      .update(issueTreeHolds)
-      .set({
+      const members = await tx
+        .select()
+        .from(issueTreeHoldMembers)
+        .where(and(eq(issueTreeHoldMembers.companyId, companyId), eq(issueTreeHoldMembers.holdId, holdId)))
+        .orderBy(asc(issueTreeHoldMembers.depth), asc(issueTreeHoldMembers.createdAt), asc(issueTreeHoldMembers.issueId));
+      const memberIssueIds = [...new Set(members.map((member) => member.issueId))].sort();
+      if ((existing.mode === "pause" || existing.mode === "cancel") && memberIssueIds.length > 0) {
+        await tx.execute(sql`
+          select ${issues.id}
+          from ${issues}
+          where ${issues.companyId} = ${companyId} and ${inArray(issues.id, memberIssueIds)}
+          order by ${issues.id}
+          for update
+        `);
+        const activeExternalIssue = await tx
+          .select({ id: issues.id, externalExecutorRunId: issues.externalExecutorRunId })
+          .from(issues)
+          .where(and(
+            eq(issues.companyId, companyId),
+            inArray(issues.id, memberIssueIds),
+            sql`${issues.externalExecutorRunId} is not null`,
+          ))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (activeExternalIssue) {
+          throw conflict("Cannot release a tree control hold while an external executor run is active", activeExternalIssue);
+        }
+        await tx
+          .update(issues)
+          .set({ executionVersion: sql`${issues.executionVersion} + 1`, updatedAt: new Date() })
+          .where(and(eq(issues.companyId, companyId), inArray(issues.id, memberIssueIds)));
+      }
+
+      const [updated] = await tx
+        .update(issueTreeHolds)
+        .set({
         status: "released",
         releasedAt: new Date(),
         releasedByActorType: input.actor.actorType,
@@ -1155,17 +1299,16 @@ export function issueTreeControlService(db: Db) {
           : existing.releasePolicy,
         releaseMetadata: input.metadata ?? null,
         updatedAt: new Date(),
-      })
-      .where(and(eq(issueTreeHolds.id, holdId), eq(issueTreeHolds.companyId, companyId)))
-      .returning();
-
-    const members = await db
-      .select()
-      .from(issueTreeHoldMembers)
-      .where(and(eq(issueTreeHoldMembers.companyId, companyId), eq(issueTreeHoldMembers.holdId, holdId)))
-      .orderBy(asc(issueTreeHoldMembers.depth), asc(issueTreeHoldMembers.createdAt), asc(issueTreeHoldMembers.issueId));
-
-    return toHold(updated, members);
+        })
+        .where(and(
+          eq(issueTreeHolds.id, holdId),
+          eq(issueTreeHolds.companyId, companyId),
+          eq(issueTreeHolds.status, "active"),
+        ))
+        .returning();
+      if (!updated) throw conflict("Issue tree hold was released concurrently");
+      return toHold(updated, members);
+    });
   }
 
   async function cancelUnclaimedWakeupsForTree(companyId: string, rootIssueId: string, reason: string) {
@@ -1206,6 +1349,7 @@ export function issueTreeControlService(db: Db) {
     getHold,
     listHolds,
     getActivePauseHoldGate,
+    getActiveExecutorHoldGate,
     releaseHold,
     cancelUnclaimedWakeupsForTree,
   };

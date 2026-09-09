@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { type AnyPgColumn, pgTable, uuid, text, timestamp, jsonb, index, integer, bigint, boolean } from "drizzle-orm/pg-core";
+import { type AnyPgColumn, pgTable, uuid, text, timestamp, jsonb, index, integer, bigint, boolean, uniqueIndex } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
 import { agentWakeupRequests } from "./agent_wakeup_requests.js";
@@ -33,6 +33,17 @@ export const heartbeatRuns = pgTable(
     stderrExcerpt: text("stderr_excerpt"),
     errorCode: text("error_code"),
     externalRunId: text("external_run_id"),
+    // A client-provided idempotency key is deliberately distinct from
+    // externalRunId, which predates the executor contract and may be used by
+    // adapters with different uniqueness semantics.
+    externalExecutorRunKey: uuid("external_executor_run_key"),
+    externalExecutorIssueId: uuid("external_executor_issue_id"),
+    externalExecutorExpectedVersion: integer("external_executor_expected_version"),
+    externalExecutorHoldId: uuid("external_executor_hold_id"),
+    // Snapshot the visibility predicate that was part of the checkout CAS.
+    // This keeps the executor's authorization envelope inspectable after the
+    // issue itself has changed or the run has completed.
+    externalExecutorVisible: boolean("external_executor_visible"),
     processPid: integer("process_pid"),
     processGroupId: integer("process_group_id"),
     processStartedAt: timestamp("process_started_at", { withTimezone: true }),
@@ -105,5 +116,8 @@ export const heartbeatRuns = pgTable(
       sql`(${table.contextSnapshot} ->> 'taskKey')`,
       table.createdAt.desc(),
     ),
+    externalExecutorRunKeyUq: uniqueIndex("heartbeat_runs_external_executor_run_key_uq")
+      .on(table.companyId, table.externalExecutorRunKey)
+      .where(sql`${table.externalExecutorRunKey} is not null`),
   }),
 );

@@ -24,6 +24,10 @@ import type {
 } from "@paperclipai/shared";
 import { notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
+import {
+  assertProjectScopeHasNoExternalExecutor,
+  lockExternalExecutorScope,
+} from "./external-executor-scope.js";
 
 type ScopeRecord = {
   companyId: string;
@@ -227,14 +231,18 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
     }
 
     if (policy.scopeType === "project") {
-      await db
-        .update(projects)
-        .set({
-          pauseReason: "budget",
-          pausedAt: now,
-          updatedAt: now,
-        })
-        .where(eq(projects.id, policy.scopeId));
+      await db.transaction(async (tx) => {
+        await lockExternalExecutorScope(tx as unknown as Db, policy.companyId);
+        await assertProjectScopeHasNoExternalExecutor(tx as unknown as Db, policy.companyId, policy.scopeId);
+        await tx
+          .update(projects)
+          .set({
+            pauseReason: "budget",
+            pausedAt: now,
+            updatedAt: now,
+          })
+          .where(eq(projects.id, policy.scopeId));
+      });
       return;
     }
 

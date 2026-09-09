@@ -40,6 +40,9 @@ import {
   createIssueLabelSchema,
   createAcceptedPlanDecompositionSchema,
   checkoutIssueSchema,
+  externalExecutorCheckoutSchema,
+  externalExecutorRecoverySchema,
+  externalExecutorTerminalSchema,
   createDocumentAnnotationCommentSchema,
   createDocumentAnnotationThreadSchema,
   createChildIssueSchema,
@@ -10647,6 +10650,12 @@ export function issueRoutes(
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
+    if (existing.externalExecutorRunId) {
+      res.status(409).json({
+        error: "An active external executor run must use its terminal or recovery compare-and-swap endpoint",
+      });
+      return;
+    }
     const attachments = await svc.listAttachments(id);
 
     const issue = await svc.remove(id);
@@ -10680,6 +10689,102 @@ export function issueRoutes(
     res.json(issue);
   });
 
+  async function requireExternalExecutorAgent(
+    req: Request,
+    res: Response,
+    issue: NonNullable<Awaited<ReturnType<typeof svc.getById>>>,
+  ) {
+    if (req.actor.type !== "agent" || req.actor.source !== "agent_key" || !req.actor.agentId) {
+      res.status(403).json({ error: "External executor endpoints require an agent API key" });
+      return null;
+    }
+    const decision = await decideIssueAccess(req, issue, "issue:mutate");
+    if (!decision.allowed) {
+      await denyIssueWrite(req, res, issue, issueWriteDenialCodeForDecision(decision));
+      return null;
+    }
+    if (issue.assigneeAgentId && issue.assigneeAgentId !== req.actor.agentId) {
+      res.status(403).json({ error: "Only the issue assignee may operate its external executor run" });
+      return null;
+    }
+    return req.actor.agentId;
+  }
+
+  router.post("/issues/:id/external-executor/checkout", validate(externalExecutorCheckoutSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    const agentId = await requireExternalExecutorAgent(req, res, issue);
+    if (!agentId) return;
+    if (issue.assigneeAgentId !== agentId) {
+      await assertCanAssignTasks(req, issue.companyId, {
+        issueId: issue.id,
+        projectId: issue.projectId ?? null,
+        parentIssueId: issue.parentId ?? null,
+        assigneeAgentId: agentId,
+        assigneeUserId: null,
+      });
+    }
+    const actor = getActorInfo(req);
+    const result = await svc.externalExecutorCheckout({
+      issueId: id,
+      companyId: issue.companyId,
+      agentId,
+      expectedProjectId: issue.projectId ?? null,
+      expectedParentId: issue.parentId ?? null,
+      expectedAssigneeAgentId: issue.assigneeAgentId ?? null,
+      runKey: req.body.runKey,
+      expectedExecutionVersion: req.body.expectedExecutionVersion,
+      expectedStatuses: req.body.expectedStatuses,
+      audit: { ...actor },
+    });
+    res.status(result.idempotent ? 200 : 201).json(result);
+  });
+
+  router.post("/issues/:id/external-executor/terminal", validate(externalExecutorTerminalSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    const agentId = await requireExternalExecutorAgent(req, res, issue);
+    if (!agentId) return;
+    const actor = getActorInfo(req);
+    const result = await svc.terminalExternalExecutorRun({
+      issueId: id,
+      companyId: issue.companyId,
+      agentId,
+      expectedProjectId: issue.projectId ?? null,
+      expectedParentId: issue.parentId ?? null,
+      expectedAssigneeAgentId: issue.assigneeAgentId ?? null,
+      runKey: req.body.runKey,
+      expectedExecutionVersion: req.body.expectedExecutionVersion,
+      issueStatus: req.body.issueStatus,
+      outcome: req.body.outcome,
+      error: req.body.error,
+      audit: { ...actor },
+    });
+    res.json(result);
+  });
+
+  router.post("/issues/:id/external-executor/recover", validate(externalExecutorRecoverySchema), async (req, res) => {
+    if (req.actor.type !== "board" || !req.actor.userId) {
+      res.status(403).json({ error: "Board user context required" });
+      return;
+    }
+    const id = req.params.id as string;
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    const actor = getActorInfo(req);
+    const result = await svc.recoverExternalExecutorRun({
+      issueId: id,
+      companyId: issue.companyId,
+      runKey: req.body.runKey,
+      expectedExecutionVersion: req.body.expectedExecutionVersion,
+      reason: req.body.reason,
+      audit: { ...actor },
+    });
+    res.json(result);
+  });
+
   router.post("/issues/:id/pull-runs", validate(startPullRunSchema), async (req, res) => {
     const actor = req.actor;
     if (actor.type !== "agent" || actor.source !== "agent_key" || !actor.companyId || !actor.agentId) {
@@ -10698,7 +10803,7 @@ export function issueRoutes(
     const id = parsedIssueId.data;
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!issue) return;
-    // Pull start is an issue mutation plus (when unassigned) an assignment.  It
+    // Pull start is an issue mutation plus (when unassigned) an assignment. It
     // must take the exact same authorization path as checkout; otherwise a
     // scoped/low-trust key can turn an issue into an active assignment merely by
     // asking the server to mint a run.

@@ -134,6 +134,42 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
     expect(await db.select().from(issueCreateIdempotencyKeys)).toHaveLength(1);
   });
 
+  it("does not let a generic recent-title request poison an exhaust issue fingerprint", async () => {
+    const companyId = await seedCompany();
+    const parent = await seedParent(companyId);
+    const app = createApp();
+    const exhaustIdentity = `exhaust:v2:${"2".repeat(64)}`;
+    const exhaustRequest = {
+      parentId: parent.id,
+      title: "Fingerprint-protected finding",
+      exhaustIdentity,
+    };
+
+    const exhaustIssue = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ ...exhaustRequest, idempotencyKey: "exhaust-original" })
+      .expect(201);
+    const genericIssue = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ parentId: parent.id, title: exhaustRequest.title, idempotencyKey: "generic-request" })
+      .expect(201);
+
+    expect(genericIssue.body.id).not.toBe(exhaustIssue.body.id);
+    const replay = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ ...exhaustRequest, idempotencyKey: "exhaust-retry" })
+      .expect(200);
+    expect(replay.body).toMatchObject({
+      id: exhaustIssue.body.id,
+      deduplicated: true,
+      deduplicationReason: "exhaust_identity",
+    });
+    const mappings = await db.select().from(issueCreateIdempotencyKeys);
+    expect(mappings.filter((mapping) => mapping.issueId === exhaustIssue.body.id)).toHaveLength(2);
+    expect(mappings.find((mapping) => mapping.idempotencyKey === "generic-request")?.issueId)
+      .toBe(genericIssue.body.id);
+  });
+
   it("expires old idempotency keys before replay lookup", async () => {
     const companyId = await seedCompany();
     const parent = await seedParent(companyId);
@@ -1445,6 +1481,27 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
       expect(unchanged).toMatchObject({ exhaustIdentity: identity, parentId: parent.id });
     });
 
+    it("rejects attaching an exhaust identity through either the route or service", async () => {
+      const companyId = await seedCompany();
+      const [identityless] = await db.insert(issues).values({
+        companyId,
+        title: "Identity-less existing issue",
+        status: "todo",
+        priority: "medium",
+      }).returning();
+      const identity = `exhaust:v2:${"3".repeat(64)}`;
+
+      await request(createApp())
+        .patch(`/api/issues/${identityless.id}`)
+        .send({ exhaustIdentity: identity })
+        .expect(409);
+      await expect(issueService(db).update(identityless.id, { exhaustIdentity: identity }))
+        .rejects.toThrow(/immutable/i);
+
+      const [unchanged] = await db.select().from(issues).where(eq(issues.id, identityless.id));
+      expect(unchanged.exhaustIdentity).toBeNull();
+    });
+
     it("migration 0223 retains the canonical alias row and quarantines every identical loser", async () => {
       const companyId = await seedCompany();
       const parent = await seedParent(companyId);
@@ -1505,7 +1562,7 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
       })).rejects.toBe(rollbackMarker);
     });
 
-    it("backfills only an explicit structured control block and validates alias input", async () => {
+    it("backfills a structured alias from a legacy null-identity issue without duplicating it", async () => {
       const companyId = await seedCompany();
       const parent = await seedParent(companyId);
       const source = await seedParent(companyId);
@@ -1517,7 +1574,6 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
         title: "Historical structured finding",
         status: "cancelled",
         priority: "medium",
-        exhaustIdentity,
         description: [
           exhaustIdentity,
           `legacy-identity: ${alias}`,
@@ -1535,6 +1591,8 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
         .query({ kind: "identity_v1", value: alias, sourceIssueId: source.id, workParentId: parent.id })
         .expect(200);
       expect(lookup.body.id).toBe(historical.id);
+      expect(lookup.body.exhaustIdentity).toBeNull();
+      expect(await db.select().from(issues).where(eq(issues.companyId, companyId))).toHaveLength(3);
       await request(app)
         .get(`/api/companies/${companyId}/issues/by-exhaust-alias`)
         .query({ kind: "identity_v1", value: `exhaust-finding:v1:sha256:${"0".repeat(64)}`, sourceIssueId: source.id, workParentId: parent.id })

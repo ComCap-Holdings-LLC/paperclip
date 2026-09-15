@@ -9119,6 +9119,9 @@ export function issueRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;
+    if (req.body.exhaustIdentity !== undefined && req.body.exhaustIdentity !== existing.exhaustIdentity) {
+      throw conflict("Exhaust identity and alias scope are immutable");
+    }
     if (existing.exhaustIdentity) {
       const controlChangeRequested = req.body.sourceIssueId !== undefined
         || req.body.exhaustAliases !== undefined
@@ -9164,8 +9167,7 @@ export function issueRoutes(
               !== JSON.stringify(canonicalAliases(aliases)));
       }
       if (
-        (req.body.exhaustIdentity !== undefined && req.body.exhaustIdentity !== existing.exhaustIdentity)
-        || (req.body.parentId !== undefined && req.body.parentId !== existing.parentId)
+        (req.body.parentId !== undefined && req.body.parentId !== existing.parentId)
         || controlChanged
       ) {
         throw conflict("Exhaust identity and alias scope are immutable");

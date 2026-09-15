@@ -6061,7 +6061,7 @@ export function issueService(db: Db) {
         identifier: string;
         company_id: string;
         parent_id: string | null;
-        exhaust_identity: string;
+        exhaust_identity: string | null;
         status: string;
         source_issue_id: string;
         work_parent_id: string;
@@ -6138,7 +6138,11 @@ export function issueService(db: Db) {
               select id, parent_id, description
               from issues
               where company_id = ${companyId}::uuid
-                and exhaust_identity is not null
+                and (
+                  exhaust_identity is not null
+                  or description like '%legacy-identity:%'
+                  or description like '%exhaust-hash:%'
+                )
                 and (${state.cursor_issue_id}::uuid is null or id > ${state.cursor_issue_id}::uuid)
               order by id asc
               limit ${EXHAUST_ALIAS_BACKFILL_BATCH_SIZE}
@@ -7493,6 +7497,7 @@ export function issueService(db: Db) {
               eq(issues.companyId, companyId),
               issueData.parentId ? eq(issues.parentId, issueData.parentId) : isNull(issues.parentId),
               isNull(issues.hiddenAt),
+              isNull(issues.exhaustIdentity),
               notInArray(issues.status, ["done", "cancelled"]),
               gte(issues.createdAt, new Date(Date.now() - 48 * 60 * 60 * 1000)),
               sql`lower(regexp_replace(btrim(${issues.title}), '\\s+', ' ', 'g')) = ${normalizedTitle}`,
@@ -8062,11 +8067,13 @@ export function issueService(db: Db) {
       if (!existing) return null;
 
       const requestedExhaustIdentity = data.exhaustIdentity;
+      if (requestedExhaustIdentity !== undefined && requestedExhaustIdentity !== existing.exhaustIdentity) {
+        throw conflict("Exhaust identity and alias scope are immutable");
+      }
       if (
         existing.exhaustIdentity
         && (
-          (requestedExhaustIdentity !== undefined && requestedExhaustIdentity !== existing.exhaustIdentity)
-          || (data.parentId !== undefined && data.parentId !== existing.parentId)
+          data.parentId !== undefined && data.parentId !== existing.parentId
         )
       ) {
         throw conflict("Exhaust identity and alias scope are immutable");

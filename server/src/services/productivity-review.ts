@@ -21,6 +21,12 @@ import {
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
+import {
+  PRODUCTIVE_TERMINAL_RUN_STATUSES,
+  TERMINAL_RUN_STATUSES,
+  countProductiveNoCommentStreak,
+  countUnproductiveTerminalRuns,
+} from "./productivity-review-run-classification.js";
 
 export const PRODUCTIVITY_REVIEW_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.issueProductivityReview;
 export const DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS = 10;
@@ -34,7 +40,6 @@ export const DEFAULT_PRODUCTIVITY_REVIEW_CREATION_WINDOW_MS = 24 * 60 * 60 * 100
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_WINDOW = 1;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CONSECUTIVE_NO_ACTION_REVIEWS = 3;
 
-const TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const MAX_CANDIDATE_ISSUES = 250;
 const MAX_RUNS_FOR_STREAK = 100;
@@ -73,6 +78,7 @@ type ProductivityReviewEvidence = {
   noCommentStreak: number;
   totalRunCount: number;
   terminalRunCount: number;
+  unproductiveTerminalRunCount: number;
   activeRunCount: number;
   runCountLastHour: number;
   runCountLastSixHours: number;
@@ -418,6 +424,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
           eq(heartbeatRuns.companyId, companyId),
           eq(heartbeatRuns.agentId, agentId),
           issueRunScopeSql(issueId),
+          inArray(heartbeatRuns.status, [...PRODUCTIVE_TERMINAL_RUN_STATUSES]),
           sql`coalesce(${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) >= ${since.toISOString()}::timestamptz`,
         ),
       )
@@ -494,11 +501,8 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     const terminalRuns = latestRuns.filter((run) =>
       TERMINAL_RUN_STATUSES.includes(run.status as (typeof TERMINAL_RUN_STATUSES)[number]),
     );
-    let noCommentStreak = 0;
-    for (const run of terminalRuns) {
-      if (commentRunIds.has(run.id)) break;
-      noCommentStreak += 1;
-    }
+    // Crashed runs (failed/cancelled/timed_out) had no opportunity to comment; only productive runs form the streak.
+    const noCommentStreak = countProductiveNoCommentStreak(latestRuns, commentRunIds);
 
     const [
       runCountLastHour,
@@ -557,7 +561,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     if (!trigger) return null;
 
     const triggerReasons: string[] = [];
-    if (noComment) triggerReasons.push(`${noCommentStreak} consecutive completed issue-linked runs had no run-created issue comment`);
+    if (noComment) triggerReasons.push(`${noCommentStreak} consecutive succeeded issue-linked runs had no run-created issue comment`);
     if (longActive) triggerReasons.push(`current active episode has lasted ${msToHuman(elapsedMs)}`);
     if (highChurn) {
       triggerReasons.push(
@@ -573,6 +577,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       noCommentStreak,
       totalRunCount: latestRuns.length,
       terminalRunCount: terminalRuns.length,
+      unproductiveTerminalRunCount: countUnproductiveTerminalRuns(terminalRuns),
       activeRunCount,
       runCountLastHour,
       runCountLastSixHours,
@@ -656,8 +661,9 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       "",
       `- Total sampled issue-linked runs: ${evidence.totalRunCount}`,
       `- Terminal sampled runs: ${evidence.terminalRunCount}`,
+      `- Failed/cancelled/timed-out sampled runs (excluded from streak and churn): ${evidence.unproductiveTerminalRunCount}`,
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
-      `- No-comment completed-run streak: ${evidence.noCommentStreak}`,
+      `- No-comment succeeded-run streak: ${evidence.noCommentStreak}`,
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
@@ -666,7 +672,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       "",
       "## Thresholds",
       "",
-      `- No-comment streak: ${evidence.thresholds.noCommentStreakRuns} completed runs`,
+      `- No-comment streak: ${evidence.thresholds.noCommentStreakRuns} succeeded runs`,
       `- Long active duration: ${msToHuman(evidence.thresholds.longActiveMs)}`,
       `- High churn: ${evidence.thresholds.highChurnHourly}/1h or ${evidence.thresholds.highChurnSixHours}/6h runs/assignee-run comments`,
       `- Resolved-review snooze: ${msToHuman(evidence.thresholds.resolvedSnoozeMs)}`,

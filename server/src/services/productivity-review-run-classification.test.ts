@@ -47,4 +47,14 @@ describe("productivity review run classification", () => {
   it("counts unproductive terminal runs including interrupted", () => {
     expect(countUnproductiveTerminalRuns(mk(["succeeded", "failed", "cancelled", "timed_out", "interrupted"]))).toBe(4);
   });
+
+  it("counts productive runs that follow more than 100 non-productive runs when they are sampled", () => {
+    const sample = mk([...Array(150).fill("failed"), ...Array(12).fill("succeeded")]);
+    expect(countProductiveNoCommentStreak(sample, new Set())).toBe(12);
+  });
+
+  it("a comment on a sampled non-productive run still ends the streak", () => {
+    const sample = mk([...Array(3).fill("succeeded"), "failed", ...Array(8).fill("succeeded")]);
+    expect(countProductiveNoCommentStreak(sample, new Set(["r3"]))).toBe(3);
+  });
 });

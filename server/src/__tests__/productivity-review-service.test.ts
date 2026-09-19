@@ -621,6 +621,27 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.created).toBe(0);
   });
 
+  it("counts succeeded runs older than 100 newer failed runs toward the streak", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const statuses = [...Array(105).fill("failed"), ...Array(10).fill("succeeded")];
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: statuses.length,
+      now,
+      spacingMs: 2 * HOUR_MS,
+      statuses,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("No-comment succeeded-run streak: 10");
+  });
+
   it("still flags a burst of failed runs as high churn", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();

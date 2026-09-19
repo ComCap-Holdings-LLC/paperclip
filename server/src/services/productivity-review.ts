@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { clampIssueRequestDepth } from "@paperclipai/shared";
 import {
@@ -22,6 +22,7 @@ import {
 } from "./recovery/model-profile-hint.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
 import {
+  PRODUCTIVE_TERMINAL_RUN_STATUSES,
   TERMINAL_RUN_STATUSES,
   countProductiveNoCommentStreak,
   countUnproductiveTerminalRuns,
@@ -478,7 +479,27 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
       .limit(MAX_RUNS_FOR_STREAK);
 
-    const runIds = latestRuns.map((run) => run.id);
+    // The streak sample must not be starved by non-productive runs: 100 recent failed/interrupted
+    // runs would otherwise hide older succeeded runs. Sample productive runs plus any run that
+    // carries a run-created comment (a comment on any run status ends the streak).
+    const streakRuns = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, sourceIssue.companyId),
+          eq(heartbeatRuns.agentId, sourceAgent.id),
+          issueRunScopeSql(sourceIssue.id),
+          or(
+            inArray(heartbeatRuns.status, [...PRODUCTIVE_TERMINAL_RUN_STATUSES]),
+            sql`exists (select 1 from ${issueComments} where ${issueComments.createdByRunId} = ${heartbeatRuns.id} and ${issueComments.issueId} = ${sourceIssue.id})`,
+          ),
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(MAX_RUNS_FOR_STREAK);
+
+    const runIds = streakRuns.map((run) => run.id);
     const commentRunIds = new Set<string>();
     if (runIds.length > 0) {
       const commentRows = await db
@@ -500,7 +521,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       TERMINAL_RUN_STATUSES.includes(run.status as (typeof TERMINAL_RUN_STATUSES)[number]),
     );
     // Only succeeded runs form the streak; crashed/killed runs are skipped unless they carry a comment.
-    const noCommentStreak = countProductiveNoCommentStreak(latestRuns, commentRunIds);
+    const noCommentStreak = countProductiveNoCommentStreak(streakRuns, commentRunIds);
 
     const [
       runCountLastHour,

@@ -121,7 +121,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     now: Date;
     withRunComments?: boolean;
     /** Per-run status, newest first; defaults to "succeeded". */
-    statuses?: string[];
+    statuses?: Array<NonNullable<typeof heartbeatRuns.$inferInsert.status>>;
     /** Indexes of runs (0 = newest) that get a run-created comment. */
     commentRunIndexes?: number[];
     spacingMs?: number;

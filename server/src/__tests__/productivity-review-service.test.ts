@@ -120,16 +120,21 @@ describeEmbeddedPostgres("productivity review service", () => {
     count: number;
     now: Date;
     withRunComments?: boolean;
+    /** Per-run status, newest first; defaults to "succeeded". */
+    statuses?: string[];
+    /** Indexes of runs (0 = newest) that get a run-created comment. */
+    commentRunIndexes?: number[];
+    spacingMs?: number;
   }) {
     const runs: Array<typeof heartbeatRuns.$inferInsert> = [];
     for (let index = 0; index < input.count; index += 1) {
       const runId = randomUUID();
-      const createdAt = new Date(input.now.getTime() - index * 60_000);
+      const createdAt = new Date(input.now.getTime() - index * (input.spacingMs ?? 60_000));
       runs.push({
         id: runId,
         companyId: input.companyId,
         agentId: input.agentId,
-        status: "succeeded",
+        status: input.statuses?.[index] ?? "succeeded",
         invocationSource: "assignment",
         triggerDetail: "system",
         startedAt: createdAt,
@@ -143,9 +148,12 @@ describeEmbeddedPostgres("productivity review service", () => {
     }
     await db.insert(heartbeatRuns).values(runs);
 
-    if (input.withRunComments) {
+    const commentRuns = input.withRunComments
+      ? runs
+      : runs.filter((_, index) => input.commentRunIndexes?.includes(index));
+    if (commentRuns.length > 0) {
       await db.insert(issueComments).values(
-        runs.map((run, index) => ({
+        commentRuns.map((run, index) => ({
           companyId: input.companyId,
           issueId: input.issueId,
           authorAgentId: input.agentId,
@@ -525,6 +533,111 @@ describeEmbeddedPostgres("productivity review service", () => {
 
     expect(unpausedResult.created).toBe(1);
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(1);
+  });
+
+  const HOUR_MS = 60 * 60 * 1000;
+
+  it("does not create a no-comment-streak review from ten failed runs", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      spacingMs: 2 * HOUR_MS,
+      statuses: Array(10).fill("failed"),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("skips silent failed runs inside a succeeded streak without breaking it", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const statuses = [
+      "succeeded", "succeeded", "failed", "succeeded", "succeeded", "succeeded", "failed",
+      "succeeded", "succeeded", "succeeded", "succeeded", "failed", "succeeded",
+    ];
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: statuses.length,
+      now,
+      spacingMs: 2 * HOUR_MS,
+      statuses,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("No-comment succeeded-run streak: 10");
+    expect(review?.description).toContain("excluded from the no-comment streak");
+  });
+
+  it("does not count interrupted runs toward the streak", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const statuses = [...Array(9).fill("succeeded"), "interrupted", "failed"];
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: statuses.length,
+      now,
+      spacingMs: 2 * HOUR_MS,
+      statuses,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+  });
+
+  it("a comment on a failed run breaks the no-comment streak", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    // Newest 4 succeeded silent, then a failed run WITH a comment, then 6 older succeeded silent.
+    const statuses = [...Array(4).fill("succeeded"), "failed", ...Array(6).fill("succeeded")];
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: statuses.length,
+      now,
+      spacingMs: 2 * HOUR_MS,
+      statuses,
+      commentRunIndexes: [4],
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+  });
+
+  it("still flags a burst of failed runs as high churn", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      statuses: Array(10).fill("timed_out"),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `high_churn`");
   });
 
   it("creates a high-churn review even when every sampled run has a progress comment", async () => {

@@ -22,7 +22,6 @@ import {
 } from "./recovery/model-profile-hint.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
 import {
-  PRODUCTIVE_TERMINAL_RUN_STATUSES,
   TERMINAL_RUN_STATUSES,
   countProductiveNoCommentStreak,
   countUnproductiveTerminalRuns,
@@ -424,7 +423,6 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
           eq(heartbeatRuns.companyId, companyId),
           eq(heartbeatRuns.agentId, agentId),
           issueRunScopeSql(issueId),
-          inArray(heartbeatRuns.status, [...PRODUCTIVE_TERMINAL_RUN_STATUSES]),
           sql`coalesce(${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) >= ${since.toISOString()}::timestamptz`,
         ),
       )
@@ -501,7 +499,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     const terminalRuns = latestRuns.filter((run) =>
       TERMINAL_RUN_STATUSES.includes(run.status as (typeof TERMINAL_RUN_STATUSES)[number]),
     );
-    // Crashed runs (failed/cancelled/timed_out) had no opportunity to comment; only productive runs form the streak.
+    // Only succeeded runs form the streak; crashed/killed runs are skipped unless they carry a comment.
     const noCommentStreak = countProductiveNoCommentStreak(latestRuns, commentRunIds);
 
     const [
@@ -661,7 +659,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       "",
       `- Total sampled issue-linked runs: ${evidence.totalRunCount}`,
       `- Terminal sampled runs: ${evidence.terminalRunCount}`,
-      `- Failed/cancelled/timed-out sampled runs (excluded from streak and churn): ${evidence.unproductiveTerminalRunCount}`,
+      `- Failed/cancelled/timed-out/interrupted sampled runs (excluded from the no-comment streak; still counted for churn): ${evidence.unproductiveTerminalRunCount}`,
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
       `- No-comment succeeded-run streak: ${evidence.noCommentStreak}`,
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,

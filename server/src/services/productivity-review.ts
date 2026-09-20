@@ -424,6 +424,9 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
           eq(heartbeatRuns.companyId, companyId),
           eq(heartbeatRuns.agentId, agentId),
           issueRunScopeSql(issueId),
+          // high_churn counts succeeded runs only (COM-15742): failed/cancelled/timed_out/interrupted
+          // runs are already reported by fleet dispatch and must not spawn a review ticket.
+          inArray(heartbeatRuns.status, [...PRODUCTIVE_TERMINAL_RUN_STATUSES]),
           sql`coalesce(${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) >= ${since.toISOString()}::timestamptz`,
         ),
       )
@@ -584,7 +587,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     if (longActive) triggerReasons.push(`current active episode has lasted ${msToHuman(elapsedMs)}`);
     if (highChurn) {
       triggerReasons.push(
-        `${runCountLastHour} runs/${assigneeRunCommentCountLastHour} assignee-run comments in 1h; ${runCountLastSixHours} runs/${assigneeRunCommentCountLastSixHours} assignee-run comments in 6h`,
+        `${runCountLastHour} succeeded runs/${assigneeRunCommentCountLastHour} assignee-run comments in 1h; ${runCountLastSixHours} succeeded runs/${assigneeRunCommentCountLastSixHours} assignee-run comments in 6h`,
       );
     }
 
@@ -680,11 +683,11 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       "",
       `- Total sampled issue-linked runs: ${evidence.totalRunCount}`,
       `- Terminal sampled runs: ${evidence.terminalRunCount}`,
-      `- Failed/cancelled/timed-out/interrupted sampled runs (excluded from the no-comment streak; still counted for churn): ${evidence.unproductiveTerminalRunCount}`,
+      `- Failed/cancelled/timed-out/interrupted sampled runs (excluded from the no-comment streak and from high-churn run counts): ${evidence.unproductiveTerminalRunCount}`,
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
       `- No-comment succeeded-run streak: ${evidence.noCommentStreak}`,
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
-      `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
+      `- Succeeded runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
       `- Cost events total: ${evidence.costCents} cents`,
       `- Current next action: ${evidence.nextAction ? truncateInline(evidence.nextAction, 500) : "none recorded"}`,
@@ -693,7 +696,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       "",
       `- No-comment streak: ${evidence.thresholds.noCommentStreakRuns} succeeded runs`,
       `- Long active duration: ${msToHuman(evidence.thresholds.longActiveMs)}`,
-      `- High churn: ${evidence.thresholds.highChurnHourly}/1h or ${evidence.thresholds.highChurnSixHours}/6h runs/assignee-run comments`,
+      `- High churn: ${evidence.thresholds.highChurnHourly}/1h or ${evidence.thresholds.highChurnSixHours}/6h succeeded runs/assignee-run comments`,
       `- Resolved-review snooze: ${msToHuman(evidence.thresholds.resolvedSnoozeMs)}`,
       "",
       "## Latest Runs",

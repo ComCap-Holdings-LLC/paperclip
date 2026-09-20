@@ -642,23 +642,72 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("No-comment succeeded-run streak: 10");
   });
 
-  it("still flags a burst of failed runs as high churn", async () => {
-    const now = new Date("2026-04-28T12:00:00.000Z");
+  const churnSeed = async (now: Date, statuses: string[], opts?: { spacingMs?: number; commentRunIndexes?: number[] }) => {
     const seeded = await seedAssignedIssue();
     await insertRuns({
       companyId: seeded.companyId,
       agentId: seeded.coderId,
       issueId: seeded.issueId,
-      count: 10,
+      count: statuses.length,
       now,
-      statuses: Array(10).fill("timed_out"),
+      statuses,
+      spacingMs: opts?.spacingMs,
+      commentRunIndexes: opts?.commentRunIndexes,
     });
-
     const result = await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId });
+    return { seeded, result, reviews: await listProductivityReviews(seeded.companyId) };
+  };
+  const NOW = new Date("2026-04-28T12:00:00.000Z");
 
+  it("does not flag a burst of failed/timed_out runs as high churn", async () => {
+    const { result, reviews } = await churnSeed(NOW, Array(10).fill("timed_out"));
+    expect(result.created).toBe(0);
+    expect(reviews).toHaveLength(0);
+  });
+
+  it("does not create a high-churn review from 30 failed runs in 6h", async () => {
+    const { result, reviews } = await churnSeed(NOW, Array(30).fill("failed"), { spacingMs: 10 * 60_000 });
+    expect(result.created).toBe(0);
+    expect(reviews).toHaveLength(0);
+  });
+
+  it("does not create a high-churn review from 6 succeeded + 20 failed runs in 1h", async () => {
+    const statuses = [...Array(6).fill("succeeded"), ...Array(20).fill("failed")];
+    const { result, reviews } = await churnSeed(NOW, statuses, { spacingMs: 60_000, commentRunIndexes: [0] });
+    expect(result.created).toBe(0);
+    expect(reviews).toHaveLength(0);
+  });
+
+  it("NEGATIVE CONTROL: 10 succeeded runs in 1h still create a high_churn review", async () => {
+    // a comment on the newest run breaks the no-comment streak so churn is the only trigger
+    const { result, reviews } = await churnSeed(NOW, Array(10).fill("succeeded"), { commentRunIndexes: [0] });
     expect(result.created).toBe(1);
-    const [review] = await listProductivityReviews(seeded.companyId);
-    expect(review?.description).toContain("Primary trigger: `high_churn`");
+    expect(reviews[0]?.description).toContain("Primary trigger: `high_churn`");
+    expect(reviews[0]?.description).toContain("Succeeded runs in rolling windows: 10/1h");
+  });
+
+  it("boundary: 9 succeeded runs in 1h do not trigger (10 do, see negative control)", async () => {
+    const { result } = await churnSeed(NOW, Array(9).fill("succeeded"), { commentRunIndexes: [0] });
+    expect(result.created).toBe(0);
+  });
+
+  it("does not count succeeded runs older than the windows", async () => {
+    // 30 min spacing: 2 inside 1h, 12 inside 6h, the rest older than 6h; all below thresholds
+    const { result, reviews } = await churnSeed(NOW, Array(30).fill("succeeded"), { spacingMs: 30 * 60_000, commentRunIndexes: [0] });
+    expect(result.created).toBe(0);
+    expect(reviews).toHaveLength(0);
+  });
+
+  it("counts 30 succeeded runs in 6h as high churn", async () => {
+    const { result, reviews } = await churnSeed(NOW, Array(30).fill("succeeded"), { spacingMs: 11 * 60_000, commentRunIndexes: [0] });
+    expect(result.created).toBe(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `high_churn`");
+  });
+
+  it("assignee run-linked comments on failed runs still count toward high churn", async () => {
+    const { result, reviews } = await churnSeed(NOW, Array(10).fill("failed"), { commentRunIndexes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9] });
+    expect(result.created).toBe(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `high_churn`");
   });
 
   it("creates a high-churn review even when every sampled run has a progress comment", async () => {
@@ -681,7 +730,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.created).toBe(1);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain("Primary trigger: `high_churn`");
-    expect(review?.description).toContain("Runs in rolling windows: 10/1h");
+    expect(review?.description).toContain("Succeeded runs in rolling windows: 10/1h");
   });
 
   it("ignores non-assignee comments when evaluating high-churn productivity reviews", async () => {

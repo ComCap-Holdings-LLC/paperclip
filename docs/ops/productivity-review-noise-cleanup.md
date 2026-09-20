@@ -19,8 +19,8 @@ This constant drives the detection of "terminal" runs that trigger the review wo
 ### Defect 1: Streak loop counts non-productive terminal runs
 Lines 37 and the streak loop at lines 494-500 count every terminal run without an issue comment, including `failed`, `cancelled`, and `timed_out` runs that crashed before doing work. The generated body claims "10 consecutive COMPLETED runs" while its Latest Runs list shows all failed and cost is 0 cents.
 
-### Defect 2 (retracted as a defect): `countIssueRunsSince` has no status filter
-`countIssueRunsSince` at line 412 has no status filter, so crash loops trip the `high_churn` threshold (10 runs/1h). This is intentional-enough to keep: a crash loop is a real churn signal. Filtering it was tried and reverted.
+### Defect 2 (reinstated 2026-09-20, COM-15742): `countIssueRunsSince` had no status filter
+`countIssueRunsSince` had no status filter, so crash loops tripped the `high_churn` threshold (10 runs/1h, 30/6h). This was first judged "a real churn signal" and left alone (PR #21). The 24h readout after PR #21 showed the cost: review tickets 10 before vs 9 after deploy; `no_comment_streak` fell 8 to 0 but `high_churn` rose 2 to 8 and `long_active_duration` 0 to 1; 928 of the newest 1000 heartbeat runs were `failed` and none of the post-deploy reviews were genuine. Failed runs are already reported by fleet dispatch, so a failing agent produced review tickets on top of failures. Fixed: see section 8.
 
 ### Defect 3: No per-agent cap on creation
 The creation cap is per source issue (`originId`, max 1 per 24h) with no per-agent cap. One broken executor fans out one review per assigned issue.
@@ -81,7 +81,7 @@ Implemented (local commit only, not pushed, not deployed) via new module `server
 
 1. `PRODUCTIVE_TERMINAL_RUN_STATUSES = ["succeeded"]`; `interrupted`, `failed`, `cancelled`, `timed_out` are unproductive (crashed or killed runs); `TERMINAL_RUN_STATUSES` is derived from the two subsets.
 2. The no-comment streak counts only succeeded runs. A run-created comment ends the streak whatever the run status (comment check runs first); a silent non-productive run is skipped, not a break.
-3. `countIssueRunsSince` (high_churn) is deliberately left unfiltered: a burst of failed/timed_out runs is still a churn signal and must keep producing a review.
+3. (Superseded by section 8.) `countIssueRunsSince` (high_churn) was left unfiltered in PR #21; it now counts succeeded runs only.
 4. Trigger wording "completed" becomes "succeeded" (now accurate, since only succeeded runs count).
 5. The unproductive-run count is shown in the Evidence block.
 
@@ -98,3 +98,11 @@ Implemented (local commit only, not pushed, not deployed) via new module `server
 - Nothing pushed.
 - Wiring in productivity-review.ts and the new DB-backed cases in productivity-review-service.test.ts were NOT type-checked and NOT run (no embedded-Postgres environment in this checkout); only the pure-helper tests were run.
 - Fork diverges from upstream `paperclipai/paperclip`.
+
+## 8. high_churn counts only succeeded runs (COM-15742)
+
+- `countIssueRunsSince` filters `heartbeatRuns.status` with `PRODUCTIVE_TERMINAL_RUN_STATUSES` (the same classification helper the no-comment streak uses). failed, cancelled, timed_out and interrupted runs no longer count toward the 10/1h or 30/6h run thresholds.
+- Unchanged: the assignee run-linked comment counts (a comment is counted whatever the status of the run that created it), the `terminal`, `active` and unproductive-terminal evidence counters, thresholds, and trigger priority.
+- Review ticket evidence now reads "Succeeded runs in rolling windows: N/1h, N/6h" and the trigger reason says "succeeded runs".
+- Tests: 10 succeeded runs in 1h still create a `high_churn` review (negative control); 10 timed_out, 30 failed in 6h, and 6 succeeded + 20 failed in 1h do not; 9 succeeded is below threshold; 30 succeeded in 6h creates one; assignee comments on failed runs still count.
+- `long_active_duration` is deliberately NOT changed here. It measures `now - issue.startedAt` and is driven by stale execution locks (bucket C), not by run statuses, so a status filter cannot fix it. It needs its own change (stale-lock handling) and is left as is.

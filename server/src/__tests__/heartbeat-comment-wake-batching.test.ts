@@ -1327,7 +1327,7 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
     }
   }, 120_000);
 
-  it("still reopens a finished issue when a deferred batch mixes self-authored and human comments", async () => {
+  it("does not reopen a finished issue when a deferred batch mixes self-authored and human comments", async () => {
     const gateway = await createControlledGatewayServer();
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -1368,7 +1368,7 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
       await db.insert(issues).values({
         id: issueId,
         companyId,
-        title: "Human follow-up must survive mixed deferred batches",
+        title: "Human context must not undo a verified closure",
         status: "todo",
         priority: "medium",
         responsibleUserId: "responsible-user",
@@ -1514,9 +1514,9 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
         .then((rows) => rows[0] ?? null);
 
       expect(issueAfterPromotion).toMatchObject({
-        status: "in_progress",
-        completedAt: null,
+        status: "done",
       });
+      expect(issueAfterPromotion?.completedAt).not.toBeNull();
 
       const secondPayload = gateway.getAgentPayloads()[1] ?? {};
       expect(secondPayload.paperclip).toBeUndefined();
@@ -1528,8 +1528,8 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
         issue: {
           id: issueId,
           identifier: `${issuePrefix}-1`,
-          title: "Human follow-up must survive mixed deferred batches",
-          status: "in_progress",
+          title: "Human context must not undo a verified closure",
+          status: "done",
           priority: "medium",
         },
       });

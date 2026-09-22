@@ -1,5 +1,57 @@
 import { describe, expect, it } from "vitest";
-import { shouldAutoCheckoutIssueForWake } from "../services/heartbeat.ts";
+import {
+  shouldAutoCheckoutIssueForWake,
+  shouldReopenClosedIssueForDeferredCommentWake,
+} from "../services/heartbeat.ts";
+
+describe("shouldReopenClosedIssueForDeferredCommentWake", () => {
+  const closed = {
+    hasComment: true,
+    selfAuthored: false,
+    issueStatus: "done" as const,
+    wakeReason: "issue_commented",
+    resumeIntent: false,
+  };
+
+  it("does not reopen a done issue for an ordinary human comment wake", () => {
+    expect(shouldReopenClosedIssueForDeferredCommentWake(closed)).toBe(false);
+  });
+
+  it("does not treat actor type as intent — a user-requested comment wake stays closed", () => {
+    expect(shouldReopenClosedIssueForDeferredCommentWake({
+      ...closed,
+      issueStatus: "cancelled",
+    })).toBe(false);
+  });
+
+  it("reopens when the wake reason is the explicit comment reopen", () => {
+    expect(shouldReopenClosedIssueForDeferredCommentWake({
+      ...closed,
+      wakeReason: "issue_reopened_via_comment",
+    })).toBe(true);
+  });
+
+  it("reopens a cancelled issue when resume intent was recorded on the wake", () => {
+    expect(shouldReopenClosedIssueForDeferredCommentWake({
+      ...closed,
+      issueStatus: "cancelled",
+      resumeIntent: true,
+    })).toBe(true);
+  });
+
+  it("does not reopen an open issue or a self-authored batch", () => {
+    expect(shouldReopenClosedIssueForDeferredCommentWake({
+      ...closed,
+      issueStatus: "in_progress",
+      wakeReason: "issue_reopened_via_comment",
+    })).toBe(false);
+    expect(shouldReopenClosedIssueForDeferredCommentWake({
+      ...closed,
+      selfAuthored: true,
+      wakeReason: "issue_reopened_via_comment",
+    })).toBe(false);
+  });
+});
 
 describe("shouldAutoCheckoutIssueForWake", () => {
   it("auto-checks out an assigned todo issue for an actionable wake", () => {

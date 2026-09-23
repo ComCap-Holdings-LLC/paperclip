@@ -1860,6 +1860,12 @@ function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   executionRunId: string | null | undefined;
   requestAddsExplicitBlockers?: boolean;
 }) {
+  // done/cancelled are verified closures. A human principal is not reopen
+  // intent: an ordinary context comment must not move the issue back to todo.
+  // Callers that mean it send `reopen` or `resume` on this same request, which
+  // the route applies separately. Blocked is not a closure and still accepts
+  // the conversational nudge below (COM-15994).
+  if (isClosedIssueStatus(input.issueStatus)) return false;
   // A request that wires a non-empty blockedByIssueIds list is declaring that
   // the issue is waiting on other work. The implicit reopen exists for plain
   // conversational comments ("please continue"), not structured dependency
@@ -1879,8 +1885,9 @@ function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   ) {
     return false;
   }
-  // Only human comments should implicitly reopen finished work.
+  // Only human comments should implicitly move a blocked issue back to todo.
   // Agent-authored comments remain communicative unless reopen was explicit.
+  // done/cancelled already returned above.
   if (input.actorType !== "user") return false;
   if (!isClosedIssueStatus(input.issueStatus) && input.issueStatus !== "blocked") return false;
   if (typeof input.assigneeAgentId !== "string" || input.assigneeAgentId.length === 0) return false;

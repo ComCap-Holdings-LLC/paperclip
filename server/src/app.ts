@@ -17,6 +17,7 @@ import {
   sweepAbandonedImportTransferSpools,
 } from "./services/company-import-transfers.js";
 import { companyTransferRunService } from "./services/company-transfer-runs.js";
+import { ISSUE_WEDGED_CHECKOUT_SWEEP_INTERVAL_MS, issueService } from "./services/issues.js";
 import { healthRoutes } from "./routes/health.js";
 import { cloudRoutes } from "./routes/cloud.js";
 import { companyRoutes } from "./routes/companies.js";
@@ -759,6 +760,39 @@ export async function createApp(
     .finally(() => {
       sweepImportTransferSpools();
     });
+  // Wedged-checkout sweep: hourly (plus once at startup), returning issues
+  // stuck in `in_progress` with no checkout run and no execution run — a
+  // state nothing else can currently release — back to `todo`. Same
+  // setInterval + unref + shutdown-clear shape as the sweeps above.
+  const issuesSweepSvc = issueService(db);
+  let wedgedCheckoutSweepShuttingDown = false;
+  const sweepWedgedInProgressIssues = () => {
+    if (wedgedCheckoutSweepShuttingDown) return;
+    issuesSweepSvc
+      .reapWedgedInProgressCheckouts()
+      .then((reaped) => {
+        if (reaped.length > 0) {
+          logger.warn(
+            { count: reaped.length, issueIds: reaped.map((issue) => issue.id) },
+            "reaped issues wedged in_progress with no checkout run and no execution run",
+          );
+        }
+      })
+      .catch((err) => {
+        if (isDatabaseConnectionUnavailableError(err)) {
+          wedgedCheckoutSweepShuttingDown = true;
+          logger.warn({ err }, "Disabling wedged-checkout sweep because the database is unavailable");
+          return;
+        }
+        logger.error({ err }, "wedged in_progress checkout sweep failed");
+      });
+  };
+  const wedgedCheckoutSweepTimer: ReturnType<typeof setInterval> = setInterval(
+    sweepWedgedInProgressIssues,
+    ISSUE_WEDGED_CHECKOUT_SWEEP_INTERVAL_MS,
+  );
+  wedgedCheckoutSweepTimer.unref?.();
+  sweepWedgedInProgressIssues();
   void toolDispatcher.initialize().catch((err) => {
     logger.error({ err }, "Failed to initialize plugin tool dispatcher");
   });

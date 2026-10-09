@@ -614,13 +614,31 @@ export const externalExecutorTerminalSchema = z.object({
 
 export type ExternalExecutorTerminal = z.infer<typeof externalExecutorTerminalSchema>;
 
-export const externalExecutorRecoverySchema = z.object({
+const externalExecutorRecoveryByKeySchema = z.object({
   runKey: z.string().uuid(),
   expectedExecutionVersion: z.number().int().min(0),
   reason: z.string().trim().min(1).max(4_000),
 }).strict();
 
+const externalExecutorRecoveryByRunSchema = z.object({
+  runId: z.string().uuid(),
+  expectedExecutionVersion: z.number().int().min(0),
+  reason: z.string().trim().min(1).max(4_000),
+}).strict();
+
+export const externalExecutorRecoverySchema = z.union([
+  externalExecutorRecoveryByKeySchema,
+  externalExecutorRecoveryByRunSchema,
+]);
+
 export type ExternalExecutorRecovery = z.infer<typeof externalExecutorRecoverySchema>;
+
+export const externalExecutorReceiptQuerySchema = z.object({
+  runId: z.string().uuid(),
+  expectedExecutionVersion: z.coerce.number().int().min(0),
+}).strict();
+
+export type ExternalExecutorReceiptQuery = z.infer<typeof externalExecutorReceiptQuerySchema>;
 
 const commentMetadataLabelSchema = z.string().trim().min(1).max(120);
 const commentMetadataTextSchema = z.string().trim().min(1).max(2000);

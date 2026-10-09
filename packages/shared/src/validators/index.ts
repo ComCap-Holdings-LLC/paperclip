@@ -423,6 +423,7 @@ export {
   externalExecutorCheckoutSchema,
   externalExecutorTerminalSchema,
   externalExecutorRecoverySchema,
+  externalExecutorReceiptQuerySchema,
   issueCommentAuthorTypeSchema,
   issueCommentPresentationSchema,
   issueCommentMetadataRowSchema,

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -1283,6 +1283,175 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       action: "issue.external_executor_recovered", actorType: "user", actorId: "board-user", agentId: null, runId: checkout.body.run.id,
       details: expect.objectContaining({ externalExecutorRunId: checkout.body.run.id, runKey, expectedExecutionVersion: 1, executionVersion: 2 }),
     })]);
+  });
+
+  it("recovers by public run identity exactly once and reconciles only the identical tuple", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    const runKey = randomUUID();
+    const reason = "executor response was lost";
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Public external executor recovery",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+    const agentApp = createApp(agentActor(companyId, agentId, currentRunId));
+    const boardApp = createApp(boardActor(companyId));
+    const checkout = await request(agentApp).post(`/api/issues/${issueId}/external-executor/checkout`).send({
+      runKey,
+      expectedExecutionVersion: 0,
+      expectedStatuses: ["todo"],
+    });
+    expect(checkout.status, JSON.stringify(checkout.body)).toBe(201);
+    const recoveryBody = {
+      runId: checkout.body.run.id,
+      expectedExecutionVersion: 1,
+      reason,
+    };
+
+    const [first, duplicate] = await Promise.all([
+      request(boardApp).post(`/api/issues/${issueId}/external-executor/recover`).send(recoveryBody),
+      request(boardApp).post(`/api/issues/${issueId}/external-executor/recover`).send(recoveryBody),
+    ]);
+    expect(first.status, JSON.stringify(first.body)).toBe(200);
+    expect(duplicate.status, JSON.stringify(duplicate.body)).toBe(200);
+    expect([first.body.reconciled, duplicate.body.reconciled].sort()).toEqual([false, true]);
+    expect(first.body).toMatchObject({ runId: checkout.body.run.id, executionVersion: 2 });
+    expect(duplicate.body).toMatchObject({ runId: checkout.body.run.id, executionVersion: 2 });
+
+    const recoveredIssue = await db
+      .select({
+        status: issues.status,
+        externalExecutorRunId: issues.externalExecutorRunId,
+        executionVersion: issues.executionVersion,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(recoveredIssue).toEqual({ status: "todo", externalExecutorRunId: null, executionVersion: 2 });
+    const receipts = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.action, "issue.external_executor_recovered"),
+        eq(activityLog.entityId, issueId),
+      ));
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]?.details).toMatchObject({
+      externalExecutorRunId: checkout.body.run.id,
+      recoveryIdentity: "run_id",
+      expectedExecutionVersion: 1,
+      executionVersion: 2,
+      recoveryReason: reason,
+    });
+    expect(receipts[0]?.details).not.toHaveProperty("runKey");
+    const receiptPath = `/api/issues/${issueId}/external-executor/receipt?runId=${recoveryBody.runId}&expectedExecutionVersion=1`;
+    await request(agentApp).get(receiptPath).expect(403);
+    const publicReceipt = await request(boardApp).get(receiptPath);
+    expect(publicReceipt.status, JSON.stringify(publicReceipt.body)).toBe(200);
+    expect(publicReceipt.body).toEqual({
+      issueId,
+      runId: recoveryBody.runId,
+      expectedExecutionVersion: 1,
+      resultingExecutionVersion: 2,
+      resolution: "recovered",
+      outcome: "timed_out",
+      issueStatus: "todo",
+    });
+    expect(publicReceipt.body).not.toHaveProperty("runKey");
+    expect(publicReceipt.body).not.toHaveProperty("recoveryReason");
+
+    await request(boardApp)
+      .post(`/api/issues/${issueId}/external-executor/recover`)
+      .send({ ...recoveryBody, reason: "different reason" })
+      .expect(409);
+
+    const secondCheckout = await request(agentApp)
+      .post(`/api/issues/${issueId}/external-executor/checkout`)
+      .send({ runKey: randomUUID(), expectedExecutionVersion: 2, expectedStatuses: ["todo"] });
+    expect(secondCheckout.status, JSON.stringify(secondCheckout.body)).toBe(201);
+    expect((await request(boardApp).get(receiptPath)).body).toEqual(publicReceipt.body);
+    await request(boardApp)
+      .get(`/api/issues/${issueId}/external-executor/receipt?runId=${randomUUID()}&expectedExecutionVersion=3`)
+      .expect(404);
+    await request(boardApp)
+      .get(`/api/issues/${issueId}/external-executor/receipt?runId=${secondCheckout.body.run.id}&expectedExecutionVersion=3`)
+      .expect(409);
+    await request(boardApp)
+      .post(`/api/issues/${issueId}/external-executor/recover`)
+      .send(recoveryBody)
+      .expect(409);
+    await request(boardApp)
+      .post(`/api/issues/${issueId}/external-executor/recover`)
+      .send({ runId: randomUUID(), expectedExecutionVersion: 3, reason: "foreign run" })
+      .expect(409);
+    await request(boardApp)
+      .post(`/api/issues/${issueId}/external-executor/recover`)
+      .send({ runId: secondCheckout.body.run.id, expectedExecutionVersion: 2, reason: "stale version" })
+      .expect(409);
+  });
+
+  it("reads and reconciles the authoritative receipt after a terminal response is lost", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Terminal receipt readback",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+    const agentApp = createApp(agentActor(companyId, agentId, currentRunId));
+    const boardApp = createApp(boardActor(companyId));
+    const runKey = randomUUID();
+    const checkout = await request(agentApp).post(`/api/issues/${issueId}/external-executor/checkout`).send({
+      runKey,
+      expectedExecutionVersion: 0,
+      expectedStatuses: ["todo"],
+    });
+    expect(checkout.status, JSON.stringify(checkout.body)).toBe(201);
+    const runId = checkout.body.run.id;
+    const terminal = await request(agentApp).post(`/api/issues/${issueId}/external-executor/terminal`).send({
+      runKey,
+      expectedExecutionVersion: 1,
+      issueStatus: "in_review",
+      outcome: "succeeded",
+    });
+    expect(terminal.status, JSON.stringify(terminal.body)).toBe(200);
+
+    const receipt = await request(boardApp)
+      .get(`/api/issues/${issueId}/external-executor/receipt?runId=${runId}&expectedExecutionVersion=1`);
+    expect(receipt.status, JSON.stringify(receipt.body)).toBe(200);
+    expect(receipt.body).toEqual({
+      issueId,
+      runId,
+      expectedExecutionVersion: 1,
+      resultingExecutionVersion: 2,
+      resolution: "terminalized",
+      outcome: "succeeded",
+      issueStatus: "in_review",
+    });
+
+    const replay = await request(boardApp).post(`/api/issues/${issueId}/external-executor/recover`).send({
+      runId,
+      expectedExecutionVersion: 1,
+      reason: "terminal response was lost",
+    });
+    expect(replay.status, JSON.stringify(replay.body)).toBe(200);
+    expect(replay.body).toMatchObject({
+      runId,
+      executionVersion: 2,
+      resultingExecutionVersion: 2,
+      resolution: "terminalized",
+      outcome: "succeeded",
+      issueStatus: "in_review",
+      reconciled: true,
+    });
+    expect(replay.body.issue).toMatchObject({ status: "in_review", executionVersion: 2 });
   });
 
   it("leaves an external executor run running when the orphan reaper runs", async () => {

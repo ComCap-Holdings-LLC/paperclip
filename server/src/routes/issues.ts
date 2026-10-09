@@ -41,6 +41,7 @@ import {
   createAcceptedPlanDecompositionSchema,
   checkoutIssueSchema,
   externalExecutorCheckoutSchema,
+  externalExecutorReceiptQuerySchema,
   externalExecutorRecoverySchema,
   externalExecutorTerminalSchema,
   createDocumentAnnotationCommentSchema,
@@ -10765,6 +10766,29 @@ export function issueRoutes(
     res.json(result);
   });
 
+  router.get("/issues/:id/external-executor/receipt", async (req, res) => {
+    if (req.actor.type !== "board" || !req.actor.userId) {
+      res.status(403).json({ error: "Board user context required" });
+      return;
+    }
+    const parsedQuery = externalExecutorReceiptQuerySchema.safeParse(req.query);
+    if (!parsedQuery.success) {
+      res.status(400).json({
+        error: parsedQuery.error.issues[0]?.message ?? "Invalid external executor receipt query",
+      });
+      return;
+    }
+    const id = req.params.id as string;
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    const receipt = await svc.getExternalExecutorLifecycleReceipt({
+      issueId: id,
+      companyId: issue.companyId,
+      ...parsedQuery.data,
+    });
+    res.json(receipt);
+  });
+
   router.post("/issues/:id/external-executor/recover", validate(externalExecutorRecoverySchema), async (req, res) => {
     if (req.actor.type !== "board" || !req.actor.userId) {
       res.status(403).json({ error: "Board user context required" });
@@ -10774,10 +10798,13 @@ export function issueRoutes(
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!issue) return;
     const actor = getActorInfo(req);
+    const recoveryIdentity = "runId" in req.body
+      ? { runId: req.body.runId }
+      : { runKey: req.body.runKey };
     const result = await svc.recoverExternalExecutorRun({
       issueId: id,
       companyId: issue.companyId,
-      runKey: req.body.runKey,
+      ...recoveryIdentity,
       expectedExecutionVersion: req.body.expectedExecutionVersion,
       reason: req.body.reason,
       audit: { ...actor },

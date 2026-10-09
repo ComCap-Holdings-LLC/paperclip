@@ -37,6 +37,7 @@ import {
   addIssueCommentSchema,
   checkoutIssueSchema,
   externalExecutorCheckoutSchema,
+  externalExecutorReceiptQuerySchema,
   externalExecutorRecoverySchema,
   externalExecutorTerminalSchema,
   linkIssueApprovalSchema,
@@ -2503,11 +2504,21 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/external-executor/receipt",
+  tags: ["issues"],
+  summary: "Read the committed external executor lifecycle receipt",
+  description: "Requires board-user context. Returns a sanitized terminal or recovery receipt for the exact public run ID and execution version without exposing the run key.",
+  request: { params: z.object({ id: z.string() }), query: externalExecutorReceiptQuerySchema },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
   method: "post",
   path: "/api/issues/{id}/external-executor/recover",
   tags: ["issues"],
   summary: "Recover a crashed external executor run with CAS",
-  description: "Requires board-user context and the exact active run key and execution version.",
+  description: "Requires board-user context and either the secret run key or the public server-issued run ID, plus the exact execution version. Run-ID recovery replays reconcile against the committed recovery receipt.",
   request: { params: z.object({ id: z.string() }), body: jsonBody(externalExecutorRecoverySchema) },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
 });

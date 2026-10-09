@@ -5262,6 +5262,22 @@ export function resolveTaskSessionConfigFreshness(input: {
   };
 }
 
+// A deferred comment wake must not undo a verified closure just because the
+// requester was a human. Local-CLI comments and board comments are both
+// actor type "user". Explicit intent is the wake reason recorded when the
+// comment request itself set `reopen`, or a resume/follow-up flag.
+export function shouldReopenClosedIssueForDeferredCommentWake(input: {
+  hasComment: boolean;
+  selfAuthored: boolean;
+  issueStatus: string | null | undefined;
+  wakeReason: string | null | undefined;
+  resumeIntent: boolean;
+}): boolean {
+  if (!input.hasComment || input.selfAuthored) return false;
+  if (input.issueStatus !== "done" && input.issueStatus !== "cancelled") return false;
+  return input.wakeReason === "issue_reopened_via_comment" || input.resumeIntent;
+}
+
 export function shouldAutoCheckoutIssueForWake(input: {
   contextSnapshot: Record<string, unknown> | null | undefined;
   issueStatus: string | null;
@@ -16947,11 +16963,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         const deferredCommentIds = extractWakeCommentIds(deferredContextSeed);
         const deferredWakeReason = readNonEmptyString(deferredContextSeed.wakeReason);
-        // Local-CLI agents post comments under user auth, so a self-comment from
-        // the run that is now ending would otherwise look like a real human
-        // comment and trigger a reopen on the very issue this run just closed.
-        // Suppress reopen only when every referenced comment came from this run;
-        // mixed batches must still reopen because they contain a real follow-up.
+        // Local-CLI agents post comments under user auth. A self-comment from the
+        // run that is now ending is not a human reopen, and neither is any other
+        // ordinary user comment. Reopen only when the wake already carries
+        // explicit intent (see shouldReopenClosedIssueForDeferredCommentWake).
         let deferredCommentWakeIsSelfAuthored = false;
         if (deferredCommentIds.length > 0) {
           const deferredComments = await tx
@@ -16969,16 +16984,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             deferredComments.length > 0 &&
             deferredComments.every((comment) => comment.createdByRunId === run.id);
         }
-        // Only human/comment-reopen interactions should revive completed issues;
-        // system follow-ups such as retry or cleanup wakes must not reopen closed work.
-        const shouldReopenDeferredCommentWake =
-          deferredCommentIds.length > 0 &&
-          !deferredCommentWakeIsSelfAuthored &&
-          (issue.status === "done" || issue.status === "cancelled") &&
-          (
-            deferred.requestedByActorType === "user" ||
-            deferredWakeReason === "issue_reopened_via_comment"
-          );
+        // System follow-ups such as retry or cleanup wakes must not reopen
+        // closed work, and neither must a plain human comment. Explicit
+        // reopen/resume recorded on the wake is the only revival signal.
+        const shouldReopenDeferredCommentWake = shouldReopenClosedIssueForDeferredCommentWake({
+          hasComment: deferredCommentIds.length > 0,
+          selfAuthored: deferredCommentWakeIsSelfAuthored,
+          issueStatus: issue.status,
+          wakeReason: deferredWakeReason,
+          resumeIntent:
+            deferredContextSeed.resumeIntent === true
+            || deferredContextSeed.followUpRequested === true,
+        });
         let reopenedActivity: LogActivityInput | null = null;
 
         if (shouldReopenDeferredCommentWake) {

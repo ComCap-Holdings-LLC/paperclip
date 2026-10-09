@@ -3251,7 +3251,7 @@ describe("IssueChatThread", () => {
     });
   });
 
-  it("hides the reopen control and infers reopen for closed agent-assigned issue replies", async () => {
+  it("does not infer reopen for a done agent-assigned issue reply", async () => {
     const root = createRoot(container);
 
     act(() => {
@@ -3297,9 +3297,7 @@ describe("IssueChatThread", () => {
       expect.objectContaining({
         content: [{ type: "text", text: "Please pick this back up" }],
         runConfig: {
-          custom: {
-            reopen: true,
-          },
+          custom: {},
         },
       }),
     );

@@ -333,7 +333,7 @@ describe("TaskChatComposer", () => {
     expect(onAdd).toHaveBeenCalledWith("do the plan", undefined, undefined);
   });
 
-  it("passes reopen=true when the issue resumes-to-todo and the assignee is an agent", async () => {
+  it("does not pass reopen=true for a done agent-assigned issue", async () => {
     const onAdd = vi.fn().mockResolvedValue(undefined);
     render(
       <TaskChatComposer
@@ -344,11 +344,29 @@ describe("TaskChatComposer", () => {
       />,
     );
 
-    typeText("wake up");
+    typeText("context only");
     pressKey("Enter", { metaKey: true });
     await flushAsync();
 
-    expect(onAdd).toHaveBeenCalledWith("wake up", true, undefined);
+    expect(onAdd).toHaveBeenCalledWith("context only", undefined, undefined);
+  });
+
+  it("passes reopen=true when a blocked issue is assigned to an agent", async () => {
+    const onAdd = vi.fn().mockResolvedValue(undefined);
+    render(
+      <TaskChatComposer
+        onAdd={onAdd}
+        workMode="standard"
+        issueStatus="blocked"
+        currentAssigneeValue="agent:a1"
+      />,
+    );
+
+    typeText("please continue");
+    pressKey("Enter", { metaKey: true });
+    await flushAsync();
+
+    expect(onAdd).toHaveBeenCalledWith("please continue", true, undefined);
   });
 
   it("hides the attach button without an upload handler and shows it with one", () => {

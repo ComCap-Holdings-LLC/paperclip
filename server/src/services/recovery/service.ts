@@ -345,6 +345,27 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "claude_transient_upstream",
   "provider_quota",
   "timeout",
+  // Gateway-side transport faults: the remote is reachable-but-unhealthy or
+  // rate limiting us. Nothing a human can fix, so these stay retryable.
+  "hermes_gateway_connect_failed",
+  "hermes_gateway_rate_limited",
+  "hermes_gateway_upstream_error",
+  "hermes_gateway_timeout",
+]);
+
+// Adapter failures that are a *credential/configuration* problem, not a
+// transient one. Retrying these forever is what produced COM-11514: a
+// `hermes_gateway_auth_failed` run was classified as a generic stall, requeued
+// to `todo`, re-woke the assignee, and the assignee had nothing it could do
+// because only a human can rotate the key. These must land in `blocked` with
+// the fix recorded, exactly like any other `configuration_incomplete`.
+const ADAPTER_CREDENTIAL_FAILURE_ERROR_CODES = new Set<string>([
+  "hermes_gateway_auth_failed",
+  "hermes_gateway_api_key_missing",
+  "hermes_gateway_api_base_url_missing",
+  "hermes_gateway_api_base_url_invalid",
+  "hermes_gateway_plain_http_remote_denied",
+  "cursor_cloud_auth_failed",
 ]);
 
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
@@ -450,6 +471,12 @@ export function classifyAdapterFailureForRecovery(
   latestRun: Pick<NonNullable<LatestIssueRun>, "error" | "errorCode" | "resultJson">,
   now = new Date(),
 ): AdapterFailureRecoveryClassification {
+  // A credential/endpoint failure is terminal for the agent: no amount of
+  // requeueing gives it a working key. Classify it before the `adapter_failed`
+  // gate below, because these codes never carry that generic code.
+  if (latestRun.errorCode && ADAPTER_CREDENTIAL_FAILURE_ERROR_CODES.has(latestRun.errorCode)) {
+    return { kind: "configuration_incomplete" };
+  }
   if (
     latestRun.errorCode !== "adapter_failed" &&
     latestRun.errorCode !== "provider_quota" &&

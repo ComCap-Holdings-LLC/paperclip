@@ -2209,4 +2209,116 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     expect(terminal.status, JSON.stringify(terminal.body)).toBe(422);
     expect(terminal.body.error).toMatch(/blocked|unblock/i);
   });
+
+  async function checkedOutForBlockedTerminal(title: string) {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title,
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+    const app = createApp(agentActor(companyId, agentId, currentRunId));
+    const runKey = randomUUID();
+    const checkout = await request(app).post(`/api/issues/${issueId}/external-executor/checkout`).send({
+      runKey,
+      expectedExecutionVersion: 0,
+      expectedStatuses: ["todo"],
+    });
+    expect(checkout.status, JSON.stringify(checkout.body)).toBe(201);
+    return { app, issueId, agentId, runKey, runId: checkout.body.run.id as string };
+  }
+
+  async function issueRow(issueId: string) {
+    return db
+      .select({
+        status: issues.status,
+        unblockDescriptor: issues.unblockDescriptor,
+        externalExecutorRunId: issues.externalExecutorRunId,
+        executionVersion: issues.executionVersion,
+        blockedTransitionAt: issues.blockedTransitionAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+  }
+
+  it("lets an external executor enter blocked atomically with its own unblock descriptor", async () => {
+    const { app, issueId, agentId, runKey, runId } = await checkedOutForBlockedTerminal("Atomic blocked terminal");
+    const descriptor = { owner: { agentId }, action: "Needs a Doppler secret the worker cannot read" };
+
+    const terminal = await request(app).post(`/api/issues/${issueId}/external-executor/terminal`).send({
+      runKey,
+      expectedExecutionVersion: 1,
+      issueStatus: "blocked",
+      outcome: "failed",
+      unblockDescriptor: descriptor,
+    });
+    expect(terminal.status, JSON.stringify(terminal.body)).toBe(200);
+    const row = await issueRow(issueId);
+    expect(row.status).toBe("blocked");
+    expect(row.unblockDescriptor).toEqual(descriptor);
+    expect(row.externalExecutorRunId).toBeNull();
+    expect(row.executionVersion).toBe(2);
+    expect(row.blockedTransitionAt).toBeInstanceOf(Date);
+    const run = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]);
+    expect(run).toEqual({ status: "failed" });
+
+    // The descriptor rides the same CAS: a replay at the old version changes nothing.
+    const replay = await request(app).post(`/api/issues/${issueId}/external-executor/terminal`).send({
+      runKey,
+      expectedExecutionVersion: 1,
+      issueStatus: "blocked",
+      outcome: "failed",
+      unblockDescriptor: { owner: { agentId }, action: "replayed" },
+    });
+    expect(replay.status, JSON.stringify(replay.body)).toBe(409);
+    expect((await issueRow(issueId)).unblockDescriptor).toEqual(descriptor);
+  });
+
+  it("refuses a terminal unblock descriptor that names another agent and keeps the lock", async () => {
+    const { app, issueId, runKey } = await checkedOutForBlockedTerminal("Foreign unblock owner");
+    const terminal = await request(app).post(`/api/issues/${issueId}/external-executor/terminal`).send({
+      runKey,
+      expectedExecutionVersion: 1,
+      issueStatus: "blocked",
+      outcome: "failed",
+      unblockDescriptor: { owner: { agentId: randomUUID() }, action: "someone else" },
+    });
+    expect(terminal.status, JSON.stringify(terminal.body)).toBe(422);
+    const row = await issueRow(issueId);
+    expect(row.status).toBe("in_progress");
+    expect(row.unblockDescriptor).toBeNull();
+    expect(row.externalExecutorRunId).not.toBeNull();
+  });
+
+  it("refuses a terminal unblock descriptor on a non-blocked status or with a board owner", async () => {
+    const { app, issueId, agentId, runKey } = await checkedOutForBlockedTerminal("Descriptor shape");
+    const notBlocked = await request(app).post(`/api/issues/${issueId}/external-executor/terminal`).send({
+      runKey,
+      expectedExecutionVersion: 1,
+      issueStatus: "todo",
+      outcome: "failed",
+      unblockDescriptor: { owner: { agentId }, action: "x" },
+    });
+    expect(notBlocked.status, JSON.stringify(notBlocked.body)).toBe(400);
+    const boardOwner = await request(app).post(`/api/issues/${issueId}/external-executor/terminal`).send({
+      runKey,
+      expectedExecutionVersion: 1,
+      issueStatus: "blocked",
+      outcome: "failed",
+      unblockDescriptor: { owner: "board", action: "x" },
+    });
+    expect(boardOwner.status, JSON.stringify(boardOwner.body)).toBe(400);
+    const row = await issueRow(issueId);
+    expect(row.status).toBe("in_progress");
+    expect(row.externalExecutorRunId).not.toBeNull();
+  });
 });

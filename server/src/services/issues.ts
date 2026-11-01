@@ -8816,8 +8816,17 @@ export function issueService(
       issueStatus: "todo" | "blocked" | "in_review" | "done" | "cancelled";
       outcome: "succeeded" | "failed" | "cancelled";
       error?: string | null;
+      unblockDescriptor?: { owner: { agentId: string }; action: string };
       audit: ExternalExecutorAuditActor;
     }) => {
+      if (input.unblockDescriptor) {
+        if (input.issueStatus !== "blocked") {
+          throw unprocessable("unblockDescriptor requires blocked status");
+        }
+        if (input.unblockDescriptor.owner.agentId !== input.agentId) {
+          throw unprocessable("An external executor may only name itself as the unblock owner");
+        }
+      }
       const postCommitActivityPublications: ActivityPublication[] = [];
       const result = await db.transaction(async (tx) => {
       await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${input.issueId} for update`);
@@ -8899,7 +8908,13 @@ export function issueService(
       ) {
         throw unprocessable("External executor cannot complete an issue while review or approval is pending");
       }
-      if (input.issueStatus === "blocked" && !issue.unblockDescriptor && !pendingInteraction && !pendingApproval) {
+      if (
+        input.issueStatus === "blocked" &&
+        !issue.unblockDescriptor &&
+        !input.unblockDescriptor &&
+        !pendingInteraction &&
+        !pendingApproval
+      ) {
         const blockerIds = await tx
           .select({ id: issueRelations.issueId })
           .from(issueRelations)
@@ -8940,11 +8955,17 @@ export function issueService(
         : input.issueStatus;
       const now = new Date();
       const statusPatch = applyStatusSideEffects(effectiveIssueStatus, {});
+      // Same fields the PATCH path writes when an issue enters blocked with a descriptor.
+      const descriptorPatch: Partial<typeof issues.$inferInsert> =
+        input.unblockDescriptor && effectiveIssueStatus === "blocked"
+          ? { unblockDescriptor: input.unblockDescriptor, blockedTransitionAt: now, blockedOwnerNotifiedAt: null }
+          : {};
       const updated = await tx
         .update(issues)
         .set({
           ...(executionPolicyTransition.patch as Partial<typeof issues.$inferInsert>),
           ...statusPatch,
+          ...descriptorPatch,
           status: effectiveIssueStatus,
           ...(effectiveIssueStatus !== "done" ? { completedAt: null } : {}),
           ...(effectiveIssueStatus !== "cancelled" ? { cancelledAt: null } : {}),

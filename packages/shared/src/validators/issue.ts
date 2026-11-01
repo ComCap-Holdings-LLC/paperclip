@@ -603,7 +603,18 @@ export const externalExecutorTerminalSchema = z.object({
   issueStatus: z.enum(["todo", "blocked", "in_review", "done", "cancelled"]),
   outcome: z.enum(["succeeded", "failed", "cancelled"]),
   error: z.string().trim().min(1).max(4_000).optional().nullable(),
+  // Lets the executor land `blocked` atomically with its terminal CAS: the
+  // descriptor is written in the same transaction, so there is no window between
+  // releasing the lock and satisfying the blocked guard. An executor may only
+  // name itself as the owner (checked against the run's agent in the service).
+  unblockDescriptor: z.object({
+    owner: z.object({ agentId: z.string().uuid() }).strict(),
+    action: multilineTextSchema.pipe(z.string().trim().min(1).max(2_000)),
+  }).strict().optional(),
 }).strict().superRefine((value, ctx) => {
+  if (value.unblockDescriptor && value.issueStatus !== "blocked") {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["unblockDescriptor"], message: "unblockDescriptor requires blocked status" });
+  }
   if (value.issueStatus === "done" && value.outcome !== "succeeded") {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["outcome"], message: "done requires a succeeded outcome" });
   }

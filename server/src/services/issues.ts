@@ -8953,6 +8953,13 @@ export function issueService(
       const effectiveIssueStatus = typeof executionPolicyTransition.patch.status === "string"
         ? executionPolicyTransition.patch.status
         : input.issueStatus;
+      if (input.unblockDescriptor && effectiveIssueStatus !== "blocked") {
+        // Never drop the executor's descriptor silently: refuse, keep the lock.
+        throw unprocessable("Execution policy would not leave the issue blocked; unblockDescriptor cannot be applied", {
+          issueId: input.issueId,
+          effectiveIssueStatus,
+        });
+      }
       const now = new Date();
       const statusPatch = applyStatusSideEffects(effectiveIssueStatus, {});
       // Same fields the PATCH path writes when an issue enters blocked with a descriptor.

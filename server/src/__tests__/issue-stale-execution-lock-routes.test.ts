@@ -3,6 +3,19 @@ import express from "express";
 import request from "supertest";
 import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+
+const policyOverride = vi.hoisted(() => ({ status: null as string | null }));
+vi.mock("../services/issue-execution-policy.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/issue-execution-policy.js")>();
+  return {
+    ...actual,
+    applyIssueExecutionPolicyTransition: (input: Parameters<typeof actual.applyIssueExecutionPolicyTransition>[0]) => {
+      const result = actual.applyIssueExecutionPolicyTransition(input);
+      if (policyOverride.status === null) return result;
+      return { ...result, patch: { ...result.patch, status: policyOverride.status } };
+    },
+  };
+});
 import {
   activityLog,
   agents,
@@ -2297,6 +2310,30 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     expect(row.status).toBe("in_progress");
     expect(row.unblockDescriptor).toBeNull();
     expect(row.externalExecutorRunId).not.toBeNull();
+  });
+
+  it("refuses a terminal unblock descriptor when the execution policy rewrites blocked, and keeps the lock", async () => {
+    const { app, issueId, agentId, runKey } = await checkedOutForBlockedTerminal("Policy rewrites blocked");
+    policyOverride.status = "in_review";
+    try {
+      const terminal = await request(app).post(`/api/issues/${issueId}/external-executor/terminal`).send({
+        runKey,
+        expectedExecutionVersion: 1,
+        issueStatus: "blocked",
+        outcome: "failed",
+        unblockDescriptor: { owner: { agentId }, action: "needs a human" },
+      });
+      expect(terminal.status, JSON.stringify(terminal.body)).toBe(422);
+      expect(terminal.body.error).toMatch(/policy/i);
+    } finally {
+      policyOverride.status = null;
+    }
+    const row = await issueRow(issueId);
+    expect(row.status).toBe("in_progress");
+    expect(row.unblockDescriptor).toBeNull();
+    expect(row.externalExecutorRunId).not.toBeNull();
+    expect(row.executionVersion).toBe(1);
+    expect(row.blockedTransitionAt).toBeNull();
   });
 
   it("refuses a terminal unblock descriptor on a non-blocked status or with a board owner", async () => {

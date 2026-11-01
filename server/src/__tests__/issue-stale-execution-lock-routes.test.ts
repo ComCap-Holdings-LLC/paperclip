@@ -2284,7 +2284,7 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       .then((rows) => rows[0]);
     expect(run).toEqual({ status: "failed" });
 
-    // The descriptor rides the same CAS: a replay at the old version changes nothing.
+    // A replay after the release finds no owning run and changes nothing.
     const replay = await request(app).post(`/api/issues/${issueId}/external-executor/terminal`).send({
       runKey,
       expectedExecutionVersion: 1,

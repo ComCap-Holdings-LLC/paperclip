@@ -8963,6 +8963,7 @@ export function issueService(
       const now = new Date();
       const statusPatch = applyStatusSideEffects(effectiveIssueStatus, {});
       // Same fields the PATCH path writes when an issue enters blocked with a descriptor.
+      // No unblock wake-up is dispatched here: the owner is the executor itself.
       const descriptorPatch: Partial<typeof issues.$inferInsert> =
         input.unblockDescriptor && effectiveIssueStatus === "blocked"
           ? { unblockDescriptor: input.unblockDescriptor, blockedTransitionAt: now, blockedOwnerNotifiedAt: null }

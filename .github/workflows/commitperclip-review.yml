@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   review:
-    runs-on: ubuntu-latest
+    runs-on: hermes-ephemeral
     # Was 5; +1 for the new script-test step (its own 1-minute step timeout
     # bounds the worst case, this just keeps the shared job budget from
     # being squeezed for every other step — Dependency Review, token

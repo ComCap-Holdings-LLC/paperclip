@@ -426,20 +426,22 @@ function withCreateIssueStatusDefault<T extends z.ZodRawShape>(schema: z.ZodObje
   }, schema);
 }
 
+export const issueUnblockDescriptorSchema = z.object({
+  owner: z.union([
+    z.object({ agentId: z.string().uuid() }).strict(),
+    z.object({ userId: z.string().trim().min(1) }).strict(),
+    z.literal("board"),
+  ]),
+  action: multilineTextSchema.pipe(z.string().trim().min(1).max(2_000)),
+}).strict();
+
 const createIssueBaseSchema = z.object({
   projectId: z.string().uuid().optional().nullable(),
   projectWorkspaceId: z.string().uuid().optional().nullable(),
   goalId: z.string().uuid().optional().nullable(),
   parentId: z.string().uuid().optional().nullable(),
   blockedByIssueIds: z.array(z.string().uuid()).optional(),
-  unblockDescriptor: z.object({
-    owner: z.union([
-      z.object({ agentId: z.string().uuid() }).strict(),
-      z.object({ userId: z.string().trim().min(1) }).strict(),
-      z.literal("board"),
-    ]),
-    action: multilineTextSchema.pipe(z.string().trim().min(1).max(2_000)),
-  }).strict().optional().nullable(),
+  unblockDescriptor: issueUnblockDescriptorSchema.optional().nullable(),
   inheritExecutionWorkspaceFromIssueId: z.string().uuid().optional().nullable(),
   title: z.string().min(1),
   description: multilineTextSchema.optional().nullable(),
@@ -597,18 +599,34 @@ export const externalExecutorCheckoutSchema = z.object({
 
 export type ExternalExecutorCheckout = z.infer<typeof externalExecutorCheckoutSchema>;
 
+// `issueStatus: "blocked"` was unreachable here until unblockDescriptor was
+// accepted: the strict schema rejected the key with 400 unrecognized_keys while
+// the service demanded one with 422 "Entering blocked requires unresolved
+// blockers, a pending interaction/approval, or unblockDescriptor". An executor
+// that holds no blocker rows and no pending interaction/approval -- the normal
+// case for a pull-executed agent reporting "a human has to choose" -- could
+// satisfy neither, so its terminal looped forever and the execution lock was
+// never released (COM-20424).
 export const externalExecutorTerminalSchema = z.object({
   runKey: z.string().uuid(),
   expectedExecutionVersion: z.number().int().min(0),
   issueStatus: z.enum(["todo", "blocked", "in_review", "done", "cancelled"]),
   outcome: z.enum(["succeeded", "failed", "cancelled"]),
   error: z.string().trim().min(1).max(4_000).optional().nullable(),
+  unblockDescriptor: issueUnblockDescriptorSchema.optional().nullable(),
 }).strict().superRefine((value, ctx) => {
   if (value.issueStatus === "done" && value.outcome !== "succeeded") {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["outcome"], message: "done requires a succeeded outcome" });
   }
   if (value.issueStatus === "cancelled" && value.outcome !== "cancelled") {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["outcome"], message: "cancelled requires a cancelled outcome" });
+  }
+  if (value.unblockDescriptor != null && value.issueStatus !== "blocked") {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["unblockDescriptor"],
+      message: "unblockDescriptor requires blocked status",
+    });
   }
 });
 

@@ -420,6 +420,7 @@ export {
   issueReviewRequestSchema,
   issueExecutionWorkspaceSettingsSchema,
   checkoutIssueSchema,
+  issueUnblockDescriptorSchema,
   externalExecutorCheckoutSchema,
   externalExecutorTerminalSchema,
   externalExecutorRecoverySchema,

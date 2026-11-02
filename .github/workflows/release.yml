@@ -59,7 +59,7 @@ jobs:
   publish_canary:
     if: github.event_name == 'push'
     needs: verify_canary
-    runs-on: ubuntu-latest
+    runs-on: hermes-ephemeral
     timeout-minutes: 45
     environment: npm-canary
     permissions:
@@ -130,7 +130,7 @@ jobs:
 
   select_nightly:
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.channel == 'nightly')
-    runs-on: ubuntu-latest
+    runs-on: hermes-ephemeral
     timeout-minutes: 10
     permissions:
       contents: read
@@ -235,7 +235,7 @@ jobs:
       needs.select_nightly.outputs.proceed == 'true' &&
       (needs.smoke_nightly.result == 'success' ||
        (needs.smoke_nightly.result == 'skipped' && github.event_name == 'workflow_dispatch' && inputs.dry_run))
-    runs-on: ubuntu-latest
+    runs-on: hermes-ephemeral
     timeout-minutes: 45
     environment: npm-canary
     # The workflow-level concurrency group is per event, so a forced dispatch
@@ -359,7 +359,7 @@ jobs:
 
   select_beta:
     if: github.event_name == 'workflow_dispatch' && inputs.channel == 'beta'
-    runs-on: ubuntu-latest
+    runs-on: hermes-ephemeral
     timeout-minutes: 10
     permissions:
       contents: read
@@ -501,7 +501,7 @@ jobs:
       needs.select_beta.result == 'success' &&
       (needs.verify_beta_candidate.result == 'success' ||
        (needs.verify_beta_candidate.result == 'skipped' && needs.select_beta.outputs.mode == 'promote'))
-    runs-on: ubuntu-latest
+    runs-on: hermes-ephemeral
     timeout-minutes: 45
     environment: npm-beta
     # Serialize beta publishes so two dispatches cannot race to the same next
@@ -643,7 +643,7 @@ jobs:
   # published at another.
   preflight_stable:
     if: github.event_name == 'workflow_dispatch' && inputs.channel == 'stable'
-    runs-on: ubuntu-latest
+    runs-on: hermes-ephemeral
     timeout-minutes: 10
     permissions:
       contents: read
@@ -750,7 +750,7 @@ jobs:
   preview_stable:
     if: github.event_name == 'workflow_dispatch' && inputs.channel == 'stable' && inputs.dry_run
     needs: [preflight_stable, verify_stable]
-    runs-on: ubuntu-latest
+    runs-on: hermes-ephemeral
     timeout-minutes: 45
     permissions:
       contents: read
@@ -792,7 +792,7 @@ jobs:
   publish_stable:
     if: github.event_name == 'workflow_dispatch' && inputs.channel == 'stable' && !inputs.dry_run
     needs: [preflight_stable, verify_stable]
-    runs-on: ubuntu-latest
+    runs-on: hermes-ephemeral
     timeout-minutes: 45
     environment: npm-stable
     permissions:

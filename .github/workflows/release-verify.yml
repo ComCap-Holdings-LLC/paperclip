@@ -11,7 +11,7 @@ on:
 jobs:
   typecheck:
     name: Typecheck
-    runs-on: ubuntu-latest
+    runs-on: hermes-ephemeral
     timeout-minutes: 20
     permissions:
       contents: read
@@ -44,7 +44,7 @@ jobs:
 
   general_tests:
     name: General tests (${{ matrix.group_label }})
-    runs-on: ubuntu-latest
+    runs-on: hermes-ephemeral
     timeout-minutes: 20
     permissions:
       contents: read
@@ -108,7 +108,7 @@ jobs:
 
   serialized_tests:
     name: Serialized tests (${{ matrix.shard_label }})
-    runs-on: ubuntu-latest
+    runs-on: hermes-ephemeral
     timeout-minutes: 20
     permissions:
       contents: read
@@ -157,7 +157,7 @@ jobs:
 
   build:
     name: Build
-    runs-on: ubuntu-latest
+    runs-on: hermes-ephemeral
     timeout-minutes: 20
     permissions:
       contents: read

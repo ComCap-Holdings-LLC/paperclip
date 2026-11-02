@@ -22,7 +22,7 @@ jobs:
       (github.event.workflow_run.event == 'push' ||
       github.event.workflow_run.event == 'workflow_dispatch') &&
       github.event.workflow_run.head_branch == 'master'
-    runs-on: ubuntu-latest
+    runs-on: hermes-ephemeral
     timeout-minutes: 15
     steps:
       - name: Configure production SSH identity

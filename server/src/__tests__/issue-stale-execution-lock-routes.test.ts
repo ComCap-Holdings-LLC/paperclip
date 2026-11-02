@@ -2253,6 +2253,7 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         externalExecutorRunId: issues.externalExecutorRunId,
         executionVersion: issues.executionVersion,
         blockedTransitionAt: issues.blockedTransitionAt,
+        blockedOwnerNotifiedAt: issues.blockedOwnerNotifiedAt,
       })
       .from(issues)
       .where(eq(issues.id, issueId))
@@ -2336,6 +2337,8 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
   it("lets an executor refresh its own stored unblock descriptor on the terminal", async () => {
     const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
     const issueId = randomUUID();
+    const episodeStartedAt = new Date(Date.now() - 3_600_000);
+    const ownerNotifiedAt = new Date(Date.now() - 1_800_000);
     await db.insert(issues).values({
       id: issueId,
       companyId,
@@ -2344,7 +2347,8 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       priority: "high",
       assigneeAgentId: agentId,
       unblockDescriptor: { owner: { agentId }, action: "stale action" },
-      blockedTransitionAt: new Date(),
+      blockedTransitionAt: episodeStartedAt,
+      blockedOwnerNotifiedAt: ownerNotifiedAt,
     });
     const app = createApp(agentActor(companyId, agentId, currentRunId));
     const runKey = randomUUID();
@@ -2368,6 +2372,15 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     expect(row.unblockDescriptor).toEqual(refreshed);
     expect(row.status).toBe("blocked");
     expect(row.externalExecutorRunId).toBeNull();
+    // This is a NEW block episode, not a refresh of a live one: the checkout moved
+    // the row to in_progress before the executor ran, so the terminal always sees
+    // in_progress and `blocked` here is a real transition. Both episode columns are
+    // therefore rewritten, exactly as the PATCH path does when an issue enters
+    // blocked. Pinned because a reviewer read this case as a same-status refresh
+    // whose clocks must be preserved -- that case is unreachable through this route.
+    expect(row.blockedTransitionAt).toBeInstanceOf(Date);
+    expect(row.blockedTransitionAt!.getTime()).toBeGreaterThan(episodeStartedAt.getTime());
+    expect(row.blockedOwnerNotifiedAt).toBeNull();
   });
 
   it("refuses a terminal unblock descriptor that names another agent and keeps the lock", async () => {

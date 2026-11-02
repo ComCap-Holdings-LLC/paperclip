@@ -51,6 +51,7 @@ import type {
   IssueProductivityReview,
   IssueProductivityReviewTrigger,
   IssueRelationIssueSummary,
+  IssueUnblockDescriptor,
   IssueWatchdogSummary,
   LowTrustBoundary,
   SuccessfulRunHandoffState,
@@ -8907,6 +8908,22 @@ export function issueService(
         (pendingExecutionReview || pendingInteraction || pendingApproval)
       ) {
         throw unprocessable("External executor cannot complete an issue while review or approval is pending");
+      }
+      if (input.unblockDescriptor && issue.unblockDescriptor) {
+        // A blocked issue can be checked out (expectedStatuses accepts every
+        // status), so the row may already carry a descriptor the board or
+        // another agent installed. The terminal write would replace it and
+        // name this executor as the owner, erasing whoever actually has to act.
+        // Refuse and keep the lock; only refreshing your own descriptor is allowed.
+        const storedOwner = (issue.unblockDescriptor as IssueUnblockDescriptor).owner;
+        const storedAgentId = typeof storedOwner === "object" && storedOwner !== null && "agentId" in storedOwner
+          ? storedOwner.agentId
+          : null;
+        if (storedAgentId !== input.agentId) {
+          throw unprocessable("An external executor cannot replace an unblock descriptor owned by someone else", {
+            issueId: input.issueId,
+          });
+        }
       }
       if (
         input.issueStatus === "blocked" &&

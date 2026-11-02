@@ -51,6 +51,7 @@ import type {
   IssueProductivityReview,
   IssueProductivityReviewTrigger,
   IssueRelationIssueSummary,
+  IssueUnblockDescriptor,
   IssueWatchdogSummary,
   LowTrustBoundary,
   SuccessfulRunHandoffState,
@@ -8816,8 +8817,17 @@ export function issueService(
       issueStatus: "todo" | "blocked" | "in_review" | "done" | "cancelled";
       outcome: "succeeded" | "failed" | "cancelled";
       error?: string | null;
+      unblockDescriptor?: { owner: { agentId: string }; action: string };
       audit: ExternalExecutorAuditActor;
     }) => {
+      if (input.unblockDescriptor) {
+        if (input.issueStatus !== "blocked") {
+          throw unprocessable("unblockDescriptor requires blocked status");
+        }
+        if (input.unblockDescriptor.owner.agentId !== input.agentId) {
+          throw unprocessable("An external executor may only name itself as the unblock owner");
+        }
+      }
       const postCommitActivityPublications: ActivityPublication[] = [];
       const result = await db.transaction(async (tx) => {
       await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${input.issueId} for update`);
@@ -8899,7 +8909,29 @@ export function issueService(
       ) {
         throw unprocessable("External executor cannot complete an issue while review or approval is pending");
       }
-      if (input.issueStatus === "blocked" && !issue.unblockDescriptor && !pendingInteraction && !pendingApproval) {
+      if (input.unblockDescriptor && issue.unblockDescriptor) {
+        // A blocked issue can be checked out (expectedStatuses accepts every
+        // status), so the row may already carry a descriptor the board or
+        // another agent installed. The terminal write would replace it and
+        // name this executor as the owner, erasing whoever actually has to act.
+        // Refuse and keep the lock; only refreshing your own descriptor is allowed.
+        const storedOwner = (issue.unblockDescriptor as IssueUnblockDescriptor).owner;
+        const storedAgentId = typeof storedOwner === "object" && storedOwner !== null && "agentId" in storedOwner
+          ? storedOwner.agentId
+          : null;
+        if (storedAgentId !== input.agentId) {
+          throw unprocessable("An external executor cannot replace an unblock descriptor owned by someone else", {
+            issueId: input.issueId,
+          });
+        }
+      }
+      if (
+        input.issueStatus === "blocked" &&
+        !issue.unblockDescriptor &&
+        !input.unblockDescriptor &&
+        !pendingInteraction &&
+        !pendingApproval
+      ) {
         const blockerIds = await tx
           .select({ id: issueRelations.issueId })
           .from(issueRelations)
@@ -8938,13 +8970,27 @@ export function issueService(
       const effectiveIssueStatus = typeof executionPolicyTransition.patch.status === "string"
         ? executionPolicyTransition.patch.status
         : input.issueStatus;
+      if (input.unblockDescriptor && effectiveIssueStatus !== "blocked") {
+        // Never drop the executor's descriptor silently: refuse, keep the lock.
+        throw unprocessable("Execution policy would not leave the issue blocked; unblockDescriptor cannot be applied", {
+          issueId: input.issueId,
+          effectiveIssueStatus,
+        });
+      }
       const now = new Date();
       const statusPatch = applyStatusSideEffects(effectiveIssueStatus, {});
+      // Same fields the PATCH path writes when an issue enters blocked with a descriptor.
+      // No unblock wake-up is dispatched here: the owner is the executor itself.
+      const descriptorPatch: Partial<typeof issues.$inferInsert> =
+        input.unblockDescriptor && effectiveIssueStatus === "blocked"
+          ? { unblockDescriptor: input.unblockDescriptor, blockedTransitionAt: now, blockedOwnerNotifiedAt: null }
+          : {};
       const updated = await tx
         .update(issues)
         .set({
           ...(executionPolicyTransition.patch as Partial<typeof issues.$inferInsert>),
           ...statusPatch,
+          ...descriptorPatch,
           status: effectiveIssueStatus,
           ...(effectiveIssueStatus !== "done" ? { completedAt: null } : {}),
           ...(effectiveIssueStatus !== "cancelled" ? { cancelledAt: null } : {}),

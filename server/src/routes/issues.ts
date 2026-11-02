@@ -10761,6 +10761,7 @@ export function issueRoutes(
       issueStatus: req.body.issueStatus,
       outcome: req.body.outcome,
       error: req.body.error,
+      unblockDescriptor: req.body.unblockDescriptor,
       audit: { ...actor },
     });
     res.json(result);

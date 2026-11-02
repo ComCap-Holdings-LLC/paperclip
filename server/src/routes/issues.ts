@@ -10748,6 +10748,19 @@ export function issueRoutes(
     if (!issue) return;
     const agentId = await requireExternalExecutorAgent(req, res, issue);
     if (!agentId) return;
+    // The descriptor rides the terminal CAS itself, so its ownership is checked
+    // here rather than on a follow-up PATCH: an executor may name only itself,
+    // exactly as the issue PATCH path refuses "board"/userId owners for an
+    // agent actor. Without this an executor could hand the unblock to someone
+    // who never agreed to own it.
+    const unblockDescriptor = req.body.unblockDescriptor ?? null;
+    if (unblockDescriptor) {
+      const owner = unblockDescriptor.owner;
+      if (owner === "board" || !("agentId" in owner) || owner.agentId !== agentId) {
+        res.status(403).json({ error: "External executors may only name themselves as an unblock owner" });
+        return;
+      }
+    }
     const actor = getActorInfo(req);
     const result = await svc.terminalExternalExecutorRun({
       issueId: id,
@@ -10761,6 +10774,7 @@ export function issueRoutes(
       issueStatus: req.body.issueStatus,
       outcome: req.body.outcome,
       error: req.body.error,
+      unblockDescriptor,
       audit: { ...actor },
     });
     res.json(result);

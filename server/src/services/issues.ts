@@ -51,6 +51,7 @@ import type {
   IssueProductivityReview,
   IssueProductivityReviewTrigger,
   IssueRelationIssueSummary,
+  IssueUnblockDescriptor,
   IssueWatchdogSummary,
   LowTrustBoundary,
   SuccessfulRunHandoffState,
@@ -8816,6 +8817,10 @@ export function issueService(
       issueStatus: "todo" | "blocked" | "in_review" | "done" | "cancelled";
       outcome: "succeeded" | "failed" | "cancelled";
       error?: string | null;
+      // Supplied only for a blocked terminal, and only naming the executor
+      // itself (the route enforces that). It is both the thing that satisfies
+      // the blocked gate below and the row the unblock owner is notified from.
+      unblockDescriptor?: IssueUnblockDescriptor | null;
       audit: ExternalExecutorAuditActor;
     }) => {
       const postCommitActivityPublications: ActivityPublication[] = [];
@@ -8899,7 +8904,14 @@ export function issueService(
       ) {
         throw unprocessable("External executor cannot complete an issue while review or approval is pending");
       }
-      if (input.issueStatus === "blocked" && !issue.unblockDescriptor && !pendingInteraction && !pendingApproval) {
+      const nextUnblockDescriptor = input.unblockDescriptor ?? null;
+      if (
+        input.issueStatus === "blocked" &&
+        !nextUnblockDescriptor &&
+        !issue.unblockDescriptor &&
+        !pendingInteraction &&
+        !pendingApproval
+      ) {
         const blockerIds = await tx
           .select({ id: issueRelations.issueId })
           .from(issueRelations)
@@ -8940,11 +8952,23 @@ export function issueService(
         : input.issueStatus;
       const now = new Date();
       const statusPatch = applyStatusSideEffects(effectiveIssueStatus, {});
+      // The execution policy may rewrite a requested `blocked` into something
+      // else; a descriptor must never survive onto a non-blocked row, and a
+      // blocked row needs blockedTransitionAt or the unblock owner is never
+      // notified (the same side effects the issue PATCH path applies).
+      const blockedPatch: Partial<typeof issues.$inferInsert> = effectiveIssueStatus === "blocked"
+        ? {
+          ...(nextUnblockDescriptor ? { unblockDescriptor: nextUnblockDescriptor } : {}),
+          blockedTransitionAt: now,
+          blockedOwnerNotifiedAt: null,
+        }
+        : { unblockDescriptor: null, blockedTransitionAt: null, blockedOwnerNotifiedAt: null };
       const updated = await tx
         .update(issues)
         .set({
           ...(executionPolicyTransition.patch as Partial<typeof issues.$inferInsert>),
           ...statusPatch,
+          ...blockedPatch,
           status: effectiveIssueStatus,
           ...(effectiveIssueStatus !== "done" ? { completedAt: null } : {}),
           ...(effectiveIssueStatus !== "cancelled" ? { cancelledAt: null } : {}),

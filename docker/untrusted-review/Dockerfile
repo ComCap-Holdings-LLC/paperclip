@@ -1,4 +1,5 @@
-FROM node:lts-trixie-slim
+# Pinned to Node 24: node:lts is Node 26 since 2026-11-04 and no longer bundles corepack.
+FROM node:24-trixie-slim
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \

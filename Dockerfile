@@ -1,8 +1,9 @@
 # syntax=docker/dockerfile:1.20
-# Pinned to Node 24 (the version production runs). node:lts moved to Node 26 on
-# 2026-11-04, which no longer bundles corepack, so `corepack enable` below fails
-# with exit 127. Moving to a newer major needs corepack installed explicitly.
-FROM node:24-trixie-slim AS base
+# Pinned to Node 24.22.2 at this index digest, the exact base of the image
+# hand-built and deployed on 2026-11-04 (COM-20417). node:lts moved to Node 26
+# that day, which no longer bundles corepack, so `corepack enable` below fails
+# with exit 127. Bump deliberately; a newer major needs corepack installed.
+FROM node:24.22.2-trixie-slim@sha256:54f84b4cf8432b21aaffd5d3ce8d41e12cea0d10d33c09d2f3c9879d49d6b446 AS base
 ARG USER_UID=1000
 ARG USER_GID=1000
 RUN apt-get update \

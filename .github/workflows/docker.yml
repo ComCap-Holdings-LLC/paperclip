@@ -31,10 +31,11 @@ jobs:
   # the release image). The forced command `paperclip-build` accepts only a commit already on
   # master or a release tag and refetches it from GitHub itself, so this job only names what to
   # build. Tags, labels and build args live there: hermes-config mercury/paperclip/builder.
-  # Images are amd64 only; production and managed hosts are amd64.
+  # Images are amd64 only; production and managed hosts are amd64. The job limit covers the
+  # builder's lock wait (up to 30 minutes) plus its build limit (55 minutes).
   build-and-push:
     runs-on: hermes-ephemeral
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Configure builder SSH identity
         env:
@@ -70,7 +71,7 @@ jobs:
   # gates the other.
   build-and-push-cloud:
     runs-on: hermes-ephemeral
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Configure builder SSH identity
         env:

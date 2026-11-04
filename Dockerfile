@@ -134,7 +134,7 @@ CMD ["node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/di
 # CLOUD_BUNDLED_PLUGINS is the space-separated list of sandbox-provider
 # directory names to build into the variant. Only what managed deployments
 # actually auto-install belongs here — every entry adds its node_modules
-# to the image. Growing the list is a one-line workflow change.
+# to the image. Growing the list is a one-line change to the ARG below.
 FROM build AS cloud-plugins
 ARG CLOUD_BUNDLED_PLUGINS="daytona"
 RUN set -eu; \

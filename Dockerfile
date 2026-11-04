@@ -1,5 +1,8 @@
 # syntax=docker/dockerfile:1.20
-FROM node:lts-trixie-slim AS base
+# Pinned to Node 24 (the version production runs). node:lts moved to Node 26 on
+# 2026-11-04, which no longer bundles corepack, so `corepack enable` below fails
+# with exit 127. Moving to a newer major needs corepack installed explicitly.
+FROM node:24-trixie-slim AS base
 ARG USER_UID=1000
 ARG USER_GID=1000
 RUN apt-get update \

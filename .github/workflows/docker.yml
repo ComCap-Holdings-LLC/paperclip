@@ -26,329 +26,78 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Image builds run on Mercury's locked-down builder, not in this job: hermes-ephemeral jobs have
+  # no Docker by design (this is a public repo, and a shared daemon would let a fork PR job reach
+  # the release image). The forced command `paperclip-build` accepts only a commit already on
+  # master or a release tag and refetches it from GitHub itself, so this job only names what to
+  # build. Tags, labels and build args live there: hermes-config mercury/paperclip/builder.
+  # Images are amd64 only; production and managed hosts are amd64. The job limit covers the
+  # builder's lock wait (up to 30 minutes) plus its build limit (55 minutes).
   build-and-push:
     runs-on: hermes-ephemeral
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          # Full history and tags so `git describe` below can compute the
-          # release version to stamp into the image.
-          fetch-depth: 0
-
-      # `.git` is dockerignored, so a running image cannot derive its own
-      # version and otherwise reports the source package.json placeholder in
-      # analytics and the debug panel. Compute it here from the pristine
-      # checkout (real CalVer drift from the nearest release tag) and pass it
-      # into both builds. Empty when no release tag is reachable — the server
-      # then keeps its existing fallbacks.
-      - name: Compute build version
-        id: build-version
-        run: |
-          set -euo pipefail
-          case "${GITHUB_REF}" in
-            refs/tags/nightly/v*)
-              # Lane tags carry the exact published version; stamp it verbatim
-              # instead of describing drift from the nearest stable tag.
-              version="${GITHUB_REF#refs/tags/nightly/v}"
-              ;;
-            refs/tags/beta/v*)
-              version="${GITHUB_REF#refs/tags/beta/v}"
-              ;;
-            *)
-              version="$(git describe --tags --match 'v*' --long --dirty 2>/dev/null || true)"
-              ;;
-          esac
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "Stamping build version: ${version:-<none>}"
-
-      # ISO week stamp for the Dockerfile's tool layer: the layer caches
-      # across commits and re-pulls the @latest CLI tools when the week rolls
-      # over, instead of on every build.
-      - name: Compute tool cache epoch
-        id: tools-epoch
-        run: echo "epoch=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
-          run_install: false
-
-      # No dependency cache here: this workflow publishes release images, and
-      # restoring a shared Actions cache into the build inputs would let a
-      # poisoned cache entry reach the published artifact.
-      - name: Setup Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: 20
-
-      - name: Refresh lockfile for Docker build context
-        run: |
-          set -euo pipefail
-          pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile
-
-          changed="$(git status --porcelain)"
-          if [ -z "$changed" ]; then
-            echo "Lockfile already matches package metadata."
-            exit 0
-          fi
-
-          if printf '%s\n' "$changed" | grep -Fvq ' pnpm-lock.yaml'; then
-            echo "Unexpected files changed during lockfile refresh:"
-            echo "$changed"
-            exit 1
-          fi
-
-          echo "Using refreshed pnpm-lock.yaml in the Docker build context."
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      # BuildKit validates registry cache references strictly. GitHub repository
-      # owners may contain uppercase characters, while GHCR image references
-      # must be lowercase.
-      - name: Normalize GHCR cache repository
-        id: ghcr-cache
+      - name: Configure builder SSH identity
         env:
-          REPOSITORY: ${{ github.repository }}
+          BUILD_KEY: ${{ secrets.PAPERCLIP_BUILD_KEY }}
+          BUILD_HOST_KEY: ${{ secrets.PAPERCLIP_BUILD_HOST_KEY }}
         run: |
           set -euo pipefail
-          repository="$(printf '%s' "$REPOSITORY" | tr '[:upper:]' '[:lower:]')"
-          test -n "$repository"
-          echo "repository=$repository" >> "$GITHUB_OUTPUT"
+          install -d -m 0700 "$HOME/.ssh"
+          install -m 0600 /dev/null "$HOME/.ssh/paperclip_build"
+          printf '%s\n' "$BUILD_KEY" > "$HOME/.ssh/paperclip_build"
+          printf '%s\n' "$BUILD_HOST_KEY" > "$HOME/.ssh/paperclip_build_known_hosts"
 
-      # Deployment tooling reads these labels from the registry to verify an
-      # image's schema expectations against a migrator before deploying it,
-      # without pulling the image. The server refuses to start when the
-      # database is missing bundled migrations, so orchestrators need a cheap
-      # way to check image/migrator compatibility up front.
-      - name: Compute schema migration labels
-        id: schema
+      - name: Build and push on the Mercury builder
+        env:
+          BUILD_HOST: ${{ secrets.PAPERCLIP_BUILD_HOST }}
+          BUILD_TARGET: production
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          last=$(ls packages/db/src/migrations/*.sql | sed 's|.*/||' | LC_ALL=C sort | tail -1)
-          count=$(ls packages/db/src/migrations/*.sql | wc -l | tr -d ' ')
-          echo "last=${last}" >> "$GITHUB_OUTPUT"
-          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          printf '%s\n' "$GHCR_TOKEN" | ssh \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/paperclip_build_known_hosts" \
+            -o ServerAliveInterval=30 \
+            -i "$HOME/.ssh/paperclip_build" \
+            "pcbuild@${BUILD_HOST}" \
+            "build ${BUILD_TARGET} ${GITHUB_SHA} ${GITHUB_REF}"
 
-      # Lane tag mapping: master pushes publish `:canary`, nightly/v* tags
-      # publish `:nightly`, and only stable v* tags move `:latest` and the
-      # versioned tags. `:sha-<short>` is published on every build.
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=raw,value=canary,enable=${{ github.ref == 'refs/heads/master' }}
-            type=raw,value=nightly,enable=${{ startsWith(github.ref, 'refs/tags/nightly/v') }}
-            type=raw,value=beta,enable=${{ startsWith(github.ref, 'refs/tags/beta/v') }}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=semver,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=sha
-          labels: |
-            io.github.paperclipai.schema.last-migration=${{ steps.schema.outputs.last }}
-            io.github.paperclipai.schema.migration-count=${{ steps.schema.outputs.count }}
-
-      - name: Build and push
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          # Pin the self-hosted image to the production stage explicitly:
-          # the Dockerfile now declares a later `cloud` stage, and without a
-          # target the default would silently become that stage.
-          target: production
-          build-args: |
-            PAPERCLIP_BUILD_VERSION=${{ steps.build-version.outputs.version }}
-            PAPERCLIP_BUILD_COMMIT=${{ github.sha }}
-            CLI_TOOLS_CACHE_EPOCH=${{ steps.tools-epoch.outputs.epoch }}
-          platforms: linux/amd64,linux/arm64
-          push: true
-          # Registry-backed BuildKit cache instead of type=gha: the Actions
-          # cache is capped at 10GB per repo, and two multi-arch mode=max jobs
-          # evict each other, so most builds ran effectively cold. The cache
-          # ref lives in ghcr next to the image and is written only by this
-          # workflow (docker.yml runs on master/tag pushes, never on PRs).
-          cache-from: type=registry,ref=ghcr.io/${{ steps.ghcr-cache.outputs.repository }}:buildcache
-          cache-to: type=registry,ref=ghcr.io/${{ steps.ghcr-cache.outputs.repository }}:buildcache,mode=max
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-
-  # The cloud variant carries built bundled plugins for managed deployments
-  # (see the `cloud` stage in the Dockerfile). It runs as its own job with no
-  # `needs:` on the stock publish above, so the two builds run in parallel and
-  # a failure or slow build in one never gates, delays, or skips the other.
-  # Both jobs share only the single top-level concurrency slot. Each job is a
-  # separate runner, so this one carries its own copy of the prep steps
-  # (checkout through schema labels) — the accepted cost of that isolation.
+  # The cloud variant carries built bundled plugins for managed deployments (see the `cloud` stage
+  # in the Dockerfile). It stays a separate job with no `needs:`, so a failure in one image never
+  # gates the other.
   build-and-push-cloud:
     runs-on: hermes-ephemeral
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          # Full history and tags so `git describe` below can compute the
-          # release version to stamp into the image.
-          fetch-depth: 0
-
-      # `.git` is dockerignored, so a running image cannot derive its own
-      # version and otherwise reports the source package.json placeholder in
-      # analytics and the debug panel. Compute it here from the pristine
-      # checkout (real CalVer drift from the nearest release tag) and pass it
-      # into the build. Empty when no release tag is reachable — the server
-      # then keeps its existing fallbacks.
-      - name: Compute build version
-        id: build-version
-        run: |
-          set -euo pipefail
-          case "${GITHUB_REF}" in
-            refs/tags/nightly/v*)
-              # Lane tags carry the exact published version; stamp it verbatim
-              # instead of describing drift from the nearest stable tag.
-              version="${GITHUB_REF#refs/tags/nightly/v}"
-              ;;
-            refs/tags/beta/v*)
-              version="${GITHUB_REF#refs/tags/beta/v}"
-              ;;
-            *)
-              version="$(git describe --tags --match 'v*' --long --dirty 2>/dev/null || true)"
-              ;;
-          esac
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "Stamping build version: ${version:-<none>}"
-
-      # ISO week stamp for the Dockerfile's tool layer: the layer caches
-      # across commits and re-pulls the @latest CLI tools when the week rolls
-      # over, instead of on every build.
-      - name: Compute tool cache epoch
-        id: tools-epoch
-        run: echo "epoch=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
-          run_install: false
-
-      # No dependency cache here: this workflow publishes release images, and
-      # restoring a shared Actions cache into the build inputs would let a
-      # poisoned cache entry reach the published artifact.
-      - name: Setup Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: 20
-
-      - name: Refresh lockfile for Docker build context
-        run: |
-          set -euo pipefail
-          pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile
-
-          changed="$(git status --porcelain)"
-          if [ -z "$changed" ]; then
-            echo "Lockfile already matches package metadata."
-            exit 0
-          fi
-
-          if printf '%s\n' "$changed" | grep -Fvq ' pnpm-lock.yaml'; then
-            echo "Unexpected files changed during lockfile refresh:"
-            echo "$changed"
-            exit 1
-          fi
-
-          echo "Using refreshed pnpm-lock.yaml in the Docker build context."
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      # BuildKit validates registry cache references strictly. GitHub repository
-      # owners may contain uppercase characters, while GHCR image references
-      # must be lowercase.
-      - name: Normalize GHCR cache repository
-        id: ghcr-cache
+      - name: Configure builder SSH identity
         env:
-          REPOSITORY: ${{ github.repository }}
+          BUILD_KEY: ${{ secrets.PAPERCLIP_BUILD_KEY }}
+          BUILD_HOST_KEY: ${{ secrets.PAPERCLIP_BUILD_HOST_KEY }}
         run: |
           set -euo pipefail
-          repository="$(printf '%s' "$REPOSITORY" | tr '[:upper:]' '[:lower:]')"
-          test -n "$repository"
-          echo "repository=$repository" >> "$GITHUB_OUTPUT"
+          install -d -m 0700 "$HOME/.ssh"
+          install -m 0600 /dev/null "$HOME/.ssh/paperclip_build"
+          printf '%s\n' "$BUILD_KEY" > "$HOME/.ssh/paperclip_build"
+          printf '%s\n' "$BUILD_HOST_KEY" > "$HOME/.ssh/paperclip_build_known_hosts"
 
-      # Deployment tooling reads these labels from the registry to verify an
-      # image's schema expectations against a migrator before deploying it,
-      # without pulling the image. The server refuses to start when the
-      # database is missing bundled migrations, so orchestrators need a cheap
-      # way to check image/migrator compatibility up front.
-      - name: Compute schema migration labels
-        id: schema
+      - name: Build and push on the Mercury builder
+        env:
+          BUILD_HOST: ${{ secrets.PAPERCLIP_BUILD_HOST }}
+          BUILD_TARGET: cloud
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          last=$(ls packages/db/src/migrations/*.sql | sed 's|.*/||' | LC_ALL=C sort | tail -1)
-          count=$(ls packages/db/src/migrations/*.sql | wc -l | tr -d ' ')
-          echo "last=${last}" >> "$GITHUB_OUTPUT"
-          echo "count=${count}" >> "$GITHUB_OUTPUT"
-
-      # Published under the same lane tag set as the self-hosted image, with a
-      # `-cloud` suffix (canary-cloud, nightly-cloud, latest-cloud,
-      # <version>-cloud, sha-<short>-cloud).
-      - name: Docker meta (cloud)
-        id: meta-cloud
-        uses: docker/metadata-action@v6
-        with:
-          images: ghcr.io/${{ github.repository }}
-          flavor: |
-            suffix=-cloud,onlatest=true
-          tags: |
-            type=raw,value=canary,enable=${{ github.ref == 'refs/heads/master' }}
-            type=raw,value=nightly,enable=${{ startsWith(github.ref, 'refs/tags/nightly/v') }}
-            type=raw,value=beta,enable=${{ startsWith(github.ref, 'refs/tags/beta/v') }}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=semver,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=sha
-          labels: |
-            io.github.paperclipai.schema.last-migration=${{ steps.schema.outputs.last }}
-            io.github.paperclipai.schema.migration-count=${{ steps.schema.outputs.count }}
-
-      - name: Build and push (cloud)
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          target: cloud
-          # Space-separated sandbox-provider directory names to build into
-          # the variant; add here when managed deployments need another.
-          build-args: |
-            CLOUD_BUNDLED_PLUGINS=daytona
-            PAPERCLIP_BUILD_VERSION=${{ steps.build-version.outputs.version }}
-            PAPERCLIP_BUILD_COMMIT=${{ github.sha }}
-            CLI_TOOLS_CACHE_EPOCH=${{ steps.tools-epoch.outputs.epoch }}
-          # amd64 only, unlike the self-hosted image above: the cloud variant
-          # is consumed exclusively by managed-deployment hosts, which run
-          # amd64. The QEMU-emulated arm64 half dominated this job's wall
-          # clock, and dropping it roughly halves time-to-deployable-image.
-          platforms: linux/amd64
-          push: true
-          # Registry-backed BuildKit cache, separate ref from the self-hosted
-          # job so the two parallel builds never clobber each other's cache
-          # manifest (see the rationale on the job above).
-          cache-from: type=registry,ref=ghcr.io/${{ steps.ghcr-cache.outputs.repository }}:buildcache-cloud
-          cache-to: type=registry,ref=ghcr.io/${{ steps.ghcr-cache.outputs.repository }}:buildcache-cloud,mode=max
-          tags: ${{ steps.meta-cloud.outputs.tags }}
-          labels: ${{ steps.meta-cloud.outputs.labels }}
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          printf '%s\n' "$GHCR_TOKEN" | ssh \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/paperclip_build_known_hosts" \
+            -o ServerAliveInterval=30 \
+            -i "$HOME/.ssh/paperclip_build" \
+            "pcbuild@${BUILD_HOST}" \
+            "build ${BUILD_TARGET} ${GITHUB_SHA} ${GITHUB_REF}"

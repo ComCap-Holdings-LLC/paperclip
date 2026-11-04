@@ -34,18 +34,16 @@ const dockerfileDefault = parseList(
   /^ARG CLOUD_BUNDLED_PLUGINS="([^"]*)"/m,
   "Dockerfile",
 );
-const workflowArg = parseList(
-  workflow,
-  /^\s*CLOUD_BUNDLED_PLUGINS=(.*)$/m,
-  "docker workflow",
-);
 
 describe("cloud image bundled plugins", () => {
-  it("keeps the Dockerfile default and the workflow build-arg in sync", () => {
-    expect(workflowArg).toEqual(dockerfileDefault);
+  it("takes the plugin list from the Dockerfile default alone", () => {
+    // The image builder passes no CLOUD_BUNDLED_PLUGINS, so the Dockerfile
+    // default is the single source of truth. A workflow override would not
+    // reach the build.
+    expect(workflow).not.toMatch(/CLOUD_BUNDLED_PLUGINS/);
   });
 
-  it.each([...new Set([...dockerfileDefault, ...workflowArg])])(
+  it.each(dockerfileDefault)(
     "plugin %s is buildable and resolvable by the auto-installer",
     (name) => {
       const dir = path.join(repoRoot, "packages", "plugins", "sandbox-providers", name);
@@ -73,7 +71,7 @@ describe("cloud image bundled plugins", () => {
     // The Dockerfile's final stage is `cloud`; without an explicit target
     // the workflow's main build would silently publish the cloud variant
     // to the self-hosted tags.
-    expect(workflow).toMatch(/^\s*target: production$/m);
+    expect(workflow).toMatch(/^\s*BUILD_TARGET: production$/m);
   });
 
   it("publishes the cloud image in its own job with no needs coupling", () => {
@@ -88,13 +86,13 @@ describe("cloud image bundled plugins", () => {
       "docker.yml must declare at least two jobs under jobs:",
     ).toBeGreaterThanOrEqual(2);
 
-    // Locate the job block that carries the cloud build (target: cloud) and
+    // Locate the job block that carries the cloud build (BUILD_TARGET: cloud) and
     // assert it declares no `needs:` — coupling it to another job would
     // reintroduce the shared failure the split job exists to remove.
     const cloudHeaderIdx = headers.findIndex((header, i) => {
       const start = header.index ?? 0;
       const end = headers[i + 1]?.index ?? jobsSection.length;
-      return jobsSection.slice(start, end).includes("target: cloud");
+      return jobsSection.slice(start, end).includes("BUILD_TARGET: cloud");
     });
     expect(cloudHeaderIdx, "one job must build the cloud target").toBeGreaterThanOrEqual(0);
     const start = headers[cloudHeaderIdx].index ?? 0;

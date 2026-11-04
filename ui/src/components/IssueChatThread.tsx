@@ -829,8 +829,10 @@ function parseReassignment(target: string): PaperclipIssueRuntimeReassignment | 
 }
 
 function shouldImplicitlyReopenComment(issueStatus: string | undefined, assigneeValue: string) {
-  const resumesToTodo = issueStatus === "done" || issueStatus === "cancelled" || issueStatus === "blocked";
-  return resumesToTodo && assigneeValue.startsWith("agent:");
+  // done/cancelled stay closed. A comment is not a reopen (COM-15994).
+  // Blocked still nudges an assigned agent; that is not a verified closure.
+  if (issueStatus === "done" || issueStatus === "cancelled") return false;
+  return issueStatus === "blocked" && assigneeValue.startsWith("agent:");
 }
 
 function isUnassignedReassignValue(value: string): boolean {

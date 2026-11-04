@@ -235,7 +235,7 @@ describe("CommentThread", () => {
     });
   });
 
-  it("hides the reopen control and infers reopen for closed agent-assigned issues", async () => {
+  it("does not infer reopen for a done agent-assigned issue comment", async () => {
     const root = createRoot(container);
     const onAdd = vi.fn(async () => {});
 
@@ -274,7 +274,7 @@ describe("CommentThread", () => {
       submitButton?.click();
     });
 
-    expect(onAdd).toHaveBeenCalledWith("Please pick this back up", true, undefined);
+    expect(onAdd).toHaveBeenCalledWith("Please pick this back up", undefined, undefined);
 
     act(() => {
       root.unmount();
